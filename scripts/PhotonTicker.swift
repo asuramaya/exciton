@@ -36,31 +36,13 @@ func fetchSignals() -> [TokenSignal] {
     }
     defer { sqlite3_close(db) }
 
-    // Get signal-worthy alerts with their latest snapshot data
+    // Get signal-worthy alerts
     let query = """
-        SELECT
-            a.alert_type,
-            a.token_address,
-            a.confidence,
-            s.top_holder_pct,
-            s.top5_pct,
-            s.tx_rate,
-            s.velocity,
-            s.momentum,
-            s.distribution,
-            s.spring,
-            s.classification,
-            s.timestamp
-        FROM alerts a
-        LEFT JOIN (
-            SELECT token_address, top_holder_pct, top5_pct, tx_rate, velocity,
-                   momentum, distribution, spring, classification, timestamp,
-                   ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY timestamp DESC) as rn
-            FROM token_snapshots
-        ) s ON s.token_address = a.token_address AND s.rn = 1
-        WHERE a.acknowledged = 0
-            AND a.alert_type IN ('grinder','staircase','spring','surge','spring_ignition')
-        ORDER BY a.confidence DESC
+        SELECT alert_type, token_address, confidence
+        FROM alerts
+        WHERE acknowledged = 0
+            AND alert_type IN ('grinder','staircase','spring','surge','spring_ignition')
+        ORDER BY confidence DESC
         LIMIT 5
     """
 
@@ -68,39 +50,50 @@ func fetchSignals() -> [TokenSignal] {
     var signals: [TokenSignal] = []
 
     guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return [] }
-    defer { sqlite3_finalize(stmt) }
 
     while sqlite3_step(stmt) == SQLITE_ROW {
         let alertType = String(cString: sqlite3_column_text(stmt, 0))
         let address = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
         let confidence = Int(sqlite3_column_int(stmt, 2))
-        let topHolder = sqlite3_column_double(stmt, 3)
-        let top5 = sqlite3_column_double(stmt, 4)
-        let txRate = sqlite3_column_double(stmt, 5)
-        let velocity = sqlite3_column_double(stmt, 6)
-        let momentum = Int(sqlite3_column_int(stmt, 7))
-        let distribution = Int(sqlite3_column_int(stmt, 8))
-        let spring = Int(sqlite3_column_int(stmt, 9))
-        let classification = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? alertType.uppercased()
-        let snapshotTime = sqlite3_column_int64(stmt, 11)
 
-        // Get previous snapshot for delta
-        var delta: (Double, Int, Int64)? = nil
+        // Fetch latest snapshot for this token
+        var topHolder = 0.0, top5 = 0.0, txRate = 0.0, velocity = 0.0
+        var momentum = 0, distribution = 0, spring = 0
+        var classification = alertType.uppercased()
+
+        var sStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db,
+            "SELECT top_holder_pct, top5_pct, tx_rate, velocity, momentum, distribution, spring, classification FROM token_snapshots WHERE token_address = ? ORDER BY timestamp DESC LIMIT 1",
+            -1, &sStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(sStmt, 1, address, -1, nil)
+            if sqlite3_step(sStmt) == SQLITE_ROW {
+                topHolder = sqlite3_column_double(sStmt, 0)
+                top5 = sqlite3_column_double(sStmt, 1)
+                txRate = sqlite3_column_double(sStmt, 2)
+                velocity = sqlite3_column_double(sStmt, 3)
+                momentum = Int(sqlite3_column_int(sStmt, 4))
+                distribution = Int(sqlite3_column_int(sStmt, 5))
+                spring = Int(sqlite3_column_int(sStmt, 6))
+                classification = sqlite3_column_text(sStmt, 7).map { String(cString: $0) } ?? classification
+            }
+        }
+        sqlite3_finalize(sStmt)
+
+        // Fetch previous snapshot for delta
+        var thDelta: Double? = nil
+        var momDelta: Int? = nil
+        var elapsed: Int64? = nil
+
         var dStmt: OpaquePointer?
-        let dQuery = """
-            SELECT top_holder_pct, momentum, timestamp
-            FROM token_snapshots
-            WHERE token_address = ?
-            ORDER BY timestamp DESC
-            LIMIT 1 OFFSET 1
-        """
-        if sqlite3_prepare_v2(db, dQuery, -1, &dStmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db,
+            "SELECT top_holder_pct, momentum, timestamp FROM token_snapshots WHERE token_address = ? ORDER BY timestamp DESC LIMIT 1 OFFSET 1",
+            -1, &dStmt, nil) == SQLITE_OK {
             sqlite3_bind_text(dStmt, 1, address, -1, nil)
             if sqlite3_step(dStmt) == SQLITE_ROW {
                 let prevTop = sqlite3_column_double(dStmt, 0)
                 let prevMom = Int(sqlite3_column_int(dStmt, 1))
-                let prevTime = sqlite3_column_int64(dStmt, 2)
-                delta = (topHolder - prevTop, momentum - prevMom, snapshotTime - prevTime)
+                thDelta = topHolder - prevTop
+                momDelta = momentum - prevMom
             }
         }
         sqlite3_finalize(dStmt)
@@ -117,11 +110,12 @@ func fetchSignals() -> [TokenSignal] {
             distribution: distribution,
             spring: spring,
             classification: classification,
-            topHolderDelta: delta?.0,
-            momentumDelta: delta?.1,
-            timeSinceLast: delta?.2
+            topHolderDelta: thDelta,
+            momentumDelta: momDelta,
+            timeSinceLast: elapsed
         ))
     }
+    sqlite3_finalize(stmt)
 
     return signals
 }
