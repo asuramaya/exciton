@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 mod config;
 mod db;
+mod discovery;
 mod execution;
 mod forecaster;
 mod ingester;
@@ -54,7 +55,7 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!("RPC connection error: {} — will retry on demand", e),
     }
 
-    let server = PhotonServer::new(db, config, rpc);
+    let server = PhotonServer::new(db, config, rpc, resolved_endpoints);
     tracing::info!("MCP server starting on stdio");
 
     let service = server.serve(rmcp::transport::stdio()).await?;

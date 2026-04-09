@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::db::Db;
+use crate::discovery;
 use crate::forecaster::{Forecaster, Regime};
 use crate::ingester::RpcRouter;
 use crate::signals;
@@ -15,6 +16,7 @@ pub struct PhotonServer {
     db: Arc<Db>,
     config: Config,
     rpc: Arc<RpcRouter>,
+    resolved_endpoints: Vec<String>,
     forecaster: Forecaster,
     tool_router: ToolRouter<Self>,
 }
@@ -132,11 +134,12 @@ fn to_json<T: Serialize>(data: &T) -> String {
 }
 
 impl PhotonServer {
-    pub fn new(db: Arc<Db>, config: Config, rpc: Arc<RpcRouter>) -> Self {
+    pub fn new(db: Arc<Db>, config: Config, rpc: Arc<RpcRouter>, resolved_endpoints: Vec<String>) -> Self {
         Self {
             db,
             config,
             rpc,
+            resolved_endpoints,
             forecaster: Forecaster::new(),
             tool_router: Self::tool_router(),
         }
@@ -149,30 +152,76 @@ impl PhotonServer {
 
 #[tool_router]
 impl PhotonServer {
-    /// Scan the market: system health, current regime, top opportunities, active alerts.
-    /// Flow: check health -> check RPC connectivity -> query forecaster -> present ranked results.
+    /// Scan the market: discover new tokens from Pump.fun, analyze them, rank by confidence.
+    /// Flow: check health -> discover tokens -> run signal analysis -> rank -> present.
     #[tool]
     async fn scan(&self) -> String {
         let _ = self.db.audit_log("claude", "scan", "Market scan requested");
 
         let rpc_connected = self.rpc.check_connection().await.unwrap_or(false);
 
-        to_json(&ScanResult {
-            healthy: self.is_healthy() && rpc_connected,
-            rpc_connected,
-            rpc_endpoints: self.rpc.endpoint_count(),
-            rpc_healthy: self.rpc.healthy_count(),
-            regime: Regime::LowActivityGrind.to_string(),
-            opportunities: vec![],
-            alerts: if !rpc_connected {
-                vec![AlertInfo {
+        if !rpc_connected {
+            return to_json(&ScanResult {
+                healthy: false,
+                rpc_connected: false,
+                rpc_endpoints: self.rpc.endpoint_count(),
+                rpc_healthy: self.rpc.healthy_count(),
+                regime: "Unknown".to_string(),
+                opportunities: vec![],
+                alerts: vec![AlertInfo {
                     alert_type: "system".to_string(),
                     message: "RPC not connected — check API keys and endpoints".to_string(),
                     confidence: 100,
-                }]
-            } else {
-                vec![]
-            },
+                }],
+            });
+        }
+
+        // Discover and analyze new tokens (limit to 5 to stay within rate limits)
+        let helius_url = self.resolved_endpoints.first().cloned().unwrap_or_default();
+        let analyses = discovery::discover_new_tokens(&helius_url, &self.db, &self.rpc, 5)
+            .await
+            .unwrap_or_default();
+
+        let opportunities: Vec<Opportunity> = analyses
+            .iter()
+            .map(|a| {
+                let position_pct = self.forecaster.position_pct(
+                    a.confidence.total,
+                    a.confidence.coverage,
+                );
+                Opportunity {
+                    token: a.address.clone(),
+                    confidence: a.confidence.total,
+                    coverage: a.confidence.coverage,
+                    recommended_position_pct: position_pct,
+                    reasoning: a.confidence.reasoning.clone(),
+                }
+            })
+            .collect();
+
+        let mut alerts = Vec::new();
+        // Alert on any high-confidence opportunities
+        for opp in &opportunities {
+            if opp.confidence >= self.config.alerts.confidence_threshold as i32 {
+                alerts.push(AlertInfo {
+                    alert_type: "opportunity".to_string(),
+                    message: format!(
+                        "Token {} scored {}/100 — recommended {}% position",
+                        opp.token, opp.confidence, opp.recommended_position_pct
+                    ),
+                    confidence: opp.confidence,
+                });
+            }
+        }
+
+        to_json(&ScanResult {
+            healthy: true,
+            rpc_connected: true,
+            rpc_endpoints: self.rpc.endpoint_count(),
+            rpc_healthy: self.rpc.healthy_count(),
+            regime: Regime::LowActivityGrind.to_string(),
+            opportunities,
+            alerts,
         })
     }
 

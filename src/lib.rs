@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod discovery;
 pub mod ingester;
 pub mod signals;
 pub mod forecaster;

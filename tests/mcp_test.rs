@@ -13,6 +13,7 @@ fn test_server_creation() {
     let rpc = Arc::new(
         RpcRouter::new(&["https://api.mainnet-beta.solana.com".to_string()]).unwrap(),
     );
-    let server = PhotonServer::new(db, config, rpc);
+    let endpoints = vec!["https://api.mainnet-beta.solana.com".to_string()];
+    let server = PhotonServer::new(db, config, rpc, endpoints);
     assert!(server.is_healthy());
 }
