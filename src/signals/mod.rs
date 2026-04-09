@@ -318,58 +318,62 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<
         .unwrap_or_default();
     let recent_tx_count = signatures.len();
 
+    // Compute raw metrics for snapshot storage and cross-layer synthesis
+    let metrics = micro.compute_metrics(&signatures);
     all_scores.extend(micro.analyze_activity(&signatures));
     all_scores.extend(onchain_analyzer.analyze_history_depth(&signatures));
 
     // 5. Cross-layer signal synthesis — patterns that emerge from combining layers
-    //    These are higher-order signals that no single layer can see alone.
-
-    // Demand congestion: high failure rate + deep holder base + high tx rate = bullish
-    // On CHILLGUY (116K holders), 84% failure = crowd fighting to get in.
-    // On PNUT (20 holders), 84% failure = congestion on thin liquidity.
-    let failure_rate = signatures.iter().filter(|s| s.err).count() as f64
-        / signatures.len().max(1) as f64;
-    let has_deep_holders = holder_count >= 15; // 15+ in top 20 = deep base
+    let has_deep_holders = holder_count >= 15;
     let has_good_distribution = top_holder_pct < 30.0;
 
-    if failure_rate > 0.2 && has_deep_holders && has_good_distribution {
-        // High failure rate on a distributed token = demand congestion (bullish)
-        let congestion_score = (70.0 + (failure_rate * 30.0)).min(95.0) as i32;
+    // Demand congestion: high failure + deep holders + good distribution = bullish
+    if metrics.failure_rate_pct > 20.0 && has_deep_holders && has_good_distribution {
+        let congestion_score = (70.0 + (metrics.failure_rate_pct / 100.0 * 30.0)).min(95.0) as i32;
         all_scores.push(SignalScore::new(
             SignalLayer::Microstructure,
             "demand_congestion",
             congestion_score,
             &format!(
-                "DEMAND CONGESTION: {:.0}% tx failure on distributed token (top holder {:.1}%, {} holders) — crowd fighting to enter",
-                failure_rate * 100.0, top_holder_pct, holder_count
+                "DEMAND CONGESTION: {:.0}% tx failure on distributed token (top holder {:.1}%) — crowd fighting to enter",
+                metrics.failure_rate_pct, top_holder_pct
             ),
         ));
-    } else if failure_rate > 0.3 && !has_good_distribution {
-        // High failure rate on concentrated token = just congestion, not meaningful
+    } else if metrics.failure_rate_pct > 30.0 && !has_good_distribution {
         all_scores.push(SignalScore::new(
             SignalLayer::Microstructure,
             "congestion_warning",
             30,
             &format!(
                 "High failure rate ({:.0}%) on concentrated token (top holder {:.1}%) — congestion without deep demand",
-                failure_rate * 100.0, top_holder_pct
+                metrics.failure_rate_pct, top_holder_pct
             ),
         ));
     }
 
-    // Loaded spring detection: good distribution + velocity picking up from dormancy
-    let velocity_score = all_scores.iter()
-        .find(|s| s.signal_type == "velocity")
-        .map(|s| s.score)
-        .unwrap_or(0);
-    if has_good_distribution && has_deep_holders && velocity_score > 60 {
+    // Spring ignition: good distribution + velocity picking up
+    if has_good_distribution && has_deep_holders && metrics.velocity_multiplier > 1.5 {
         all_scores.push(SignalScore::new(
             SignalLayer::Microstructure,
             "spring_ignition",
             90,
             &format!(
-                "SPRING IGNITING: velocity rising on distributed token (top holder {:.1}%, {} holders) — potential wave forming",
-                top_holder_pct, holder_count
+                "SPRING IGNITING: velocity {:.1}x on distributed token (top holder {:.1}%) — potential wave forming",
+                metrics.velocity_multiplier, top_holder_pct
+            ),
+        ));
+    }
+
+    // Velocity exit warning: velocity dropping below 1.0x is a leading exit signal
+    // This fires before concentration delta shows re-concentration
+    if metrics.velocity_multiplier < 0.5 && metrics.tx_per_minute > 1.0 {
+        all_scores.push(SignalScore::new(
+            SignalLayer::Microstructure,
+            "velocity_exit_warning",
+            20,
+            &format!(
+                "EXIT WARNING: velocity {:.1}x (decelerating) with {:.1} tx/min — momentum dying",
+                metrics.velocity_multiplier, metrics.tx_per_minute
             ),
         ));
     }
@@ -377,15 +381,9 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<
     // 6. Aggregate confidence
     let confidence = Confidence::from_scores(&all_scores);
 
-    // Extract tx_rate and velocity from scores for snapshot storage
-    let tx_rate = all_scores.iter()
-        .find(|s| s.signal_type == "tx_rate")
-        .map(|s| s.score as f64)
-        .unwrap_or(0.0);
-    let velocity = all_scores.iter()
-        .find(|s| s.signal_type == "velocity")
-        .map(|s| s.score as f64)
-        .unwrap_or(0.0);
+    // Raw values for snapshot (not scores)
+    let tx_rate = metrics.tx_per_minute;
+    let velocity = metrics.velocity_multiplier;
 
     // 6. Store snapshot and compute delta
     let now = chrono::Utc::now().timestamp();

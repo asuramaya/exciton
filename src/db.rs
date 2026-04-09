@@ -121,6 +121,14 @@ impl Db {
                 details TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS watchlist (
+                token_address TEXT PRIMARY KEY,
+                classification TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                last_checked INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
             CREATE TABLE IF NOT EXISTS token_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_address TEXT NOT NULL,
@@ -295,6 +303,51 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // -- Watchlist --
+
+    pub fn add_to_watchlist(&self, address: &str, classification: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO watchlist (token_address, classification, added_at, last_checked, active) \
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            params![address, classification, now, 0],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_watchlist_due(&self, check_interval_seconds: i64, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - check_interval_seconds;
+        let mut stmt = conn.prepare(
+            "SELECT token_address FROM watchlist \
+             WHERE active = 1 AND last_checked < ?1 \
+             ORDER BY last_checked ASC LIMIT ?2"
+        )?;
+        let addrs = stmt.query_map(params![cutoff, limit], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(addrs)
+    }
+
+    pub fn update_watchlist_checked(&self, address: &str, classification: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE watchlist SET last_checked = ?1, classification = ?2 WHERE token_address = ?3",
+            params![now, classification, address],
+        )?;
+        Ok(())
+    }
+
+    pub fn deactivate_watchlist(&self, address: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE watchlist SET active = 0 WHERE token_address = ?1",
+            params![address],
+        )?;
+        Ok(())
     }
 
     // -- Snapshot tracking (film, not frames) --

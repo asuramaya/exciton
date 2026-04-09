@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::discovery;
 use crate::ingester::RpcRouter;
+use crate::signals;
 use crate::signals::SignalLayer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -83,9 +84,73 @@ impl BackgroundScanner {
     }
 
     async fn scan_cycle(&self) -> anyhow::Result<usize> {
-        // Discover new tokens (limit 5 per cycle to respect rate limits)
+        // Phase 1: Re-analyze watchlist tokens (up to 3 per cycle)
+        let watchlist = self.db.get_watchlist_due(15, 3)?; // re-check every 15s
+        for addr in &watchlist {
+            match signals::analyze_token(&self.rpc, addr, Some(&self.db)).await {
+                Ok(analysis) => {
+                    let class = &analysis.confidence.classification;
+                    self.db.update_watchlist_checked(addr, class)?;
+
+                    // Check delta for alerts
+                    if let Some(ref delta) = analysis.delta {
+                        // Classification changed — always alert
+                        if delta.classification_changed {
+                            self.db.insert_alert(
+                                "classification_change",
+                                Some(addr),
+                                &format!(
+                                    "CLASSIFICATION CHANGE {} — {} → {}, top holder delta {:+.1}%",
+                                    addr, delta.previous.classification, analysis.confidence.classification,
+                                    delta.top_holder_delta
+                                ),
+                                analysis.confidence.total,
+                            )?;
+                        }
+
+                        // Concentration direction alert
+                        if delta.concentration_direction == "concentrating" {
+                            self.db.insert_alert(
+                                "concentrating",
+                                Some(addr),
+                                &format!(
+                                    "CONCENTRATING {} — top holder {:+.1}% ({:.1}% → {:.1}%), {} — EXIT SIGNAL",
+                                    addr, delta.top_holder_delta,
+                                    delta.previous.top_holder_pct, delta.current.top_holder_pct,
+                                    analysis.confidence.classification,
+                                ),
+                                analysis.confidence.total,
+                            )?;
+                        }
+
+                        // Velocity exit warning
+                        if delta.current.velocity < 0.5 && delta.previous.velocity > 1.0 {
+                            self.db.insert_alert(
+                                "velocity_crash",
+                                Some(addr),
+                                &format!(
+                                    "VELOCITY CRASH {} — {:.1}x → {:.1}x, momentum dying",
+                                    addr, delta.previous.velocity, delta.current.velocity,
+                                ),
+                                analysis.confidence.total,
+                            )?;
+                        }
+                    }
+
+                    // Deactivate DEAD tokens from watchlist
+                    if analysis.confidence.classification == "DEAD" {
+                        self.db.deactivate_watchlist(addr)?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Watchlist re-analysis failed for {}: {}", addr, e);
+                }
+            }
+        }
+
+        // Phase 2: Discover new tokens (limit 3 per cycle to leave budget for watchlist)
         let analyses =
-            discovery::discover_new_tokens(&self.helius_url, &self.db, &self.rpc, 5).await?;
+            discovery::discover_new_tokens(&self.helius_url, &self.db, &self.rpc, 3).await?;
 
         let mut alert_count = 0;
 
@@ -183,6 +248,18 @@ impl BackgroundScanner {
                         alert_count += 1;
                     }
                 }
+            }
+
+            // Add interesting tokens to watchlist for trajectory tracking
+            let dominated_class = &analysis.confidence.classification;
+            match dominated_class.as_str() {
+                "STAIRCASE" | "SPRING" | "SURGE" | "ACTIVE_TRAP" => {
+                    let _ = self.db.add_to_watchlist(&analysis.address, dominated_class);
+                }
+                "DEVELOPING" if analysis.confidence.distribution > 40 => {
+                    let _ = self.db.add_to_watchlist(&analysis.address, dominated_class);
+                }
+                _ => {}
             }
         }
 

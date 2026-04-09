@@ -3,12 +3,81 @@ use crate::ingester::SignatureInfo;
 
 pub struct MicrostructureAnalyzer;
 
+/// Raw computed metrics from transaction analysis — stored in snapshots
+#[derive(Debug, Clone)]
+pub struct MicroMetrics {
+    pub tx_per_minute: f64,
+    pub velocity_multiplier: f64,
+    pub success_rate_pct: f64,
+    pub failure_rate_pct: f64,
+    pub last_tx_age_seconds: i64,
+    pub window_seconds: i64,
+}
+
 impl MicrostructureAnalyzer {
     pub fn new() -> Self {
         Self
     }
 
-    /// Analyze recent transaction activity for a token
+    /// Compute raw metrics from signatures
+    pub fn compute_metrics(&self, signatures: &[SignatureInfo]) -> MicroMetrics {
+        if signatures.is_empty() {
+            return MicroMetrics {
+                tx_per_minute: 0.0,
+                velocity_multiplier: 0.0,
+                success_rate_pct: 0.0,
+                failure_rate_pct: 0.0,
+                last_tx_age_seconds: i64::MAX,
+                window_seconds: 0,
+            };
+        }
+
+        let total = signatures.len();
+        let successful = signatures.iter().filter(|s| !s.err).count();
+        let success_rate = (successful as f64 / total as f64) * 100.0;
+
+        let window = time_span(signatures);
+        let tx_per_minute = if window > 0 {
+            (total as f64 / window as f64) * 60.0
+        } else {
+            total as f64
+        };
+
+        let last_tx_age = signatures
+            .first()
+            .and_then(|s| s.block_time)
+            .map(|t| chrono::Utc::now().timestamp() - t)
+            .unwrap_or(i64::MAX);
+
+        let velocity = if signatures.len() >= 10 {
+            let recent_span = time_span(&signatures[..5]);
+            let older_span = time_span(&signatures[5..10]);
+            if recent_span > 0 && older_span > 0 {
+                let recent_rate = 5.0 / recent_span as f64;
+                let older_rate = 5.0 / older_span as f64;
+                if older_rate > 0.0 {
+                    recent_rate / older_rate
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+
+        MicroMetrics {
+            tx_per_minute,
+            velocity_multiplier: velocity,
+            success_rate_pct: success_rate,
+            failure_rate_pct: 100.0 - success_rate,
+            last_tx_age_seconds: last_tx_age,
+            window_seconds: window,
+        }
+    }
+
+    /// Analyze recent transaction activity, producing scored signals
     pub fn analyze_activity(&self, signatures: &[SignatureInfo]) -> Vec<SignalScore> {
         let mut scores = Vec::new();
 
@@ -22,142 +91,111 @@ impl MicrostructureAnalyzer {
             return scores;
         }
 
-        let total_txs = signatures.len();
-        let successful_txs = signatures.iter().filter(|s| !s.err).count();
-        let failed_txs = total_txs - successful_txs;
-        let success_rate = if total_txs > 0 {
-            (successful_txs as f64 / total_txs as f64) * 100.0
-        } else {
-            0.0
-        };
+        let m = self.compute_metrics(signatures);
 
-        // Transaction rate (tx per minute) — more meaningful than raw count
-        let time_window = time_span(signatures);
-        let tx_per_minute = if time_window > 0 {
-            (total_txs as f64 / time_window as f64) * 60.0
-        } else {
-            total_txs as f64 // all in same second = very fast
-        };
-
-        let volume_score = if tx_per_minute > 30.0 {
-            95 // Extremely active
-        } else if tx_per_minute > 10.0 {
+        // Transaction rate score
+        let rate_score = if m.tx_per_minute > 30.0 {
+            95
+        } else if m.tx_per_minute > 10.0 {
             80
-        } else if tx_per_minute > 3.0 {
+        } else if m.tx_per_minute > 3.0 {
             65
-        } else if tx_per_minute > 1.0 {
+        } else if m.tx_per_minute > 1.0 {
             50
-        } else if tx_per_minute > 0.1 {
+        } else if m.tx_per_minute > 0.1 {
             30
-        } else {
-            15 // Nearly dead
-        };
-
-        scores.push(SignalScore::new(
-            SignalLayer::Microstructure,
-            "tx_rate",
-            volume_score,
-            &format!("{:.1} tx/min ({} txs over {}s)", tx_per_minute, total_txs, time_window),
-        ));
-
-        // Success rate — high failure rate can indicate honeypot or congestion
-        let success_score = if success_rate > 95.0 {
-            90
-        } else if success_rate > 85.0 {
-            70
-        } else if success_rate > 70.0 {
-            40
         } else {
             15
         };
 
         scores.push(SignalScore::new(
             SignalLayer::Microstructure,
-            "tx_success_rate",
-            success_score,
+            "tx_rate",
+            rate_score,
             &format!(
-                "{:.1}% success rate ({} failed of {})",
-                success_rate, failed_txs, total_txs
+                "{:.1} tx/min ({} txs over {}s)",
+                m.tx_per_minute,
+                signatures.len(),
+                m.window_seconds
             ),
         ));
 
-        // Recency — how recent is the last transaction?
-        if let Some(latest) = signatures.first() {
-            if let Some(block_time) = latest.block_time {
-                let now = chrono::Utc::now().timestamp();
-                let age_seconds = now - block_time;
+        // Success rate
+        let success_score = if m.success_rate_pct > 95.0 {
+            90
+        } else if m.success_rate_pct > 85.0 {
+            70
+        } else if m.success_rate_pct > 70.0 {
+            40
+        } else {
+            15
+        };
 
-                let recency_score = if age_seconds < 60 {
-                    95
-                } else if age_seconds < 300 {
-                    80
-                } else if age_seconds < 3600 {
-                    60
-                } else if age_seconds < 86400 {
-                    30
-                } else {
-                    10
-                };
+        let failed = signatures.iter().filter(|s| s.err).count();
+        scores.push(SignalScore::new(
+            SignalLayer::Microstructure,
+            "tx_success_rate",
+            success_score,
+            &format!(
+                "{:.0}% success rate ({} failed of {})",
+                m.success_rate_pct,
+                failed,
+                signatures.len()
+            ),
+        ));
 
-                let age_str = if age_seconds < 60 {
-                    format!("{}s ago", age_seconds)
-                } else if age_seconds < 3600 {
-                    format!("{}m ago", age_seconds / 60)
-                } else if age_seconds < 86400 {
-                    format!("{}h ago", age_seconds / 3600)
-                } else {
-                    format!("{}d ago", age_seconds / 86400)
-                };
+        // Recency
+        if m.last_tx_age_seconds < i64::MAX {
+            let recency_score = if m.last_tx_age_seconds < 60 {
+                95
+            } else if m.last_tx_age_seconds < 300 {
+                80
+            } else if m.last_tx_age_seconds < 3600 {
+                60
+            } else if m.last_tx_age_seconds < 86400 {
+                30
+            } else {
+                10
+            };
 
-                scores.push(SignalScore::new(
-                    SignalLayer::Microstructure,
-                    "recency",
-                    recency_score,
-                    &format!("Last transaction {}", age_str),
-                ));
-            }
+            let age_str = if m.last_tx_age_seconds < 60 {
+                format!("{}s ago", m.last_tx_age_seconds)
+            } else if m.last_tx_age_seconds < 3600 {
+                format!("{}m ago", m.last_tx_age_seconds / 60)
+            } else if m.last_tx_age_seconds < 86400 {
+                format!("{}h ago", m.last_tx_age_seconds / 3600)
+            } else {
+                format!("{}d ago", m.last_tx_age_seconds / 86400)
+            };
+
+            scores.push(SignalScore::new(
+                SignalLayer::Microstructure,
+                "recency",
+                recency_score,
+                &format!("Last transaction {}", age_str),
+            ));
         }
 
-        // Transaction velocity — are transactions accelerating?
+        // Velocity
         if signatures.len() >= 10 {
-            let recent_5 = &signatures[..5];
-            let older_5 = &signatures[5..10];
+            let accel_score = if m.velocity_multiplier > 3.0 {
+                90
+            } else if m.velocity_multiplier > 1.5 {
+                75
+            } else if m.velocity_multiplier > 0.8 {
+                50
+            } else if m.velocity_multiplier > 0.3 {
+                30
+            } else {
+                15
+            };
 
-            let recent_span = time_span(recent_5);
-            let older_span = time_span(older_5);
-
-            if recent_span > 0 && older_span > 0 {
-                let recent_rate = 5.0 / recent_span as f64;
-                let older_rate = 5.0 / older_span as f64;
-
-                let acceleration = if older_rate > 0.0 {
-                    recent_rate / older_rate
-                } else {
-                    1.0
-                };
-
-                let accel_score = if acceleration > 3.0 {
-                    90 // Accelerating fast
-                } else if acceleration > 1.5 {
-                    75
-                } else if acceleration > 0.8 {
-                    50 // Steady
-                } else if acceleration > 0.3 {
-                    30 // Decelerating
-                } else {
-                    15 // Dying
-                };
-
-                scores.push(SignalScore::new(
-                    SignalLayer::Microstructure,
-                    "velocity",
-                    accel_score,
-                    &format!(
-                        "Tx velocity {:.1}x vs prior period",
-                        acceleration
-                    ),
-                ));
-            }
+            scores.push(SignalScore::new(
+                SignalLayer::Microstructure,
+                "velocity",
+                accel_score,
+                &format!("Tx velocity {:.1}x vs prior period", m.velocity_multiplier),
+            ));
         }
 
         scores

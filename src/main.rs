@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         db.clone(),
         rpc.clone(),
         helius_url,
-        30,                                          // scan every 30 seconds
+        15,                                          // scan every 15 seconds
         config.alerts.confidence_threshold as i32,   // alert threshold from config
     );
     let scanner_handle = scanner.start();
