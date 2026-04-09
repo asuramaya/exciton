@@ -2,7 +2,7 @@ import Cocoa
 import SQLite3
 
 // Only show these — everything else is noise
-let SIGNAL_TYPES = ["staircase", "spring", "surge", "spring_ignition"]
+let SIGNAL_TYPES = ["grinder", "staircase", "spring", "surge", "spring_ignition"]
 
 struct Signal {
     let alertType: String
@@ -48,7 +48,7 @@ func acknowledgeNoise(dbPath: String) {
     sqlite3_exec(db, """
         UPDATE alerts SET acknowledged = 1
         WHERE acknowledged = 0
-        AND alert_type NOT IN ('staircase','spring','surge','spring_ignition')
+        AND alert_type NOT IN ('grinder','staircase','spring','surge','spring_ignition')
     """, nil, nil, nil)
 }
 
@@ -61,6 +61,7 @@ func acknowledgeAll(dbPath: String) {
 
 func icon(for alertType: String) -> String {
     switch alertType {
+    case "grinder": return "⛏️"
     case "staircase": return "📈"
     case "spring": return "🔋"
     case "surge": return "⚡"

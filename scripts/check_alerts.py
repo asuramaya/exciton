@@ -17,6 +17,7 @@ DB_PATH = Path(os.environ.get("PHOTON_DB", Path.home() / "Code" / "photon" / "ph
 LOG_PATH = Path.home() / ".photon_alerts.log"
 
 ICONS = {
+    "grinder": "⛏️",
     "staircase": "📈",
     "spring": "🔋",
     "surge": "⚡",
@@ -30,7 +31,7 @@ ICONS = {
 }
 
 # Alert types worth a macOS notification
-HIGH_PRIORITY = {"staircase", "spring", "surge", "spring_ignition", "classification_change"}
+HIGH_PRIORITY = {"grinder", "staircase", "spring", "surge", "spring_ignition", "classification_change"}
 
 def notify_macos(title, message):
     """Send a macOS notification via osascript."""

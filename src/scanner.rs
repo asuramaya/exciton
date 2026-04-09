@@ -158,6 +158,21 @@ impl BackgroundScanner {
             let class = &analysis.confidence.classification;
 
             match class.as_str() {
+                // GRINDER: escaped velocity — deep distribution + sustained demand congestion
+                "GRINDER" => {
+                    self.db.insert_alert(
+                        "grinder",
+                        Some(&analysis.address),
+                        &format!(
+                            "GRINDER {} — top holder {:.1}%, demand congestion on deep base",
+                            &analysis.address,
+                            analysis.top_holder_pct,
+                        ),
+                        analysis.confidence.total,
+                    )?;
+                    alert_count += 1;
+                }
+
                 // SPRING: distributed and quiet — loaded potential. Always alert.
                 "SPRING" => {
                     self.db.insert_alert(

@@ -163,22 +163,39 @@ impl Confidence {
             + (distribution as f64 * 0.30)
             + (spring as f64 * 0.30)) as i32;
 
+        // Check for demand congestion signal in scores
+        let has_demand_congestion = scores.iter().any(|s| s.signal_type == "demand_congestion");
+        let congestion_score = scores.iter()
+            .find(|s| s.signal_type == "demand_congestion")
+            .map(|s| s.score)
+            .unwrap_or(0);
+
         // Classification based on the pattern taxonomy
-        let classification = if momentum > 70 && distribution > 50 {
-            "STAIRCASE".to_string() // Active + distributed = AVA/GAYCOIN pattern
+        let classification = if distribution > 50 && has_demand_congestion && congestion_score > 70 {
+            // GRINDER: deep distribution + sustained demand congestion
+            // The BONK/WIF/FARTCOIN/CHILLGUY pattern — escaped velocity,
+            // grinding upward through demand that permanently exceeds supply.
+            // Velocity is low (0.3-1.0x) but that's the mature state.
+            "GRINDER".to_string()
+        } else if momentum > 70 && distribution > 50 {
+            "STAIRCASE".to_string()
         } else if momentum > 70 && distribution < 30 {
-            "SURGE".to_string() // Explosive + concentrated = rideable trap
+            "SURGE".to_string()
         } else if momentum < 30 && distribution > 50 {
-            "SPRING".to_string() // Quiet + distributed = loaded, waiting for ignition
+            "SPRING".to_string()
         } else if momentum < 20 && distribution < 30 {
-            "DEAD".to_string() // Nothing happening, concentrated
+            "DEAD".to_string()
         } else if momentum > 50 && distribution < 40 {
-            "ACTIVE_TRAP".to_string() // Activity on a still-concentrated token
+            "ACTIVE_TRAP".to_string()
         } else {
-            "DEVELOPING".to_string() // In between states
+            "DEVELOPING".to_string()
         };
 
         let reasoning = match classification.as_str() {
+            "GRINDER" => format!(
+                "GRINDER — distribution {}, congestion {}, momentum {} — deep holder base with sustained demand exceeding supply",
+                distribution, congestion_score, momentum
+            ),
             "STAIRCASE" => format!(
                 "STAIRCASE — momentum {}, distribution {}, spring {} — active with deep holder base, multi-wave potential",
                 momentum, distribution, spring
