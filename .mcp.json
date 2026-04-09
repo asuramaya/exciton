@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "photon": {
+      "command": "/Users/asuramaya/Code/photon/target/release/photon",
+      "args": ["/Users/asuramaya/Code/photon/config.toml"],
+      "env": {
+        "HELIUS_API_KEY": "${HELIUS_API_KEY}"
+      }
+    }
+  }
+}
