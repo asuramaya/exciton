@@ -321,7 +321,60 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<
     all_scores.extend(micro.analyze_activity(&signatures));
     all_scores.extend(onchain_analyzer.analyze_history_depth(&signatures));
 
-    // 5. Aggregate confidence
+    // 5. Cross-layer signal synthesis — patterns that emerge from combining layers
+    //    These are higher-order signals that no single layer can see alone.
+
+    // Demand congestion: high failure rate + deep holder base + high tx rate = bullish
+    // On CHILLGUY (116K holders), 84% failure = crowd fighting to get in.
+    // On PNUT (20 holders), 84% failure = congestion on thin liquidity.
+    let failure_rate = signatures.iter().filter(|s| s.err).count() as f64
+        / signatures.len().max(1) as f64;
+    let has_deep_holders = holder_count >= 15; // 15+ in top 20 = deep base
+    let has_good_distribution = top_holder_pct < 30.0;
+
+    if failure_rate > 0.2 && has_deep_holders && has_good_distribution {
+        // High failure rate on a distributed token = demand congestion (bullish)
+        let congestion_score = (70.0 + (failure_rate * 30.0)).min(95.0) as i32;
+        all_scores.push(SignalScore::new(
+            SignalLayer::Microstructure,
+            "demand_congestion",
+            congestion_score,
+            &format!(
+                "DEMAND CONGESTION: {:.0}% tx failure on distributed token (top holder {:.1}%, {} holders) — crowd fighting to enter",
+                failure_rate * 100.0, top_holder_pct, holder_count
+            ),
+        ));
+    } else if failure_rate > 0.3 && !has_good_distribution {
+        // High failure rate on concentrated token = just congestion, not meaningful
+        all_scores.push(SignalScore::new(
+            SignalLayer::Microstructure,
+            "congestion_warning",
+            30,
+            &format!(
+                "High failure rate ({:.0}%) on concentrated token (top holder {:.1}%) — congestion without deep demand",
+                failure_rate * 100.0, top_holder_pct
+            ),
+        ));
+    }
+
+    // Loaded spring detection: good distribution + velocity picking up from dormancy
+    let velocity_score = all_scores.iter()
+        .find(|s| s.signal_type == "velocity")
+        .map(|s| s.score)
+        .unwrap_or(0);
+    if has_good_distribution && has_deep_holders && velocity_score > 60 {
+        all_scores.push(SignalScore::new(
+            SignalLayer::Microstructure,
+            "spring_ignition",
+            90,
+            &format!(
+                "SPRING IGNITING: velocity rising on distributed token (top holder {:.1}%, {} holders) — potential wave forming",
+                top_holder_pct, holder_count
+            ),
+        ));
+    }
+
+    // 6. Aggregate confidence
     let confidence = Confidence::from_scores(&all_scores);
 
     // Extract tx_rate and velocity from scores for snapshot storage
