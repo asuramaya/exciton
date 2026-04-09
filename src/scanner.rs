@@ -208,17 +208,22 @@ impl BackgroundScanner {
                     }
                 }
 
-                // ACTIVE_TRAP: activity but concentrated — watch for distribution starting
+                // ACTIVE_TRAP: only alert if top holder < 60% AND has real holder depth
+                // 100% top holder with momentum 93 is just a bot pinging a shell
                 "ACTIVE_TRAP" => {
-                    if analysis.confidence.momentum > 70 {
+                    if analysis.top_holder_pct < 60.0
+                        && analysis.holder_count >= 10
+                        && analysis.confidence.momentum > 70
+                    {
                         self.db.insert_alert(
                             "active_trap",
                             Some(&analysis.address),
                             &format!(
-                                "ACTIVE TRAP {} — momentum {} but top holder {:.1}%, watch for distribution",
+                                "ACTIVE TRAP {} — momentum {}, top holder {:.1}%, {} holders — distribution starting?",
                                 &analysis.address,
                                 analysis.confidence.momentum,
                                 analysis.top_holder_pct,
+                                analysis.holder_count,
                             ),
                             analysis.confidence.total,
                         )?;
@@ -226,27 +231,29 @@ impl BackgroundScanner {
                     }
                 }
 
-                // DEAD or DEVELOPING: only alert on danger signals
+                // DEAD or DEVELOPING: don't alert on every concentrated token.
+                // Only alert on DEVELOPING tokens that have real distribution
+                // potential (>10 holders, top holder dropping)
                 _ => {
-                    let has_danger = analysis.scores.iter().any(|s| {
-                        s.layer == SignalLayer::Safety && s.score <= 10
-                    });
-                    if has_danger {
-                        let dangers: Vec<String> = analysis
-                            .scores
-                            .iter()
-                            .filter(|s| s.layer == SignalLayer::Safety && s.score <= 10)
-                            .map(|s| s.details.clone())
-                            .collect();
-
+                    if analysis.confidence.classification == "DEVELOPING"
+                        && analysis.holder_count >= 10
+                        && analysis.top_holder_pct < 50.0
+                    {
                         self.db.insert_alert(
-                            "danger",
+                            "developing",
                             Some(&analysis.address),
-                            &format!("DANGER {}: {}", &analysis.address, dangers.join("; ")),
+                            &format!(
+                                "DEVELOPING {} — top holder {:.1}%, {} holders, momentum {}, watch for transition",
+                                &analysis.address,
+                                analysis.top_holder_pct,
+                                analysis.holder_count,
+                                analysis.confidence.momentum,
+                            ),
                             analysis.confidence.total,
                         )?;
                         alert_count += 1;
                     }
+                    // DEAD tokens with 90%+ concentration are noise — don't alert
                 }
             }
 
