@@ -203,4 +203,86 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(logs)
     }
+
+    // -- Alert queue methods --
+
+    pub fn insert_alert(
+        &self,
+        alert_type: &str,
+        token_address: Option<&str>,
+        message: &str,
+        confidence: i32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO alerts (alert_type, token_address, message, confidence, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![alert_type, token_address, message, confidence, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_alerts(&self, limit: usize) -> Result<Vec<Alert>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, alert_type, token_address, message, confidence, timestamp \
+             FROM alerts WHERE acknowledged = 0 ORDER BY confidence DESC, id DESC LIMIT ?1",
+        )?;
+        let alerts = stmt
+            .query_map(params![limit], |row| {
+                Ok(Alert {
+                    id: row.get(0)?,
+                    alert_type: row.get(1)?,
+                    token_address: row.get(2)?,
+                    message: row.get(3)?,
+                    confidence: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(alerts)
+    }
+
+    pub fn acknowledge_alerts(&self, ids: &[i64]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for id in ids {
+            conn.execute(
+                "UPDATE alerts SET acknowledged = 1 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn pending_alert_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM alerts WHERE acknowledged = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Check if we've analyzed a token recently (within last N seconds)
+    pub fn token_analyzed_recently(&self, address: &str, within_seconds: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - within_seconds;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tokens WHERE address = ?1 AND first_seen > ?2",
+            params![address, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Alert {
+    pub id: i64,
+    pub alert_type: String,
+    pub token_address: Option<String>,
+    pub message: String,
+    pub confidence: i32,
+    pub timestamp: i64,
 }

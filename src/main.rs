@@ -10,12 +10,14 @@ mod execution;
 mod forecaster;
 mod ingester;
 mod mcp;
+mod scanner;
 mod signals;
 
 use config::Config;
 use db::Db;
 use ingester::{resolve_endpoints, RpcRouter};
 use mcp::PhotonServer;
+use scanner::BackgroundScanner;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,11 +57,27 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!("RPC connection error: {} — will retry on demand", e),
     }
 
+    // Start background scanner
+    let helius_url = resolved_endpoints.first().cloned().unwrap_or_default();
+    let scanner = BackgroundScanner::new(
+        db.clone(),
+        rpc.clone(),
+        helius_url,
+        30,                                          // scan every 30 seconds
+        config.alerts.confidence_threshold as i32,   // alert threshold from config
+    );
+    let scanner_handle = scanner.start();
+    tracing::info!("Background scanner started (30s interval)");
+
+    // Start MCP server
     let server = PhotonServer::new(db, config, rpc, resolved_endpoints);
     tracing::info!("MCP server starting on stdio");
 
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
+
+    // Cleanup
+    scanner_handle.stop();
 
     Ok(())
 }

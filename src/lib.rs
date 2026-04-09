@@ -6,3 +6,4 @@ pub mod signals;
 pub mod forecaster;
 pub mod execution;
 pub mod mcp;
+pub mod scanner;

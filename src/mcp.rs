@@ -101,6 +101,7 @@ struct TradePreview {
 #[derive(Debug, Serialize)]
 struct StatusResult {
     system_health: SystemHealth,
+    pending_alerts: usize,
     positions: Vec<Position>,
     wallet: String,
     total_balance_sol: f64,
@@ -152,71 +153,62 @@ impl PhotonServer {
 
 #[tool_router]
 impl PhotonServer {
-    /// Scan the market: discover new tokens from Pump.fun, analyze them, rank by confidence.
-    /// Flow: check health -> discover tokens -> run signal analysis -> rank -> present.
+    /// Scan the market: read alerts from background scanner, show pending opportunities.
+    /// The background scanner runs every 30s discovering and analyzing new tokens.
+    /// This tool reads the queue — results are instant.
     #[tool]
     async fn scan(&self) -> String {
         let _ = self.db.audit_log("claude", "scan", "Market scan requested");
 
         let rpc_connected = self.rpc.check_connection().await.unwrap_or(false);
 
-        if !rpc_connected {
-            return to_json(&ScanResult {
-                healthy: false,
-                rpc_connected: false,
-                rpc_endpoints: self.rpc.endpoint_count(),
-                rpc_healthy: self.rpc.healthy_count(),
-                regime: "Unknown".to_string(),
-                opportunities: vec![],
-                alerts: vec![AlertInfo {
-                    alert_type: "system".to_string(),
-                    message: "RPC not connected — check API keys and endpoints".to_string(),
-                    confidence: 100,
-                }],
+        // Read pending alerts from the background scanner's queue
+        let pending_alerts = self.db.get_pending_alerts(20).unwrap_or_default();
+        let pending_count = self.db.pending_alert_count().unwrap_or(0);
+
+        // Separate into opportunities and danger alerts
+        let mut opportunities = Vec::new();
+        let mut alerts = Vec::new();
+        let mut alert_ids = Vec::new();
+
+        for alert in &pending_alerts {
+            alert_ids.push(alert.id);
+
+            if alert.alert_type == "discovery" {
+                let position_pct = self.forecaster.position_pct(alert.confidence, 3);
+                opportunities.push(Opportunity {
+                    token: alert.token_address.clone().unwrap_or_default(),
+                    confidence: alert.confidence,
+                    coverage: 3,
+                    recommended_position_pct: position_pct,
+                    reasoning: alert.message.clone(),
+                });
+            }
+
+            alerts.push(AlertInfo {
+                alert_type: alert.alert_type.clone(),
+                message: alert.message.clone(),
+                confidence: alert.confidence,
             });
         }
 
-        // Discover and analyze new tokens (limit to 5 to stay within rate limits)
-        let helius_url = self.resolved_endpoints.first().cloned().unwrap_or_default();
-        let analyses = discovery::discover_new_tokens(&helius_url, &self.db, &self.rpc, 5)
-            .await
-            .unwrap_or_default();
+        // Mark alerts as acknowledged after reading
+        let _ = self.db.acknowledge_alerts(&alert_ids);
 
-        let opportunities: Vec<Opportunity> = analyses
-            .iter()
-            .map(|a| {
-                let position_pct = self.forecaster.position_pct(
-                    a.confidence.total,
-                    a.confidence.coverage,
-                );
-                Opportunity {
-                    token: a.address.clone(),
-                    confidence: a.confidence.total,
-                    coverage: a.confidence.coverage,
-                    recommended_position_pct: position_pct,
-                    reasoning: a.confidence.reasoning.clone(),
-                }
-            })
-            .collect();
-
-        let mut alerts = Vec::new();
-        // Alert on any high-confidence opportunities
-        for opp in &opportunities {
-            if opp.confidence >= self.config.alerts.confidence_threshold as i32 {
-                alerts.push(AlertInfo {
-                    alert_type: "opportunity".to_string(),
-                    message: format!(
-                        "Token {} scored {}/100 — recommended {}% position",
-                        opp.token, opp.confidence, opp.recommended_position_pct
-                    ),
-                    confidence: opp.confidence,
-                });
-            }
+        if !rpc_connected {
+            alerts.push(AlertInfo {
+                alert_type: "system".to_string(),
+                message: "RPC not connected — check API keys and endpoints".to_string(),
+                confidence: 100,
+            });
         }
 
+        // Sort opportunities by confidence
+        opportunities.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+
         to_json(&ScanResult {
-            healthy: true,
-            rpc_connected: true,
+            healthy: self.is_healthy() && rpc_connected,
+            rpc_connected,
             rpc_endpoints: self.rpc.endpoint_count(),
             rpc_healthy: self.rpc.healthy_count(),
             regime: Regime::LowActivityGrind.to_string(),
@@ -392,16 +384,25 @@ impl PhotonServer {
             format!("Wallet {} — unable to fetch balance", wallet_key)
         };
 
+        let pending_alerts = self.db.pending_alert_count().unwrap_or(0);
+
+        let message = if pending_alerts > 0 {
+            format!("{} — {} pending alerts, call scan to review", message, pending_alerts)
+        } else {
+            message
+        };
+
         to_json(&StatusResult {
             system_health: SystemHealth {
                 rpc_connected,
                 rpc_endpoints: self.rpc.endpoint_count(),
                 rpc_healthy: self.rpc.healthy_count(),
                 db_writable: self.is_healthy(),
-                signal_layers_active: 0,
+                signal_layers_active: 3,
                 current_slot,
                 data_freshness,
             },
+            pending_alerts,
             positions: vec![],
             wallet: wallet_key.clone(),
             total_balance_sol: balance_sol.unwrap_or(0.0),
