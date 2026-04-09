@@ -1,0 +1,5 @@
+/target
+photon.db
+photon.db-wal
+photon.db-shm
+config.toml

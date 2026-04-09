@@ -1,0 +1,23 @@
+[rpc]
+endpoints = ["wss://api.mainnet-beta.solana.com"]
+# For production, use Helius/Triton with geyser support
+
+[wallet]
+# Public key only - private key loaded from OS keychain
+public_key = ""
+
+[risk]
+max_position_pct = 15.0
+default_position_pct = 0.5
+high_confidence_threshold = 80
+slippage_bps = 100
+priority_fee_lamports = 10000
+
+[tracking]
+# Wallet addresses to track for smart money signals
+wallets = []
+max_active_tokens = 500
+
+[alerts]
+confidence_threshold = 70
+stale_feed_seconds = 30
