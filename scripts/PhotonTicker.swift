@@ -62,10 +62,8 @@ func fetchSignals() -> [TokenSignal] {
         var classification = alertType.uppercased()
 
         var sStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db,
-            "SELECT top_holder_pct, top5_pct, tx_rate, velocity, momentum, distribution, spring, classification FROM token_snapshots WHERE token_address = ? ORDER BY timestamp DESC LIMIT 1",
-            -1, &sStmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(sStmt, 1, address, -1, nil)
+        let snapQuery = "SELECT top_holder_pct, top5_pct, tx_rate, velocity, momentum, distribution, spring, classification FROM token_snapshots WHERE token_address = '\(address)' ORDER BY timestamp DESC LIMIT 1"
+        if sqlite3_prepare_v2(db, snapQuery, -1, &sStmt, nil) == SQLITE_OK {
             if sqlite3_step(sStmt) == SQLITE_ROW {
                 topHolder = sqlite3_column_double(sStmt, 0)
                 top5 = sqlite3_column_double(sStmt, 1)
@@ -85,10 +83,8 @@ func fetchSignals() -> [TokenSignal] {
         var elapsed: Int64? = nil
 
         var dStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db,
-            "SELECT top_holder_pct, momentum, timestamp FROM token_snapshots WHERE token_address = ? ORDER BY timestamp DESC LIMIT 1 OFFSET 1",
-            -1, &dStmt, nil) == SQLITE_OK {
-            sqlite3_bind_text(dStmt, 1, address, -1, nil)
+        let deltaQuery = "SELECT top_holder_pct, momentum FROM token_snapshots WHERE token_address = '\(address)' ORDER BY timestamp DESC LIMIT 1 OFFSET 1"
+        if sqlite3_prepare_v2(db, deltaQuery, -1, &dStmt, nil) == SQLITE_OK {
             if sqlite3_step(dStmt) == SQLITE_ROW {
                 let prevTop = sqlite3_column_double(dStmt, 0)
                 let prevMom = Int(sqlite3_column_int(dStmt, 1))
