@@ -230,13 +230,18 @@ pub struct TokenAnalysis {
     pub decimals: u8,
     pub holder_count: usize,
     pub top_holder_pct: f64,
+    pub top5_pct: f64,
+    pub top10_pct: f64,
+    pub tx_rate: f64,
+    pub velocity: f64,
     pub recent_tx_count: usize,
     pub scores: Vec<SignalScore>,
     pub confidence: Confidence,
+    pub delta: Option<crate::db::TokenDelta>,
 }
 
-/// Run all signal layers against a live token
-pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<TokenAnalysis> {
+/// Run all signal layers against a live token, store snapshot, compute delta
+pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<&Arc<crate::db::Db>>) -> Result<TokenAnalysis> {
     let safety_checker = safety::SafetyChecker::new();
     let micro = microstructure::MicrostructureAnalyzer::new();
     let onchain_analyzer = onchain::OnChainAnalyzer::new();
@@ -297,6 +302,12 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<T
     } else {
         0.0
     };
+    let top5_pct: f64 = holders.iter().take(5).map(|h| {
+        if supply_ui > 0.0 { (h.ui_amount / supply_ui) * 100.0 } else { 0.0 }
+    }).sum();
+    let top10_pct: f64 = holders.iter().take(10).map(|h| {
+        if supply_ui > 0.0 { (h.ui_amount / supply_ui) * 100.0 } else { 0.0 }
+    }).sum();
 
     all_scores.extend(safety_checker.analyze_holders(&holders, supply_ui));
 
@@ -313,6 +324,42 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<T
     // 5. Aggregate confidence
     let confidence = Confidence::from_scores(&all_scores);
 
+    // Extract tx_rate and velocity from scores for snapshot storage
+    let tx_rate = all_scores.iter()
+        .find(|s| s.signal_type == "tx_rate")
+        .map(|s| s.score as f64)
+        .unwrap_or(0.0);
+    let velocity = all_scores.iter()
+        .find(|s| s.signal_type == "velocity")
+        .map(|s| s.score as f64)
+        .unwrap_or(0.0);
+
+    // 6. Store snapshot and compute delta
+    let now = chrono::Utc::now().timestamp();
+    let current_snapshot = crate::db::TokenSnapshot {
+        token_address: mint_address.to_string(),
+        top_holder_pct,
+        top5_pct,
+        top10_pct,
+        holder_count: holder_count as i32,
+        tx_rate,
+        velocity,
+        momentum: confidence.momentum,
+        distribution: confidence.distribution,
+        spring: confidence.spring,
+        classification: confidence.classification.clone(),
+        confidence: confidence.total,
+        timestamp: now,
+    };
+
+    let delta = if let Some(db) = db {
+        let d = db.compute_delta(mint_address, &current_snapshot).ok().flatten();
+        let _ = db.insert_snapshot(&current_snapshot);
+        d
+    } else {
+        None
+    };
+
     Ok(TokenAnalysis {
         address: mint_address.to_string(),
         mint_authority,
@@ -322,8 +369,13 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<T
         decimals,
         holder_count,
         top_holder_pct,
+        top5_pct,
+        top10_pct,
+        tx_rate,
+        velocity,
         recent_tx_count,
         scores: all_scores,
         confidence,
+        delta,
     })
 }

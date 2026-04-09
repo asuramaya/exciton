@@ -121,6 +121,27 @@ impl Db {
                 details TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS token_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address TEXT NOT NULL,
+                top_holder_pct REAL NOT NULL,
+                top5_pct REAL NOT NULL,
+                top10_pct REAL NOT NULL,
+                holder_count INTEGER NOT NULL,
+                tx_rate REAL NOT NULL,
+                velocity REAL NOT NULL,
+                momentum INTEGER NOT NULL,
+                distribution INTEGER NOT NULL,
+                spring INTEGER NOT NULL,
+                classification TEXT NOT NULL,
+                confidence INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshots_token ON token_snapshots(token_address);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON token_snapshots(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_token_time ON token_snapshots(token_address, timestamp);
+
             CREATE INDEX IF NOT EXISTS idx_token_signals_token ON token_signals(token_address);
             CREATE INDEX IF NOT EXISTS idx_token_signals_timestamp ON token_signals(timestamp);
             CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet_address);
@@ -275,6 +296,123 @@ impl Db {
         )?;
         Ok(count > 0)
     }
+
+    // -- Snapshot tracking (film, not frames) --
+
+    pub fn insert_snapshot(&self, snap: &TokenSnapshot) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO token_snapshots (token_address, top_holder_pct, top5_pct, top10_pct, \
+             holder_count, tx_rate, velocity, momentum, distribution, spring, classification, \
+             confidence, timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                snap.token_address,
+                snap.top_holder_pct,
+                snap.top5_pct,
+                snap.top10_pct,
+                snap.holder_count,
+                snap.tx_rate,
+                snap.velocity,
+                snap.momentum,
+                snap.distribution,
+                snap.spring,
+                snap.classification,
+                snap.confidence,
+                snap.timestamp,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_previous_snapshot(&self, address: &str) -> Result<Option<TokenSnapshot>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token_address, top_holder_pct, top5_pct, top10_pct, holder_count, \
+             tx_rate, velocity, momentum, distribution, spring, classification, confidence, timestamp \
+             FROM token_snapshots WHERE token_address = ?1 ORDER BY timestamp DESC LIMIT 1"
+        )?;
+        let snap = stmt.query_row(params![address], |row| {
+            Ok(TokenSnapshot {
+                token_address: row.get(0)?,
+                top_holder_pct: row.get(1)?,
+                top5_pct: row.get(2)?,
+                top10_pct: row.get(3)?,
+                holder_count: row.get(4)?,
+                tx_rate: row.get(5)?,
+                velocity: row.get(6)?,
+                momentum: row.get(7)?,
+                distribution: row.get(8)?,
+                spring: row.get(9)?,
+                classification: row.get(10)?,
+                confidence: row.get(11)?,
+                timestamp: row.get(12)?,
+            })
+        }).optional()?;
+        Ok(snap)
+    }
+
+    pub fn get_snapshot_history(&self, address: &str, limit: usize) -> Result<Vec<TokenSnapshot>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token_address, top_holder_pct, top5_pct, top10_pct, holder_count, \
+             tx_rate, velocity, momentum, distribution, spring, classification, confidence, timestamp \
+             FROM token_snapshots WHERE token_address = ?1 ORDER BY timestamp DESC LIMIT ?2"
+        )?;
+        let snaps = stmt.query_map(params![address, limit], |row| {
+            Ok(TokenSnapshot {
+                token_address: row.get(0)?,
+                top_holder_pct: row.get(1)?,
+                top5_pct: row.get(2)?,
+                top10_pct: row.get(3)?,
+                holder_count: row.get(4)?,
+                tx_rate: row.get(5)?,
+                velocity: row.get(6)?,
+                momentum: row.get(7)?,
+                distribution: row.get(8)?,
+                spring: row.get(9)?,
+                classification: row.get(10)?,
+                confidence: row.get(11)?,
+                timestamp: row.get(12)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(snaps)
+    }
+
+    pub fn compute_delta(&self, address: &str, current: &TokenSnapshot) -> Result<Option<TokenDelta>> {
+        let previous = self.get_previous_snapshot(address)?;
+        match previous {
+            None => Ok(None),
+            Some(prev) => {
+                let top_holder_delta = current.top_holder_pct - prev.top_holder_pct;
+                let top5_delta = current.top5_pct - prev.top5_pct;
+                let holder_count_delta = current.holder_count - prev.holder_count;
+                let momentum_delta = current.momentum - prev.momentum;
+                let time_elapsed = current.timestamp - prev.timestamp;
+
+                let concentration_direction = if top_holder_delta < -2.0 {
+                    "distributing".to_string()
+                } else if top_holder_delta > 2.0 {
+                    "concentrating".to_string()
+                } else {
+                    "stable".to_string()
+                };
+
+                let classification_changed = current.classification != prev.classification;
+
+                Ok(Some(TokenDelta {
+                    previous: prev,
+                    current: current.clone(),
+                    top_holder_delta,
+                    top5_delta,
+                    holder_count_delta,
+                    momentum_delta,
+                    time_elapsed_seconds: time_elapsed,
+                    concentration_direction,
+                    classification_changed,
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,4 +423,34 @@ pub struct Alert {
     pub message: String,
     pub confidence: i32,
     pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenSnapshot {
+    pub token_address: String,
+    pub top_holder_pct: f64,
+    pub top5_pct: f64,
+    pub top10_pct: f64,
+    pub holder_count: i32,
+    pub tx_rate: f64,
+    pub velocity: f64,
+    pub momentum: i32,
+    pub distribution: i32,
+    pub spring: i32,
+    pub classification: String,
+    pub confidence: i32,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenDelta {
+    pub previous: TokenSnapshot,
+    pub current: TokenSnapshot,
+    pub top_holder_delta: f64,
+    pub top5_delta: f64,
+    pub holder_count_delta: i32,
+    pub momentum_delta: i32,
+    pub time_elapsed_seconds: i64,
+    pub concentration_direction: String, // "distributing", "concentrating", "stable"
+    pub classification_changed: bool,
 }

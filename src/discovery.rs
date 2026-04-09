@@ -105,7 +105,7 @@ pub async fn discover_new_tokens(
     let mut analyses: Vec<TokenAnalysis> = Vec::new();
 
     for mint in &fresh_mints {
-        match signals::analyze_token(rpc, mint).await {
+        match signals::analyze_token(rpc, mint, Some(db)).await {
             Ok(analysis) => {
                 // Store in DB
                 let _ = db.insert_token(&analysis.address, analysis.confidence.total);

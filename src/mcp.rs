@@ -76,9 +76,24 @@ struct AlertInfo {
 struct InspectResult {
     target: String,
     target_type: String,
+    classification: String,
     safety: Vec<SignalDetail>,
     signals: Vec<SignalDetail>,
     risk_rating: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<DeltaInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeltaInfo {
+    time_since_last: String,
+    top_holder_delta: String,
+    top5_delta: String,
+    holder_count_delta: String,
+    momentum_delta: String,
+    concentration_direction: String,
+    classification_changed: bool,
+    previous_classification: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,7 +249,7 @@ impl PhotonServer {
             .audit_log("claude", "inspect", &format!("Inspecting {}", params.address));
 
         // Run full token analysis through all signal layers
-        match signals::analyze_token(&self.rpc, &params.address).await {
+        match signals::analyze_token(&self.rpc, &params.address, Some(&self.db)).await {
             Ok(analysis) => {
                 let safety_scores: Vec<SignalDetail> = analysis
                     .scores
@@ -273,17 +288,40 @@ impl PhotonServer {
                     analysis.confidence.total,
                 );
 
+                let delta_info = analysis.delta.as_ref().map(|d| {
+                    let elapsed = if d.time_elapsed_seconds < 60 {
+                        format!("{}s ago", d.time_elapsed_seconds)
+                    } else if d.time_elapsed_seconds < 3600 {
+                        format!("{}m ago", d.time_elapsed_seconds / 60)
+                    } else {
+                        format!("{:.1}h ago", d.time_elapsed_seconds as f64 / 3600.0)
+                    };
+                    DeltaInfo {
+                        time_since_last: elapsed,
+                        top_holder_delta: format!("{:+.1}%", d.top_holder_delta),
+                        top5_delta: format!("{:+.1}%", d.top5_delta),
+                        holder_count_delta: format!("{:+}", d.holder_count_delta),
+                        momentum_delta: format!("{:+}", d.momentum_delta),
+                        concentration_direction: d.concentration_direction.clone(),
+                        classification_changed: d.classification_changed,
+                        previous_classification: d.previous.classification.clone(),
+                    }
+                });
+
                 to_json(&InspectResult {
                     target: params.address,
                     target_type: "token".to_string(),
+                    classification: analysis.confidence.classification.clone(),
                     safety: safety_scores,
                     signals: other_scores,
                     risk_rating,
+                    delta: delta_info,
                 })
             }
             Err(e) => to_json(&InspectResult {
                 target: params.address,
                 target_type: "unknown".to_string(),
+                classification: "ERROR".to_string(),
                 safety: vec![],
                 signals: vec![SignalDetail {
                     layer: "System".to_string(),
@@ -292,6 +330,7 @@ impl PhotonServer {
                     details: format!("Analysis failed: {}", e),
                 }],
                 risk_rating: format!("UNKNOWN — analysis error: {}", e),
+                delta: None,
             }),
         }
     }
