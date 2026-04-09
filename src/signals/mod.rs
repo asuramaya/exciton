@@ -61,6 +61,8 @@ impl SignalScore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Confidence {
     pub total: i32,
+    pub momentum: i32,
+    pub safety: i32,
     pub coverage: usize,
     pub layer_scores: Vec<(SignalLayer, i32)>,
     pub reasoning: String,
@@ -75,45 +77,86 @@ impl Confidence {
         }
 
         let mut layer_scores = Vec::new();
-        let mut weighted_sum = 0.0;
-        let mut total_weight = 0.0;
+        let mut context_sum = 0.0; // Safety + OnChain = structural context
+        let mut context_count = 0;
+        let mut momentum_sum = 0.0; // Microstructure + SmartMoney = momentum
+        let mut momentum_count = 0;
 
         for layer in SignalLayer::all() {
             if let Some(vals) = layer_avgs.get(layer) {
                 let avg = vals.iter().sum::<i32>() as f64 / vals.len() as f64;
                 layer_scores.push((*layer, avg as i32));
-                weighted_sum += avg * layer.weight();
-                total_weight += layer.weight();
+
+                match layer {
+                    SignalLayer::Safety | SignalLayer::OnChain => {
+                        context_sum += avg;
+                        context_count += 1;
+                    }
+                    SignalLayer::Microstructure | SignalLayer::SmartMoney => {
+                        momentum_sum += avg;
+                        momentum_count += 1;
+                    }
+                }
             }
         }
-
-        let coverage = layer_scores.len();
-        // Soft coverage penalty: 1 layer = 0.6x, 2 = 0.75x, 3 = 0.9x, 4 = 1.0x
-        // Missing SmartMoney shouldn't tank the score — it's an enhancement layer
-        let coverage_penalty = match coverage {
-            0 => 0.0,
-            1 => 0.6,
-            2 => 0.75,
-            3 => 0.9,
-            _ => 1.0,
-        };
-        let raw_total = if total_weight > 0.0 {
-            weighted_sum / total_weight
+        let safety_avg = if context_count > 0 {
+            context_sum / context_count as f64
         } else {
             0.0
         };
-        let total = (raw_total * coverage_penalty) as i32;
+
+        let coverage = layer_scores.len();
+        let momentum = if momentum_count > 0 {
+            (momentum_sum / momentum_count as f64) as i32
+        } else {
+            0
+        };
+        let safety = safety_avg as i32;
+
+        // Total confidence: momentum-weighted score
+        // High momentum + moderate safety = high confidence (rideable trap)
+        // High momentum + low safety = moderate confidence (dangerous but real)
+        // Low momentum + any safety = low confidence (nothing happening)
+        //
+        // Momentum is 70% of the score. Safety is 30%.
+        // A dead-safe token with no activity scores low.
+        // A concentrated token with explosive activity scores high.
+        let total = ((momentum as f64 * 0.70) + (safety as f64 * 0.30)) as i32;
+
+        let reasoning = if momentum > 70 && safety < 40 {
+            format!(
+                "SURGE CANDIDATE — momentum {}, safety {} — high activity on concentrated token, window may be open",
+                momentum, safety
+            )
+        } else if momentum > 70 && safety >= 40 {
+            format!(
+                "STRONG — momentum {}, safety {} — active with reasonable distribution",
+                momentum, safety
+            )
+        } else if momentum > 50 {
+            format!(
+                "ACTIVE — momentum {}, safety {} — moderate activity",
+                momentum, safety
+            )
+        } else if momentum > 30 {
+            format!(
+                "SLOW — momentum {}, safety {} — low activity",
+                momentum, safety
+            )
+        } else {
+            format!(
+                "DEAD — momentum {}, safety {} — no meaningful activity",
+                momentum, safety
+            )
+        };
 
         Self {
             total: total.clamp(0, 100),
+            momentum: momentum.clamp(0, 100),
+            safety: safety.clamp(0, 100),
             coverage,
             layer_scores,
-            reasoning: format!(
-                "{} of {} layers reporting, weighted score {}",
-                coverage,
-                SignalLayer::all().len(),
-                total
-            ),
+            reasoning,
         }
     }
 }

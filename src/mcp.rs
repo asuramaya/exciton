@@ -56,6 +56,8 @@ struct ScanResult {
 struct Opportunity {
     token: String,
     confidence: i32,
+    momentum: i32,
+    safety: i32,
     coverage: usize,
     recommended_position_pct: f64,
     reasoning: String,
@@ -179,6 +181,8 @@ impl PhotonServer {
                 opportunities.push(Opportunity {
                     token: alert.token_address.clone().unwrap_or_default(),
                     confidence: alert.confidence,
+                    momentum: 0,
+                    safety: 0,
                     coverage: 3,
                     recommended_position_pct: position_pct,
                     reasoning: alert.message.clone(),
@@ -252,28 +256,13 @@ impl PhotonServer {
                     })
                     .collect();
 
-                let risk_rating = if analysis.confidence.total >= 70 {
-                    format!(
-                        "LOW RISK — confidence {}/100 ({} layers, {} signals)",
-                        analysis.confidence.total,
-                        analysis.confidence.coverage,
-                        analysis.scores.len()
-                    )
-                } else if analysis.confidence.total >= 40 {
-                    format!(
-                        "MEDIUM RISK — confidence {}/100 ({} layers, {} signals)",
-                        analysis.confidence.total,
-                        analysis.confidence.coverage,
-                        analysis.scores.len()
-                    )
-                } else {
-                    format!(
-                        "HIGH RISK — confidence {}/100 ({} layers, {} signals)",
-                        analysis.confidence.total,
-                        analysis.confidence.coverage,
-                        analysis.scores.len()
-                    )
-                };
+                let risk_rating = format!(
+                    "{} — momentum {}/100, safety {}/100, {} signals",
+                    analysis.confidence.reasoning,
+                    analysis.confidence.momentum,
+                    analysis.confidence.safety,
+                    analysis.scores.len()
+                );
 
                 // Store in DB for historical tracking
                 let _ = self.db.insert_token(
