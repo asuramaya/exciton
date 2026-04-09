@@ -13,6 +13,7 @@ mod signals;
 
 use config::Config;
 use db::Db;
+use ingester::{resolve_endpoints, RpcRouter};
 use mcp::PhotonServer;
 
 #[tokio::main]
@@ -38,7 +39,22 @@ async fn main() -> Result<()> {
     db.audit_log("system", "startup", "Photon Signal Forecaster started")?;
     tracing::info!("Database initialized at {:?}", db_path);
 
-    let server = PhotonServer::new(db, config);
+    // Resolve env vars in endpoint URLs and create RPC router
+    let resolved_endpoints = resolve_endpoints(&config.rpc.endpoints);
+    let rpc = Arc::new(RpcRouter::new(&resolved_endpoints)?);
+    tracing::info!(
+        "RPC router ready: {} endpoints configured",
+        rpc.endpoint_count()
+    );
+
+    // Test connectivity
+    match rpc.check_connection().await {
+        Ok(true) => tracing::info!("RPC connection verified"),
+        Ok(false) => tracing::warn!("RPC connection check failed — will retry on demand"),
+        Err(e) => tracing::warn!("RPC connection error: {} — will retry on demand", e),
+    }
+
+    let server = PhotonServer::new(db, config, rpc);
     tracing::info!("MCP server starting on stdio");
 
     let service = server.serve(rmcp::transport::stdio()).await?;

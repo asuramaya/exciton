@@ -1,9 +1,14 @@
 [rpc]
-endpoints = ["wss://api.mainnet-beta.solana.com"]
-# For production, use Helius/Triton with geyser support
+# Endpoints support ${ENV_VAR} syntax for API keys.
+# Stack multiple providers for failover and combined rate limits.
+# Keys are NEVER stored here — only env var references.
+endpoints = [
+    "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}",
+    "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}",
+]
 
 [wallet]
-# Public key only - private key loaded from OS keychain
+# Public key only — private key loaded from OS keychain at signing time
 public_key = ""
 
 [risk]

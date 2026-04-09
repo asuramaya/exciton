@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::db::Db;
 use crate::forecaster::{Forecaster, Regime};
+use crate::ingester::RpcRouter;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 pub struct PhotonServer {
     db: Arc<Db>,
     config: Config,
+    rpc: Arc<RpcRouter>,
     forecaster: Forecaster,
     tool_router: ToolRouter<Self>,
 }
@@ -39,6 +41,9 @@ pub struct TradeParams {
 #[derive(Debug, Serialize)]
 struct ScanResult {
     healthy: bool,
+    rpc_connected: bool,
+    rpc_endpoints: usize,
+    rpc_healthy: usize,
     regime: String,
     opportunities: Vec<Opportunity>,
     alerts: Vec<AlertInfo>,
@@ -104,8 +109,11 @@ struct StatusResult {
 #[derive(Debug, Serialize)]
 struct SystemHealth {
     rpc_connected: bool,
+    rpc_endpoints: usize,
+    rpc_healthy: usize,
     db_writable: bool,
     signal_layers_active: usize,
+    current_slot: Option<u64>,
     data_freshness: String,
 }
 
@@ -123,10 +131,11 @@ fn to_json<T: Serialize>(data: &T) -> String {
 }
 
 impl PhotonServer {
-    pub fn new(db: Arc<Db>, config: Config) -> Self {
+    pub fn new(db: Arc<Db>, config: Config, rpc: Arc<RpcRouter>) -> Self {
         Self {
             db,
             config,
+            rpc,
             forecaster: Forecaster::new(),
             tool_router: Self::tool_router(),
         }
@@ -140,16 +149,29 @@ impl PhotonServer {
 #[tool_router]
 impl PhotonServer {
     /// Scan the market: system health, current regime, top opportunities, active alerts.
-    /// Flow: check health -> query forecaster -> present ranked results.
+    /// Flow: check health -> check RPC connectivity -> query forecaster -> present ranked results.
     #[tool]
-    fn scan(&self) -> String {
+    async fn scan(&self) -> String {
         let _ = self.db.audit_log("claude", "scan", "Market scan requested");
 
+        let rpc_connected = self.rpc.check_connection().await.unwrap_or(false);
+
         to_json(&ScanResult {
-            healthy: self.is_healthy(),
+            healthy: self.is_healthy() && rpc_connected,
+            rpc_connected,
+            rpc_endpoints: self.rpc.endpoint_count(),
+            rpc_healthy: self.rpc.healthy_count(),
             regime: Regime::LowActivityGrind.to_string(),
             opportunities: vec![],
-            alerts: vec![],
+            alerts: if !rpc_connected {
+                vec![AlertInfo {
+                    alert_type: "system".to_string(),
+                    message: "RPC not connected — check API keys and endpoints".to_string(),
+                    confidence: 100,
+                }]
+            } else {
+                vec![]
+            },
         })
     }
 
@@ -203,33 +225,72 @@ impl PhotonServer {
     }
 
     /// Portfolio status and system health.
-    /// Flow: check all components -> positions with live P&L -> exposure vs risk limits -> data freshness.
+    /// Flow: check all components -> query wallet balance live -> positions with live P&L -> exposure vs risk limits -> data freshness.
     #[tool]
-    fn status(&self) -> String {
+    async fn status(&self) -> String {
         let _ = self
             .db
             .audit_log("claude", "status", "Status check requested");
 
         let wallet_key = &self.config.wallet.public_key;
+
+        // Check RPC connectivity and get slot
+        let rpc_connected = self.rpc.check_connection().await.unwrap_or(false);
+        let current_slot = if rpc_connected {
+            self.rpc.get_slot().await.ok()
+        } else {
+            None
+        };
+
+        // Get live wallet balance if configured and connected
+        let balance_lamports = if !wallet_key.is_empty() && rpc_connected {
+            self.rpc.get_balance(wallet_key).await.ok()
+        } else {
+            None
+        };
+        let balance_sol = balance_lamports.map(|l| l as f64 / 1_000_000_000.0);
+
+        let data_freshness = if let Some(slot) = current_slot {
+            format!("Live — slot {}", slot)
+        } else if !rpc_connected {
+            "No connection — check RPC endpoints and API keys".to_string()
+        } else {
+            "Connected but unable to read slot".to_string()
+        };
+
         let message = if wallet_key.is_empty() {
             "No wallet configured. Set wallet.public_key in config.toml".to_string()
-        } else {
+        } else if !rpc_connected {
             format!(
-                "Wallet {} has 0 SOL - fund this wallet to begin trading",
+                "Wallet {} configured but RPC not connected — set API keys",
                 wallet_key
             )
+        } else if let Some(sol) = balance_sol {
+            if sol < 0.01 {
+                format!(
+                    "Wallet {} has {:.4} SOL — fund this wallet to begin trading",
+                    wallet_key, sol
+                )
+            } else {
+                format!("Wallet {} — {:.4} SOL available", wallet_key, sol)
+            }
+        } else {
+            format!("Wallet {} — unable to fetch balance", wallet_key)
         };
 
         to_json(&StatusResult {
             system_health: SystemHealth {
-                rpc_connected: false,
+                rpc_connected,
+                rpc_endpoints: self.rpc.endpoint_count(),
+                rpc_healthy: self.rpc.healthy_count(),
                 db_writable: self.is_healthy(),
                 signal_layers_active: 0,
-                data_freshness: "No data yet - awaiting RPC connection".to_string(),
+                current_slot,
+                data_freshness,
             },
             positions: vec![],
             wallet: wallet_key.clone(),
-            total_balance_sol: 0.0,
+            total_balance_sol: balance_sol.unwrap_or(0.0),
             total_pnl_sol: 0.0,
             exposure_pct: 0.0,
             message,
@@ -242,9 +303,7 @@ impl ServerHandler for PhotonServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
                 name: "photon".to_string(),
                 title: Some("Photon Signal Forecaster".to_string()),
