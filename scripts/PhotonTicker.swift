@@ -1,50 +1,135 @@
 import Cocoa
 import SQLite3
 
-// Only show these — everything else is noise
-let SIGNAL_TYPES = ["grinder", "staircase", "spring", "surge", "spring_ignition"]
+// MARK: - Data
 
-struct Signal {
+struct TokenSignal {
+    let address: String
     let alertType: String
-    let tokenAddress: String?
-    let message: String
     let confidence: Int
+    // From latest snapshot
+    let topHolderPct: Double
+    let top5Pct: Double
+    let txRate: Double
+    let velocity: Double
+    let momentum: Int
+    let distribution: Int
+    let spring: Int
+    let classification: String
+    // Delta from previous snapshot
+    let topHolderDelta: Double?
+    let momentumDelta: Int?
+    let timeSinceLast: Int64?
 }
 
-func getSignals(dbPath: String) -> [Signal] {
+let DB_PATH: String = {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home.appendingPathComponent("Code/photon/photon.db").path
+}()
+
+// MARK: - Database queries
+
+func fetchSignals() -> [TokenSignal] {
     var db: OpaquePointer?
-    guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_WAL, nil) == SQLITE_OK else {
+    guard sqlite3_open_v2(DB_PATH, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_WAL, nil) == SQLITE_OK else {
         return []
     }
     defer { sqlite3_close(db) }
 
-    var signals: [Signal] = []
-    var stmt: OpaquePointer?
+    // Get signal-worthy alerts with their latest snapshot data
     let query = """
-        SELECT alert_type, token_address, message, confidence
-        FROM alerts WHERE acknowledged = 0
-            AND alert_type IN ('staircase','spring','surge','spring_ignition')
-        ORDER BY confidence DESC
+        SELECT
+            a.alert_type,
+            a.token_address,
+            a.confidence,
+            s.top_holder_pct,
+            s.top5_pct,
+            s.tx_rate,
+            s.velocity,
+            s.momentum,
+            s.distribution,
+            s.spring,
+            s.classification,
+            s.timestamp
+        FROM alerts a
+        LEFT JOIN (
+            SELECT token_address, top_holder_pct, top5_pct, tx_rate, velocity,
+                   momentum, distribution, spring, classification, timestamp,
+                   ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY timestamp DESC) as rn
+            FROM token_snapshots
+        ) s ON s.token_address = a.token_address AND s.rn = 1
+        WHERE a.acknowledged = 0
+            AND a.alert_type IN ('grinder','staircase','spring','surge','spring_ignition')
+        ORDER BY a.confidence DESC
         LIMIT 5
     """
-    if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let atype = String(cString: sqlite3_column_text(stmt, 0))
-            let token: String? = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
-            let msg = String(cString: sqlite3_column_text(stmt, 2))
-            let conf = Int(sqlite3_column_int(stmt, 3))
-            signals.append(Signal(alertType: atype, tokenAddress: token, message: msg, confidence: conf))
+
+    var stmt: OpaquePointer?
+    var signals: [TokenSignal] = []
+
+    guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return [] }
+    defer { sqlite3_finalize(stmt) }
+
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        let alertType = String(cString: sqlite3_column_text(stmt, 0))
+        let address = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+        let confidence = Int(sqlite3_column_int(stmt, 2))
+        let topHolder = sqlite3_column_double(stmt, 3)
+        let top5 = sqlite3_column_double(stmt, 4)
+        let txRate = sqlite3_column_double(stmt, 5)
+        let velocity = sqlite3_column_double(stmt, 6)
+        let momentum = Int(sqlite3_column_int(stmt, 7))
+        let distribution = Int(sqlite3_column_int(stmt, 8))
+        let spring = Int(sqlite3_column_int(stmt, 9))
+        let classification = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? alertType.uppercased()
+        let snapshotTime = sqlite3_column_int64(stmt, 11)
+
+        // Get previous snapshot for delta
+        var delta: (Double, Int, Int64)? = nil
+        var dStmt: OpaquePointer?
+        let dQuery = """
+            SELECT top_holder_pct, momentum, timestamp
+            FROM token_snapshots
+            WHERE token_address = ?
+            ORDER BY timestamp DESC
+            LIMIT 1 OFFSET 1
+        """
+        if sqlite3_prepare_v2(db, dQuery, -1, &dStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(dStmt, 1, address, -1, nil)
+            if sqlite3_step(dStmt) == SQLITE_ROW {
+                let prevTop = sqlite3_column_double(dStmt, 0)
+                let prevMom = Int(sqlite3_column_int(dStmt, 1))
+                let prevTime = sqlite3_column_int64(dStmt, 2)
+                delta = (topHolder - prevTop, momentum - prevMom, snapshotTime - prevTime)
+            }
         }
+        sqlite3_finalize(dStmt)
+
+        signals.append(TokenSignal(
+            address: address,
+            alertType: alertType,
+            confidence: confidence,
+            topHolderPct: topHolder,
+            top5Pct: top5,
+            txRate: txRate,
+            velocity: velocity,
+            momentum: momentum,
+            distribution: distribution,
+            spring: spring,
+            classification: classification,
+            topHolderDelta: delta?.0,
+            momentumDelta: delta?.1,
+            timeSinceLast: delta?.2
+        ))
     }
-    sqlite3_finalize(stmt)
+
     return signals
 }
 
-func acknowledgeNoise(dbPath: String) {
+func acknowledgeNoise() {
     var db: OpaquePointer?
-    guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
+    guard sqlite3_open(DB_PATH, &db) == SQLITE_OK else { return }
     defer { sqlite3_close(db) }
-    // Auto-clear the noise — only keep signal types unacknowledged
     sqlite3_exec(db, """
         UPDATE alerts SET acknowledged = 1
         WHERE acknowledged = 0
@@ -52,111 +137,132 @@ func acknowledgeNoise(dbPath: String) {
     """, nil, nil, nil)
 }
 
-func acknowledgeAll(dbPath: String) {
+func acknowledgeAll() {
     var db: OpaquePointer?
-    guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
+    guard sqlite3_open(DB_PATH, &db) == SQLITE_OK else { return }
     defer { sqlite3_close(db) }
     sqlite3_exec(db, "UPDATE alerts SET acknowledged = 1 WHERE acknowledged = 0", nil, nil, nil)
 }
 
-func icon(for alertType: String) -> String {
-    switch alertType {
-    case "grinder": return "⛏️"
-    case "staircase": return "📈"
-    case "spring": return "🔋"
-    case "surge": return "⚡"
-    case "spring_ignition": return "🔥"
+// MARK: - Formatting
+
+func classIcon(_ classification: String) -> String {
+    switch classification {
+    case "GRINDER": return "⛏️"
+    case "STAIRCASE": return "📈"
+    case "SPRING": return "🔋"
+    case "SURGE": return "⚡"
     default: return "•"
     }
 }
 
-func shortAddress(_ addr: String) -> String {
-    if addr.count > 8 {
-        return String(addr.prefix(4)) + "..." + String(addr.suffix(4))
-    }
-    return addr
+func shortAddr(_ addr: String) -> String {
+    guard addr.count > 10 else { return addr }
+    return String(addr.prefix(4)) + ".." + String(addr.suffix(4))
 }
 
-func photonURL(for token: String) -> URL? {
+func formatDelta(_ val: Double) -> String {
+    if val > 0 { return "+\(String(format: "%.1f", val))%" }
+    if val < 0 { return "\(String(format: "%.1f", val))%" }
+    return "—"
+}
+
+func directionArrow(_ delta: Double?) -> String {
+    guard let d = delta else { return "" }
+    if d < -1.0 { return " ↘" }  // distributing
+    if d > 1.0 { return " ↗" }   // concentrating (bad)
+    return ""
+}
+
+func photonURL(_ token: String) -> URL? {
     URL(string: "https://photon-sol.tinyastro.io/en/lp/\(token)")
 }
 
-// Extract a readable summary from the raw alert message
-func readableSummary(_ msg: String, type: String, token: String?) -> String {
-    let addr = token.map { shortAddress($0) } ?? "?"
+// MARK: - Menu building
 
-    // Parse key numbers from the message
-    if type == "staircase" {
-        // "STAIRCASE xyz — momentum 80, distribution 53, multi-wave potential"
-        if let mRange = msg.range(of: "momentum \\d+", options: .regularExpression) {
-            let momentum = msg[mRange].replacingOccurrences(of: "momentum ", with: "")
-            return "\(addr) — mom \(momentum)"
-        }
-    }
-    if type == "spring" || type == "spring_ignition" {
-        if let vRange = msg.range(of: "velocity [\\d.]+x", options: .regularExpression) {
-            let vel = msg[vRange]
-            return "\(addr) — \(vel)"
-        }
-    }
-    if type == "surge" {
-        return "\(addr) — surge"
-    }
+func buildSignalItem(_ s: TokenSignal) -> NSMenuItem {
+    let addr = shortAddr(s.address)
+    let arrow = directionArrow(s.topHolderDelta)
+    let velStr = String(format: "%.1fx", s.velocity)
+    let holderStr = String(format: "%.1f%%", s.topHolderPct)
 
-    return addr
+    // Primary line: icon [score] addr — key metric
+    let title = "\(classIcon(s.classification)) \(addr)  \(holderStr)\(arrow)  \(velStr)  [\(s.confidence)]"
+
+    let item = NSMenuItem(title: title, action: #selector(AppDelegate.signalClicked(_:)), keyEquivalent: "")
+    item.representedObject = s.address
+
+    return item
 }
+
+func buildDetailItems(_ s: TokenSignal) -> [NSMenuItem] {
+    var items: [NSMenuItem] = []
+
+    let metrics = "     mom \(s.momentum)  dist \(s.distribution)  spr \(s.spring)  tx \(String(format: "%.0f", s.txRate))/m"
+    let mItem = NSMenuItem(title: metrics, action: nil, keyEquivalent: "")
+    mItem.isEnabled = false
+    items.append(mItem)
+
+    if let thDelta = s.topHolderDelta {
+        let direction = thDelta < -1.0 ? "distributing" : thDelta > 1.0 ? "concentrating ⚠" : "stable"
+        let deltaLine = "     holder \(formatDelta(thDelta))  \(direction)"
+        let dItem = NSMenuItem(title: deltaLine, action: nil, keyEquivalent: "")
+        dItem.isEnabled = false
+        items.append(dItem)
+    }
+
+    return items
+}
+
+// MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
-    let dbPath: String
-
-    override init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        self.dbPath = home.appendingPathComponent("Code/photon/photon.db").path
-        super.init()
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        acknowledgeNoise()
         refresh()
 
-        // Auto-clear noise on startup
-        acknowledgeNoise(dbPath: dbPath)
-
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            acknowledgeNoise(dbPath: self.dbPath)
-            self.refresh()
+            acknowledgeNoise()
+            self?.refresh()
         }
     }
 
     func refresh() {
-        let signals = getSignals(dbPath: dbPath)
+        let signals = fetchSignals()
 
-        // Menu bar title — clean
+        // Menu bar — minimal
         if signals.isEmpty {
             statusItem.button?.title = "◉"
         } else {
             let best = signals[0]
-            statusItem.button?.title = "\(icon(for: best.alertType)) \(signals.count)"
+            let arrow = directionArrow(best.topHolderDelta)
+            statusItem.button?.title = "\(classIcon(best.classification))\(signals.count)\(arrow)"
         }
 
-        // Build menu
         let menu = NSMenu()
 
         if signals.isEmpty {
-            let scanning = NSMenuItem(title: "Scanning...", action: nil, keyEquivalent: "")
-            scanning.isEnabled = false
-            menu.addItem(scanning)
+            let item = NSMenuItem(title: "Scanning...", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
         } else {
-            for signal in signals {
-                let summary = readableSummary(signal.message, type: signal.alertType, token: signal.tokenAddress)
-                let title = "\(icon(for: signal.alertType)) [\(signal.confidence)] \(summary)"
-                let item = NSMenuItem(title: title, action: #selector(signalClicked(_:)), keyEquivalent: "")
+            for (i, signal) in signals.enumerated() {
+                let item = buildSignalItem(signal)
                 item.target = self
-                item.representedObject = signal.tokenAddress
                 menu.addItem(item)
+
+                // Detail rows under each signal
+                for detail in buildDetailItems(signal) {
+                    menu.addItem(detail)
+                }
+
+                if i < signals.count - 1 {
+                    menu.addItem(NSMenuItem.separator())
+                }
             }
 
             menu.addItem(NSMenuItem.separator())
@@ -175,12 +281,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func signalClicked(_ sender: NSMenuItem) {
         guard let token = sender.representedObject as? String,
-              let url = photonURL(for: token) else { return }
+              let url = photonURL(token) else { return }
         NSWorkspace.shared.open(url)
     }
 
     @objc func clearAll() {
-        acknowledgeAll(dbPath: dbPath)
+        acknowledgeAll()
         refresh()
     }
 
