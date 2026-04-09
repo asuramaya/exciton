@@ -62,9 +62,11 @@ impl SignalScore {
 pub struct Confidence {
     pub total: i32,
     pub momentum: i32,
-    pub safety: i32,
+    pub distribution: i32,
+    pub spring: i32,
     pub coverage: usize,
     pub layer_scores: Vec<(SignalLayer, i32)>,
+    pub classification: String,
     pub reasoning: String,
 }
 
@@ -77,10 +79,26 @@ impl Confidence {
         }
 
         let mut layer_scores = Vec::new();
-        let mut context_sum = 0.0; // Safety + OnChain = structural context
-        let mut context_count = 0;
-        let mut momentum_sum = 0.0; // Microstructure + SmartMoney = momentum
+        let mut momentum_sum = 0.0;
         let mut momentum_count = 0;
+        let mut distribution_sum = 0.0;
+        let mut distribution_count = 0;
+
+        // Extract specific signal scores for pattern detection
+        let mut velocity_score = 50i32;
+        let mut holder_count_score = 20i32;
+        let mut top_holder_score = 5i32;
+        let mut tx_rate_score = 15i32;
+
+        for s in scores {
+            match s.signal_type.as_str() {
+                "velocity" => velocity_score = s.score,
+                "holder_count" => holder_count_score = s.score,
+                "top_holder" => top_holder_score = s.score,
+                "tx_rate" => tx_rate_score = s.score,
+                _ => {}
+            }
+        }
 
         for layer in SignalLayer::all() {
             if let Some(vals) = layer_avgs.get(layer) {
@@ -88,9 +106,15 @@ impl Confidence {
                 layer_scores.push((*layer, avg as i32));
 
                 match layer {
-                    SignalLayer::Safety | SignalLayer::OnChain => {
-                        context_sum += avg;
-                        context_count += 1;
+                    SignalLayer::Safety => {
+                        // Safety layer now means distribution quality
+                        distribution_sum += avg;
+                        distribution_count += 1;
+                    }
+                    SignalLayer::OnChain => {
+                        // OnChain is structural context — contributes to distribution
+                        distribution_sum += avg * 0.5;
+                        distribution_count += 1;
                     }
                     SignalLayer::Microstructure | SignalLayer::SmartMoney => {
                         momentum_sum += avg;
@@ -99,11 +123,6 @@ impl Confidence {
                 }
             }
         }
-        let safety_avg = if context_count > 0 {
-            context_sum / context_count as f64
-        } else {
-            0.0
-        };
 
         let coverage = layer_scores.len();
         let momentum = if momentum_count > 0 {
@@ -111,51 +130,89 @@ impl Confidence {
         } else {
             0
         };
-        let safety = safety_avg as i32;
-
-        // Total confidence: momentum-weighted score
-        // High momentum + moderate safety = high confidence (rideable trap)
-        // High momentum + low safety = moderate confidence (dangerous but real)
-        // Low momentum + any safety = low confidence (nothing happening)
-        //
-        // Momentum is 70% of the score. Safety is 30%.
-        // A dead-safe token with no activity scores low.
-        // A concentrated token with explosive activity scores high.
-        let total = ((momentum as f64 * 0.70) + (safety as f64 * 0.30)) as i32;
-
-        let reasoning = if momentum > 70 && safety < 40 {
-            format!(
-                "SURGE CANDIDATE — momentum {}, safety {} — high activity on concentrated token, window may be open",
-                momentum, safety
-            )
-        } else if momentum > 70 && safety >= 40 {
-            format!(
-                "STRONG — momentum {}, safety {} — active with reasonable distribution",
-                momentum, safety
-            )
-        } else if momentum > 50 {
-            format!(
-                "ACTIVE — momentum {}, safety {} — moderate activity",
-                momentum, safety
-            )
-        } else if momentum > 30 {
-            format!(
-                "SLOW — momentum {}, safety {} — low activity",
-                momentum, safety
-            )
+        let distribution = if distribution_count > 0 {
+            (distribution_sum / distribution_count as f64) as i32
         } else {
-            format!(
-                "DEAD — momentum {}, safety {} — no meaningful activity",
-                momentum, safety
-            )
+            0
+        };
+
+        // Spring score: good distribution + low current activity = coiled potential
+        // These are the dormant tokens that have already distributed and are waiting
+        // for ignition. High spring + any momentum = the trade.
+        // Pattern: SENNA sat at 22.9% top holder for weeks, then spiked.
+        //          AVA had 47K holders grinding up with staircase pattern.
+        let spring = if distribution > 50 && momentum < 40 {
+            // Well distributed, quiet — loaded spring
+            (distribution as f64 * 0.8 + 20.0) as i32
+        } else if distribution > 50 && momentum > 60 {
+            // Well distributed AND active — the surge is happening now
+            (distribution as f64 * 0.5 + momentum as f64 * 0.5) as i32
+        } else if distribution < 30 {
+            // Concentrated — not a spring, just a trap
+            (distribution as f64 * 0.3) as i32
+        } else {
+            // Middle ground
+            (distribution as f64 * 0.5) as i32
+        };
+
+        // Total score: what matters is the combination
+        // Momentum (40%) — is something happening right now?
+        // Distribution (30%) — can this survive selling pressure?
+        // Spring (30%) — is this coiled for a move?
+        let total = ((momentum as f64 * 0.40)
+            + (distribution as f64 * 0.30)
+            + (spring as f64 * 0.30)) as i32;
+
+        // Classification based on the pattern taxonomy
+        let classification = if momentum > 70 && distribution > 50 {
+            "STAIRCASE".to_string() // Active + distributed = AVA/GAYCOIN pattern
+        } else if momentum > 70 && distribution < 30 {
+            "SURGE".to_string() // Explosive + concentrated = rideable trap
+        } else if momentum < 30 && distribution > 50 {
+            "SPRING".to_string() // Quiet + distributed = loaded, waiting for ignition
+        } else if momentum < 20 && distribution < 30 {
+            "DEAD".to_string() // Nothing happening, concentrated
+        } else if momentum > 50 && distribution < 40 {
+            "ACTIVE_TRAP".to_string() // Activity on a still-concentrated token
+        } else {
+            "DEVELOPING".to_string() // In between states
+        };
+
+        let reasoning = match classification.as_str() {
+            "STAIRCASE" => format!(
+                "STAIRCASE — momentum {}, distribution {}, spring {} — active with deep holder base, multi-wave potential",
+                momentum, distribution, spring
+            ),
+            "SURGE" => format!(
+                "SURGE — momentum {}, distribution {}, spring {} — explosive activity on concentrated token, window may be open",
+                momentum, distribution, spring
+            ),
+            "SPRING" => format!(
+                "SPRING — momentum {}, distribution {}, spring {} — distributed and quiet, coiled for potential ignition",
+                momentum, distribution, spring
+            ),
+            "DEAD" => format!(
+                "DEAD — momentum {}, distribution {}, spring {} — concentrated with no activity",
+                momentum, distribution, spring
+            ),
+            "ACTIVE_TRAP" => format!(
+                "ACTIVE TRAP — momentum {}, distribution {}, spring {} — activity but still concentrated, watch for distribution",
+                momentum, distribution, spring
+            ),
+            _ => format!(
+                "DEVELOPING — momentum {}, distribution {}, spring {} — between states, watch for classification change",
+                momentum, distribution, spring
+            ),
         };
 
         Self {
             total: total.clamp(0, 100),
             momentum: momentum.clamp(0, 100),
-            safety: safety.clamp(0, 100),
+            distribution: distribution.clamp(0, 100),
+            spring: spring.clamp(0, 100),
             coverage,
             layer_scores,
+            classification,
             reasoning,
         }
     }

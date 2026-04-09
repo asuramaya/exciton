@@ -57,7 +57,9 @@ struct Opportunity {
     token: String,
     confidence: i32,
     momentum: i32,
-    safety: i32,
+    distribution: i32,
+    spring: i32,
+    classification: String,
     coverage: usize,
     recommended_position_pct: f64,
     reasoning: String,
@@ -182,7 +184,9 @@ impl PhotonServer {
                     token: alert.token_address.clone().unwrap_or_default(),
                     confidence: alert.confidence,
                     momentum: 0,
-                    safety: 0,
+                    distribution: 0,
+                    spring: 0,
+                    classification: "FROM_ALERT".to_string(),
                     coverage: 3,
                     recommended_position_pct: position_pct,
                     reasoning: alert.message.clone(),
@@ -257,10 +261,9 @@ impl PhotonServer {
                     .collect();
 
                 let risk_rating = format!(
-                    "{} — momentum {}/100, safety {}/100, {} signals",
+                    "[{}] {} — {} signals",
+                    analysis.confidence.classification,
                     analysis.confidence.reasoning,
-                    analysis.confidence.momentum,
-                    analysis.confidence.safety,
                     analysis.scores.len()
                 );
 

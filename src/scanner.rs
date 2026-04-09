@@ -90,61 +90,99 @@ impl BackgroundScanner {
         let mut alert_count = 0;
 
         for analysis in &analyses {
-            // Generate alerts for tokens that cross the threshold
-            if analysis.confidence.total >= self.alert_threshold {
-                let safety_avg = {
-                    let safety_scores: Vec<i32> = analysis
-                        .scores
-                        .iter()
-                        .filter(|s| s.layer == SignalLayer::Safety)
-                        .map(|s| s.score)
-                        .collect();
-                    if safety_scores.is_empty() {
-                        0
-                    } else {
-                        safety_scores.iter().sum::<i32>() / safety_scores.len() as i32
+            let class = &analysis.confidence.classification;
+
+            match class.as_str() {
+                // SPRING: distributed and quiet — loaded potential. Always alert.
+                "SPRING" => {
+                    self.db.insert_alert(
+                        "spring",
+                        Some(&analysis.address),
+                        &format!(
+                            "SPRING {} — distributed (top holder {:.1}%), quiet, spring score {}, waiting for ignition",
+                            &analysis.address,
+                            analysis.top_holder_pct,
+                            analysis.confidence.spring,
+                        ),
+                        analysis.confidence.total,
+                    )?;
+                    alert_count += 1;
+                }
+
+                // STAIRCASE: active with deep distribution — the best pattern. Always alert.
+                "STAIRCASE" => {
+                    self.db.insert_alert(
+                        "staircase",
+                        Some(&analysis.address),
+                        &format!(
+                            "STAIRCASE {} — momentum {}, distribution {}, multi-wave potential",
+                            &analysis.address,
+                            analysis.confidence.momentum,
+                            analysis.confidence.distribution,
+                        ),
+                        analysis.confidence.total,
+                    )?;
+                    alert_count += 1;
+                }
+
+                // SURGE: explosive on concentrated token — short window. Alert if high confidence.
+                "SURGE" => {
+                    if analysis.confidence.total >= self.alert_threshold {
+                        self.db.insert_alert(
+                            "surge",
+                            Some(&analysis.address),
+                            &format!(
+                                "SURGE {} — momentum {}, top holder {:.1}%, window may be open",
+                                &analysis.address,
+                                analysis.confidence.momentum,
+                                analysis.top_holder_pct,
+                            ),
+                            analysis.confidence.total,
+                        )?;
+                        alert_count += 1;
                     }
-                };
+                }
 
-                let message = format!(
-                    "New token {} — confidence {}/100, safety avg {}, {} holders, top holder {:.1}%",
-                    &analysis.address,
-                    analysis.confidence.total,
-                    safety_avg,
-                    analysis.holder_count,
-                    analysis.top_holder_pct,
-                );
+                // ACTIVE_TRAP: activity but concentrated — watch for distribution starting
+                "ACTIVE_TRAP" => {
+                    if analysis.confidence.momentum > 70 {
+                        self.db.insert_alert(
+                            "active_trap",
+                            Some(&analysis.address),
+                            &format!(
+                                "ACTIVE TRAP {} — momentum {} but top holder {:.1}%, watch for distribution",
+                                &analysis.address,
+                                analysis.confidence.momentum,
+                                analysis.top_holder_pct,
+                            ),
+                            analysis.confidence.total,
+                        )?;
+                        alert_count += 1;
+                    }
+                }
 
-                self.db.insert_alert(
-                    "discovery",
-                    Some(&analysis.address),
-                    &message,
-                    analysis.confidence.total,
-                )?;
+                // DEAD or DEVELOPING: only alert on danger signals
+                _ => {
+                    let has_danger = analysis.scores.iter().any(|s| {
+                        s.layer == SignalLayer::Safety && s.score <= 10
+                    });
+                    if has_danger {
+                        let dangers: Vec<String> = analysis
+                            .scores
+                            .iter()
+                            .filter(|s| s.layer == SignalLayer::Safety && s.score <= 10)
+                            .map(|s| s.details.clone())
+                            .collect();
 
-                alert_count += 1;
-            }
-
-            // Always alert on dangerous tokens (safety score very low)
-            let has_danger = analysis.scores.iter().any(|s| {
-                s.layer == SignalLayer::Safety && s.score <= 10
-            });
-            if has_danger && analysis.confidence.total < self.alert_threshold {
-                let dangers: Vec<String> = analysis
-                    .scores
-                    .iter()
-                    .filter(|s| s.layer == SignalLayer::Safety && s.score <= 10)
-                    .map(|s| s.details.clone())
-                    .collect();
-
-                self.db.insert_alert(
-                    "danger",
-                    Some(&analysis.address),
-                    &format!("DANGER on {}: {}", &analysis.address, dangers.join("; ")),
-                    analysis.confidence.total,
-                )?;
-
-                alert_count += 1;
+                        self.db.insert_alert(
+                            "danger",
+                            Some(&analysis.address),
+                            &format!("DANGER {}: {}", &analysis.address, dangers.join("; ")),
+                            analysis.confidence.total,
+                        )?;
+                        alert_count += 1;
+                    }
+                }
             }
         }
 
