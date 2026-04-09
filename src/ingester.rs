@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_response::RpcTokenAccountBalance;
+use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -197,10 +200,7 @@ impl RpcRouter {
         match client.get_token_account_balance(&pk).await {
             Ok(balance) => {
                 self.record_result(idx, true);
-                let amount = balance
-                    .amount
-                    .parse::<u64>()
-                    .unwrap_or(0);
+                let amount = balance.amount.parse::<u64>().unwrap_or(0);
                 Ok(amount)
             }
             Err(e) => {
@@ -209,6 +209,213 @@ impl RpcRouter {
             }
         }
     }
+
+    /// Get raw account info for a mint address — used to read authorities and extensions
+    pub async fn get_account_info(&self, address: &str) -> Result<Option<Account>> {
+        let pk = Pubkey::from_str(address).context("Invalid address")?;
+        let client = self.next_client().context("No RPC endpoints available")?;
+        let idx = self.current_index();
+
+        match client.get_account(&pk).await {
+            Ok(account) => {
+                self.record_result(idx, true);
+                Ok(Some(account))
+            }
+            Err(e) => {
+                // Account not found is not an error — it just doesn't exist
+                let err_str = e.to_string();
+                if err_str.contains("AccountNotFound") || err_str.contains("could not find account")
+                {
+                    self.record_result(idx, true);
+                    Ok(None)
+                } else {
+                    self.record_result(idx, false);
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// Get token supply for a mint
+    pub async fn get_token_supply(&self, mint: &str) -> Result<TokenSupplyInfo> {
+        let pk = Pubkey::from_str(mint).context("Invalid mint address")?;
+        let client = self.next_client().context("No RPC endpoints available")?;
+        let idx = self.current_index();
+
+        match client.get_token_supply(&pk).await {
+            Ok(supply) => {
+                self.record_result(idx, true);
+                Ok(TokenSupplyInfo {
+                    amount: supply.amount.parse::<u64>().unwrap_or(0),
+                    decimals: supply.decimals,
+                    ui_amount: supply.ui_amount.unwrap_or(0.0),
+                })
+            }
+            Err(e) => {
+                self.record_result(idx, false);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Get largest token holders — critical for concentration analysis
+    pub async fn get_token_largest_accounts(
+        &self,
+        mint: &str,
+    ) -> Result<Vec<TokenHolderInfo>> {
+        let pk = Pubkey::from_str(mint).context("Invalid mint address")?;
+        let client = self.next_client().context("No RPC endpoints available")?;
+        let idx = self.current_index();
+
+        match client.get_token_largest_accounts(&pk).await {
+            Ok(accounts) => {
+                self.record_result(idx, true);
+                let holders: Vec<TokenHolderInfo> = accounts
+                    .iter()
+                    .map(|a| TokenHolderInfo {
+                        address: a.address.clone(),
+                        amount: a.amount.amount.parse::<u64>().unwrap_or(0),
+                        ui_amount: a.amount.ui_amount.unwrap_or(0.0),
+                        decimals: a.amount.decimals,
+                    })
+                    .collect();
+                Ok(holders)
+            }
+            Err(e) => {
+                self.record_result(idx, false);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Get recent transaction signatures for an address
+    pub async fn get_recent_signatures(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<SignatureInfo>> {
+        let pk = Pubkey::from_str(address).context("Invalid address")?;
+        let client = self.next_client().context("No RPC endpoints available")?;
+        let idx = self.current_index();
+
+        let config = solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+            limit: Some(limit),
+            ..Default::default()
+        };
+
+        match client
+            .get_signatures_for_address_with_config(&pk, config)
+            .await
+        {
+            Ok(sigs) => {
+                self.record_result(idx, true);
+                let infos: Vec<SignatureInfo> = sigs
+                    .iter()
+                    .map(|s| SignatureInfo {
+                        signature: s.signature.clone(),
+                        slot: s.slot,
+                        block_time: s.block_time,
+                        err: s.err.is_some(),
+                    })
+                    .collect();
+                Ok(infos)
+            }
+            Err(e) => {
+                self.record_result(idx, false);
+                Err(e.into())
+            }
+        }
+    }
+}
+
+// -- Domain types for chain data --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenSupplyInfo {
+    pub amount: u64,
+    pub decimals: u8,
+    pub ui_amount: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenHolderInfo {
+    pub address: String,
+    pub amount: u64,
+    pub ui_amount: f64,
+    pub decimals: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub err: bool,
+}
+
+/// Parsed mint account data — extracted from raw account bytes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintInfo {
+    pub address: String,
+    pub supply: u64,
+    pub decimals: u8,
+    pub mint_authority: Option<String>,
+    pub freeze_authority: Option<String>,
+    pub is_token_2022: bool,
+}
+
+/// Parse a Solana SPL Token mint account from raw bytes
+pub fn parse_mint_account(address: &str, data: &[u8], owner: &Pubkey) -> Option<MintInfo> {
+    // SPL Token program ID
+    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?;
+    // Token-2022 program ID
+    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").ok()?;
+
+    let is_token_2022 = *owner == token_2022;
+    let is_spl_token = *owner == spl_token;
+
+    if !is_spl_token && !is_token_2022 {
+        return None;
+    }
+
+    // Mint account layout (first 82 bytes are the same for both):
+    // [0..4]   - mint_authority COption (4 bytes tag + 32 bytes pubkey)
+    // [36..44] - supply (u64 LE)
+    // [44]     - decimals (u8)
+    // [45]     - is_initialized (bool)
+    // [46..82] - freeze_authority COption (4 bytes tag + 32 bytes pubkey)
+    if data.len() < 82 {
+        return None;
+    }
+
+    let mint_authority_tag = u32::from_le_bytes(data[0..4].try_into().ok()?);
+    let mint_authority = if mint_authority_tag == 1 {
+        let key = Pubkey::try_from(&data[4..36]).ok()?;
+        Some(key.to_string())
+    } else {
+        None
+    };
+
+    let supply = u64::from_le_bytes(data[36..44].try_into().ok()?);
+    let decimals = data[44];
+    let _is_initialized = data[45] != 0;
+
+    let freeze_authority_tag = u32::from_le_bytes(data[46..50].try_into().ok()?);
+    let freeze_authority = if freeze_authority_tag == 1 {
+        let key = Pubkey::try_from(&data[50..82]).ok()?;
+        Some(key.to_string())
+    } else {
+        None
+    };
+
+    Some(MintInfo {
+        address: address.to_string(),
+        supply,
+        decimals,
+        mint_authority,
+        freeze_authority,
+        is_token_2022,
+    })
 }
 
 /// Mask API keys in URLs for safe logging

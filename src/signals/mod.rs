@@ -3,8 +3,11 @@ pub mod onchain;
 pub mod safety;
 pub mod smartmoney;
 
+use crate::ingester::{parse_mint_account, RpcRouter};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalLayer {
@@ -105,4 +108,114 @@ impl Confidence {
             ),
         }
     }
+}
+
+// -- Token Analysis Orchestrator --
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenAnalysis {
+    pub address: String,
+    pub mint_authority: Option<String>,
+    pub freeze_authority: Option<String>,
+    pub is_token_2022: bool,
+    pub supply_ui: f64,
+    pub decimals: u8,
+    pub holder_count: usize,
+    pub top_holder_pct: f64,
+    pub recent_tx_count: usize,
+    pub scores: Vec<SignalScore>,
+    pub confidence: Confidence,
+}
+
+/// Run all signal layers against a live token
+pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<TokenAnalysis> {
+    let safety_checker = safety::SafetyChecker::new();
+    let micro = microstructure::MicrostructureAnalyzer::new();
+    let onchain_analyzer = onchain::OnChainAnalyzer::new();
+
+    let mut all_scores: Vec<SignalScore> = Vec::new();
+
+    // 1. Fetch mint account info
+    let account = rpc.get_account_info(mint_address).await?;
+    let mint_info = account
+        .as_ref()
+        .and_then(|a| parse_mint_account(mint_address, &a.data, &a.owner));
+
+    let (mint_authority, freeze_authority, is_token_2022, supply_raw, decimals) =
+        if let Some(ref mint) = mint_info {
+            all_scores.extend(safety_checker.analyze_mint(mint));
+            (
+                mint.mint_authority.clone(),
+                mint.freeze_authority.clone(),
+                mint.is_token_2022,
+                mint.supply,
+                mint.decimals,
+            )
+        } else {
+            all_scores.push(SignalScore::new(
+                SignalLayer::Safety,
+                "mint_account",
+                5,
+                "Could not parse mint account — may not be a valid SPL token",
+            ));
+            (None, None, false, 0, 0)
+        };
+
+    // 2. Fetch token supply
+    let supply_info = rpc.get_token_supply(mint_address).await.ok();
+    let supply_ui = supply_info
+        .as_ref()
+        .map(|s| s.ui_amount)
+        .unwrap_or_else(|| {
+            if decimals > 0 {
+                supply_raw as f64 / 10f64.powi(decimals as i32)
+            } else {
+                supply_raw as f64
+            }
+        });
+
+    if let (Some(ref supply), Some(ref mint)) = (&supply_info, &mint_info) {
+        all_scores.extend(onchain_analyzer.analyze_supply(supply, mint));
+    }
+
+    // 3. Fetch largest holders
+    let holders = rpc
+        .get_token_largest_accounts(mint_address)
+        .await
+        .unwrap_or_default();
+    let holder_count = holders.len();
+    let top_holder_pct = if !holders.is_empty() && supply_ui > 0.0 {
+        (holders[0].ui_amount / supply_ui) * 100.0
+    } else {
+        0.0
+    };
+
+    all_scores.extend(safety_checker.analyze_holders(&holders, supply_ui));
+
+    // 4. Fetch recent transactions
+    let signatures = rpc
+        .get_recent_signatures(mint_address, 50)
+        .await
+        .unwrap_or_default();
+    let recent_tx_count = signatures.len();
+
+    all_scores.extend(micro.analyze_activity(&signatures));
+    all_scores.extend(onchain_analyzer.analyze_age(&signatures));
+
+    // 5. Aggregate confidence
+    let confidence = Confidence::from_scores(&all_scores);
+
+    Ok(TokenAnalysis {
+        address: mint_address.to_string(),
+        mint_authority,
+        freeze_authority,
+        is_token_2022,
+        supply_ui,
+        decimals,
+        holder_count,
+        top_holder_pct,
+        recent_tx_count,
+        scores: all_scores,
+        confidence,
+    })
 }

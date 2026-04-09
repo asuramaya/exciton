@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::forecaster::{Forecaster, Regime};
 use crate::ingester::RpcRouter;
+use crate::signals;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -178,24 +179,88 @@ impl PhotonServer {
     /// Deep-dive investigation of a token or wallet.
     /// Flow: check existence -> run all signal layers -> pull history -> safety checks -> present full picture.
     #[tool]
-    fn inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
+    async fn inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
         let _ = self
             .db
             .audit_log("claude", "inspect", &format!("Inspecting {}", params.address));
 
-        let target_type = if params.address.len() > 40 {
-            "token"
-        } else {
-            "wallet"
-        };
+        // Run full token analysis through all signal layers
+        match signals::analyze_token(&self.rpc, &params.address).await {
+            Ok(analysis) => {
+                let safety_scores: Vec<SignalDetail> = analysis
+                    .scores
+                    .iter()
+                    .filter(|s| s.layer == signals::SignalLayer::Safety)
+                    .map(|s| SignalDetail {
+                        layer: "Safety".to_string(),
+                        signal_type: s.signal_type.clone(),
+                        score: s.score,
+                        details: s.details.clone(),
+                    })
+                    .collect();
 
-        to_json(&InspectResult {
-            target: params.address,
-            target_type: target_type.to_string(),
-            safety: vec![],
-            signals: vec![],
-            risk_rating: "unknown - no data yet, connect RPC to begin analysis".to_string(),
-        })
+                let other_scores: Vec<SignalDetail> = analysis
+                    .scores
+                    .iter()
+                    .filter(|s| s.layer != signals::SignalLayer::Safety)
+                    .map(|s| SignalDetail {
+                        layer: format!("{:?}", s.layer),
+                        signal_type: s.signal_type.clone(),
+                        score: s.score,
+                        details: s.details.clone(),
+                    })
+                    .collect();
+
+                let risk_rating = if analysis.confidence.total >= 70 {
+                    format!(
+                        "LOW RISK — confidence {}/100 ({} layers, {} signals)",
+                        analysis.confidence.total,
+                        analysis.confidence.coverage,
+                        analysis.scores.len()
+                    )
+                } else if analysis.confidence.total >= 40 {
+                    format!(
+                        "MEDIUM RISK — confidence {}/100 ({} layers, {} signals)",
+                        analysis.confidence.total,
+                        analysis.confidence.coverage,
+                        analysis.scores.len()
+                    )
+                } else {
+                    format!(
+                        "HIGH RISK — confidence {}/100 ({} layers, {} signals)",
+                        analysis.confidence.total,
+                        analysis.confidence.coverage,
+                        analysis.scores.len()
+                    )
+                };
+
+                // Store in DB for historical tracking
+                let _ = self.db.insert_token(
+                    &params.address,
+                    analysis.confidence.total,
+                );
+
+                to_json(&InspectResult {
+                    target: params.address,
+                    target_type: "token".to_string(),
+                    safety: safety_scores,
+                    signals: other_scores,
+                    risk_rating,
+                })
+            }
+            Err(e) => to_json(&InspectResult {
+                target: params.address,
+                target_type: "unknown".to_string(),
+                safety: vec![],
+                signals: vec![SignalDetail {
+                    layer: "System".to_string(),
+                    signal_type: "error".to_string(),
+                    score: 0,
+                    details: format!("Analysis failed: {}", e),
+                }],
+                risk_rating: format!("UNKNOWN — analysis error: {}", e),
+            }),
+        }
     }
 
     /// Execute a trade with full guardrails.
