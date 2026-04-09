@@ -88,7 +88,15 @@ impl Confidence {
         }
 
         let coverage = layer_scores.len();
-        let coverage_penalty = coverage as f64 / SignalLayer::all().len() as f64;
+        // Soft coverage penalty: 1 layer = 0.6x, 2 = 0.75x, 3 = 0.9x, 4 = 1.0x
+        // Missing SmartMoney shouldn't tank the score — it's an enhancement layer
+        let coverage_penalty = match coverage {
+            0 => 0.0,
+            1 => 0.6,
+            2 => 0.75,
+            3 => 0.9,
+            _ => 1.0,
+        };
         let raw_total = if total_weight > 0.0 {
             weighted_sum / total_weight
         } else {
@@ -200,7 +208,7 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str) -> Result<T
     let recent_tx_count = signatures.len();
 
     all_scores.extend(micro.analyze_activity(&signatures));
-    all_scores.extend(onchain_analyzer.analyze_age(&signatures));
+    all_scores.extend(onchain_analyzer.analyze_history_depth(&signatures));
 
     // 5. Aggregate confidence
     let confidence = Confidence::from_scores(&all_scores);

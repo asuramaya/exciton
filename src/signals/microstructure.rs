@@ -23,31 +23,41 @@ impl MicrostructureAnalyzer {
         }
 
         let total_txs = signatures.len();
-        let failed_txs = signatures.iter().filter(|s| s.err).count();
+        let successful_txs = signatures.iter().filter(|s| !s.err).count();
+        let failed_txs = total_txs - successful_txs;
         let success_rate = if total_txs > 0 {
-            ((total_txs - failed_txs) as f64 / total_txs as f64) * 100.0
+            (successful_txs as f64 / total_txs as f64) * 100.0
         } else {
             0.0
         };
 
-        // Transaction volume score
-        let volume_score = if total_txs > 100 {
-            90
-        } else if total_txs > 50 {
-            75
-        } else if total_txs > 20 {
-            60
-        } else if total_txs > 5 {
-            40
+        // Transaction rate (tx per minute) — more meaningful than raw count
+        let time_window = time_span(signatures);
+        let tx_per_minute = if time_window > 0 {
+            (total_txs as f64 / time_window as f64) * 60.0
         } else {
-            20
+            total_txs as f64 // all in same second = very fast
+        };
+
+        let volume_score = if tx_per_minute > 30.0 {
+            95 // Extremely active
+        } else if tx_per_minute > 10.0 {
+            80
+        } else if tx_per_minute > 3.0 {
+            65
+        } else if tx_per_minute > 1.0 {
+            50
+        } else if tx_per_minute > 0.1 {
+            30
+        } else {
+            15 // Nearly dead
         };
 
         scores.push(SignalScore::new(
             SignalLayer::Microstructure,
-            "tx_volume",
+            "tx_rate",
             volume_score,
-            &format!("{} recent transactions", total_txs),
+            &format!("{:.1} tx/min ({} txs over {}s)", tx_per_minute, total_txs, time_window),
         ));
 
         // Success rate — high failure rate can indicate honeypot or congestion

@@ -46,50 +46,48 @@ impl OnChainAnalyzer {
         scores
     }
 
-    /// Analyze token age from its transaction history
-    pub fn analyze_age(&self, signatures: &[SignatureInfo]) -> Vec<SignalScore> {
+    /// Analyze transaction history depth — how far back does observable activity go?
+    /// Note: getSignaturesForAddress returns most recent N, not the full history.
+    /// A short window with high activity = actively traded. A short window with low activity = new or dying.
+    pub fn analyze_history_depth(&self, signatures: &[SignatureInfo]) -> Vec<SignalScore> {
         let mut scores = Vec::new();
 
-        if let Some(oldest) = signatures.last() {
-            if let Some(block_time) = oldest.block_time {
-                let now = chrono::Utc::now().timestamp();
-                let age_seconds = now - block_time;
-                let age_hours = age_seconds as f64 / 3600.0;
-
-                // Very new tokens are higher risk
-                let age_score = if age_hours < 1.0 {
-                    30 // Less than 1 hour old
-                } else if age_hours < 24.0 {
-                    50 // Less than a day
-                } else if age_hours < 168.0 {
-                    70 // Less than a week
-                } else {
-                    85 // Over a week — survived initial period
-                };
-
-                let age_str = if age_hours < 1.0 {
-                    format!("{:.0}m old", age_hours * 60.0)
-                } else if age_hours < 24.0 {
-                    format!("{:.1}h old", age_hours)
-                } else {
-                    format!("{:.0}d old", age_hours / 24.0)
-                };
-
-                scores.push(SignalScore::new(
-                    SignalLayer::OnChain,
-                    "token_age",
-                    age_score,
-                    &age_str,
-                ));
-            }
-        } else {
+        if signatures.is_empty() {
             scores.push(SignalScore::new(
                 SignalLayer::OnChain,
-                "token_age",
+                "history_depth",
                 10,
                 "No transaction history found",
             ));
+            return scores;
         }
+
+        // How much time does our sample window cover?
+        let newest_time = signatures.first().and_then(|s| s.block_time).unwrap_or(0);
+        let oldest_time = signatures.last().and_then(|s| s.block_time).unwrap_or(0);
+        let window_seconds = (newest_time - oldest_time).abs();
+        let window_hours = window_seconds as f64 / 3600.0;
+
+        // If 50 transactions span a long window = moderate activity on an established token
+        // If 50 transactions span seconds = extremely active (just launched or pumping)
+        let (depth_score, depth_label) = if window_hours > 24.0 {
+            (85, format!("{:.0} txs over {:.0}d — established activity", signatures.len(), window_hours / 24.0))
+        } else if window_hours > 1.0 {
+            (70, format!("{:.0} txs over {:.1}h — active trading", signatures.len(), window_hours))
+        } else if window_seconds > 300 {
+            (55, format!("{:.0} txs over {:.0}m — moderate activity", signatures.len(), window_seconds as f64 / 60.0))
+        } else if window_seconds > 30 {
+            (40, format!("{:.0} txs in {:.0}s — very high activity, possible launch/pump", signatures.len(), window_seconds))
+        } else {
+            (25, format!("{:.0} txs in <30s — extreme burst, likely just launched", signatures.len()))
+        };
+
+        scores.push(SignalScore::new(
+            SignalLayer::OnChain,
+            "history_depth",
+            depth_score,
+            &depth_label,
+        ));
 
         scores
     }
