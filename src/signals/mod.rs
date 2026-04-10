@@ -159,23 +159,39 @@ impl Confidence {
         // Momentum (40%) — is something happening right now?
         // Distribution (30%) — can this survive selling pressure?
         // Spring (30%) — is this coiled for a move?
-        let total = ((momentum as f64 * 0.40)
+        let mut total = ((momentum as f64 * 0.40)
             + (distribution as f64 * 0.30)
             + (spring as f64 * 0.30)) as i32;
 
-        // Check for demand congestion signal in scores
+        // Exceptional distribution bonus: top_holder < 10% is rare and powerful
+        // BFiGUx at 2% should score higher than a token at 25%
+        if top_holder_score >= 75 {
+            total = (total as f64 * 1.10) as i32; // +10% for < 15% top holder
+        }
+        if top_holder_score >= 90 {
+            total = (total as f64 * 1.05) as i32; // additional +5% for < 5% top holder
+        }
+
+        // Check for demand congestion and recency signals
         let has_demand_congestion = scores.iter().any(|s| s.signal_type == "demand_congestion");
         let congestion_score = scores.iter()
             .find(|s| s.signal_type == "demand_congestion")
             .map(|s| s.score)
             .unwrap_or(0);
+        let recency_score = scores.iter()
+            .find(|s| s.signal_type == "recency")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        let tx_rate_score = scores.iter()
+            .find(|s| s.signal_type == "tx_rate")
+            .map(|s| s.score)
+            .unwrap_or(0);
 
         // Classification based on the pattern taxonomy
-        let classification = if distribution > 50 && has_demand_congestion && congestion_score > 70 {
-            // GRINDER: deep distribution + sustained demand congestion
-            // The BONK/WIF/FARTCOIN/CHILLGUY pattern — escaped velocity,
-            // grinding upward through demand that permanently exceeds supply.
-            // Velocity is low (0.3-1.0x) but that's the mature state.
+        let classification = if distribution > 50 && has_demand_congestion && congestion_score > 70
+            && recency_score >= 60 && tx_rate_score >= 30 {
+            // GRINDER: deep distribution + sustained demand congestion + actually active
+            // Must have recent transactions — a dead token with old congestion is SPRING, not GRINDER
             "GRINDER".to_string()
         } else if momentum > 70 && distribution > 50 {
             "STAIRCASE".to_string()
