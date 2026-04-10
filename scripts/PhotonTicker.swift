@@ -9,6 +9,7 @@ struct TokenSignal {
     let confidence: Int
     let topHolderPct: Double
     let top5Pct: Double
+    let holderCount: Int
     let txRate: Double
     let velocity: Double
     let momentum: Int
@@ -42,11 +43,11 @@ func fetchSignals() -> [TokenSignal] {
         let confidence = Int(sqlite3_column_int(stmt, 2))
 
         var topHolder = 0.0, top5 = 0.0, txRate = 0.0, velocity = 0.0
-        var momentum = 0, distribution = 0, spring = 0
+        var momentum = 0, distribution = 0, spring = 0, holderCount = 0
         var classification = alertType.uppercased()
 
         var sStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT top_holder_pct, top5_pct, tx_rate, velocity, momentum, distribution, spring, classification FROM token_snapshots WHERE token_address = '\(address)' ORDER BY timestamp DESC LIMIT 1", -1, &sStmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT top_holder_pct, top5_pct, tx_rate, velocity, momentum, distribution, spring, classification, holder_count FROM token_snapshots WHERE token_address = '\(address)' ORDER BY timestamp DESC LIMIT 1", -1, &sStmt, nil) == SQLITE_OK {
             if sqlite3_step(sStmt) == SQLITE_ROW {
                 topHolder = sqlite3_column_double(sStmt, 0)
                 top5 = sqlite3_column_double(sStmt, 1)
@@ -56,6 +57,7 @@ func fetchSignals() -> [TokenSignal] {
                 distribution = Int(sqlite3_column_int(sStmt, 5))
                 spring = Int(sqlite3_column_int(sStmt, 6))
                 classification = sqlite3_column_text(sStmt, 7).map { String(cString: $0) } ?? classification
+                holderCount = Int(sqlite3_column_int(sStmt, 8))
             }
         }
         sqlite3_finalize(sStmt)
@@ -71,7 +73,7 @@ func fetchSignals() -> [TokenSignal] {
         sqlite3_finalize(dStmt)
 
         signals.append(TokenSignal(address: address, alertType: alertType, confidence: confidence,
-            topHolderPct: topHolder, top5Pct: top5, txRate: txRate, velocity: velocity,
+            topHolderPct: topHolder, top5Pct: top5, holderCount: holderCount, txRate: txRate, velocity: velocity,
             momentum: momentum, distribution: distribution, spring: spring, classification: classification,
             topHolderDelta: thDelta, momentumDelta: momDelta))
     }
@@ -148,7 +150,7 @@ class SignalMenuView: NSView {
 
     init(signal: TokenSignal, width: CGFloat) {
         self.signal = signal
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 68))
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 58))
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -172,55 +174,41 @@ class SignalMenuView: NSView {
         let s = signal
         let color = classColor(s.classification)
         let (dirStr, dirColor) = directionSymbol(s.topHolderDelta)
-
-        // Row 1: Classification badge + address + confidence
-        let row1 = NSMutableAttributedString()
-        row1.append(NSAttributedString(string: "\(classIcon(s.classification)) ", attributes: [.font: NSFont.systemFont(ofSize: 13)]))
-        row1.append(NSAttributedString(string: s.classification, attributes: [
-            .font: NSFont.boldSystemFont(ofSize: 11),
-            .foregroundColor: color
-        ]))
-        row1.append(NSAttributedString(string: "  \(shortAddr(s.address))", attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]))
-        let confStr = "  \(s.confidence)"
-        row1.append(NSAttributedString(string: confStr, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold),
-            .foregroundColor: s.confidence >= 65 ? color : NSColor.tertiaryLabelColor
-        ]))
-        row1.draw(at: NSPoint(x: 14, y: 46))
-
-        // Row 2: Key metrics bar
-        let holderStr = String(format: "%.1f%%", s.topHolderPct)
-        let velStr = String(format: "%.1fx", s.velocity)
-        let rateStr = s.txRate >= 1.0 ? String(format: "%.0f/m", s.txRate) : String(format: "%.1f/m", s.txRate)
-
-        let row2 = NSMutableAttributedString()
-        // Holder %
-        let holderColor = s.topHolderPct < 15 ? NSColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1) :
+        let holderColor: NSColor = s.topHolderPct < 15 ? NSColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1) :
                           s.topHolderPct < 30 ? NSColor(red: 0.8, green: 0.8, blue: 0.3, alpha: 1) :
                           NSColor(red: 1.0, green: 0.4, blue: 0.3, alpha: 1)
-        row2.append(NSAttributedString(string: "⬤ ", attributes: [.font: NSFont.systemFont(ofSize: 6), .foregroundColor: holderColor]))
-        row2.append(NSAttributedString(string: holderStr, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: holderColor]))
-        row2.append(NSAttributedString(string: "   ", attributes: [:]))
-        // Velocity
-        let velColor = s.velocity >= 2.0 ? NSColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1) :
+        let velColor: NSColor = s.velocity >= 2.0 ? NSColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1) :
                        s.velocity >= 1.0 ? NSColor.labelColor : NSColor.tertiaryLabelColor
-        row2.append(NSAttributedString(string: velStr, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: velColor]))
-        row2.append(NSAttributedString(string: "   ", attributes: [:]))
-        // Tx rate
-        row2.append(NSAttributedString(string: rateStr, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]))
-        row2.draw(at: NSPoint(x: 20, y: 26))
+        let dim = NSColor.tertiaryLabelColor
+        let mono11 = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        let mono10 = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
 
-        // Row 3: Direction + momentum bar
-        let row3 = NSMutableAttributedString()
-        row3.append(NSAttributedString(string: dirStr, attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: dirColor]))
-        row3.append(NSAttributedString(string: "   m\(s.momentum) d\(s.distribution) s\(s.spring)", attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor
-        ]))
-        row3.draw(at: NSPoint(x: 20, y: 8))
+        // Row 1: Icon + Class + Address + Score
+        let r1 = NSMutableAttributedString()
+        r1.append(NSAttributedString(string: "\(classIcon(s.classification)) ", attributes: [.font: NSFont.systemFont(ofSize: 12)]))
+        r1.append(NSAttributedString(string: s.classification, attributes: [.font: NSFont.boldSystemFont(ofSize: 10), .foregroundColor: color]))
+        r1.append(NSAttributedString(string: "  \(shortAddr(s.address))  ", attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]))
+        r1.append(NSAttributedString(string: "\(s.confidence)", attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold), .foregroundColor: s.confidence >= 65 ? color : dim]))
+        r1.draw(at: NSPoint(x: 12, y: 38))
+
+        // Row 2: Holder% | Holders | Vel | Rate
+        let r2 = NSMutableAttributedString()
+        r2.append(NSAttributedString(string: "⬤", attributes: [.font: NSFont.systemFont(ofSize: 5), .foregroundColor: holderColor]))
+        r2.append(NSAttributedString(string: String(format: "%.1f%%", s.topHolderPct), attributes: [.font: mono11, .foregroundColor: holderColor]))
+        r2.append(NSAttributedString(string: "  ", attributes: [:]))
+        r2.append(NSAttributedString(string: "\(s.holderCount)h", attributes: [.font: mono10, .foregroundColor: NSColor.secondaryLabelColor]))
+        r2.append(NSAttributedString(string: "  ", attributes: [:]))
+        r2.append(NSAttributedString(string: String(format: "%.1fx", s.velocity), attributes: [.font: mono11, .foregroundColor: velColor]))
+        r2.append(NSAttributedString(string: "  ", attributes: [:]))
+        let rateStr = s.txRate >= 1.0 ? String(format: "%.0f/m", s.txRate) : String(format: "%.1f/m", s.txRate)
+        r2.append(NSAttributedString(string: rateStr, attributes: [.font: mono10, .foregroundColor: dim]))
+        r2.draw(at: NSPoint(x: 18, y: 20))
+
+        // Row 3: Direction + m/d/s
+        let r3 = NSMutableAttributedString()
+        r3.append(NSAttributedString(string: dirStr, attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: dirColor]))
+        r3.append(NSAttributedString(string: "  m\(s.momentum) d\(s.distribution) s\(s.spring)", attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular), .foregroundColor: dim]))
+        r3.draw(at: NSPoint(x: 18, y: 5))
     }
 }
 
