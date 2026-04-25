@@ -4,7 +4,7 @@ pub mod safety;
 pub mod smartmoney;
 
 use crate::ingester::{parse_mint_account, RpcRouter};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +61,14 @@ impl SignalScore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Confidence {
     pub total: i32,
+    /// Weighted sum (mom×0.40 + dist×0.30 + spring×0.30) before the
+    /// top-holder bonus is applied. Exposed so callers can show the breakdown.
+    #[serde(default)]
+    pub base_total: i32,
+    /// Distribution bonus applied on top of base_total: 0, 10, or 15.
+    /// Fires when top_holder_score ≥ 75 (+10%) or ≥ 90 (+15%).
+    #[serde(default)]
+    pub top_holder_bonus_pct: i32,
     pub momentum: i32,
     pub distribution: i32,
     pub spring: i32,
@@ -174,24 +182,66 @@ impl Confidence {
 
         // Check for demand congestion and recency signals
         let has_demand_congestion = scores.iter().any(|s| s.signal_type == "demand_congestion");
-        let congestion_score = scores.iter()
+        let congestion_score = scores
+            .iter()
             .find(|s| s.signal_type == "demand_congestion")
             .map(|s| s.score)
             .unwrap_or(0);
-        let recency_score = scores.iter()
+        let recency_score = scores
+            .iter()
             .find(|s| s.signal_type == "recency")
             .map(|s| s.score)
             .unwrap_or(0);
-        let tx_rate_score = scores.iter()
+        let tx_rate_score = scores
+            .iter()
             .find(|s| s.signal_type == "tx_rate")
             .map(|s| s.score)
             .unwrap_or(0);
 
-        // Classification based on the pattern taxonomy
-        let classification = if distribution > 50 && has_demand_congestion && congestion_score > 70
-            && recency_score >= 60 && tx_rate_score >= 30 {
-            // GRINDER: deep distribution + sustained demand congestion + actually active
-            // Must have recent transactions — a dead token with old congestion is SPRING, not GRINDER
+        // Safety veto: any safety signal that encodes a hard-stop
+        // (PermanentDelegate, default-frozen mint, non-transferable) gets
+        // score = 0 with signal_type in the veto list. If present, classify
+        // as UNSAFE and zero the total — no confidence scoring applies.
+        let veto_signal = scores.iter().find(|s| {
+            s.score == 0
+                && matches!(
+                    s.signal_type.as_str(),
+                    "permanent_delegate" | "default_frozen" | "non_transferable"
+                )
+        });
+
+        // Crash detector: distributed-but-failing tokens where the wave is
+        // breaking. Still-active traffic (>= 10 tpm) with success rate collapsing
+        // (< 30%) and velocity decelerating is an actionable exit signal.
+        let tx_success_score = scores
+            .iter()
+            .find(|s| s.signal_type == "tx_success_rate")
+            .map(|s| s.score)
+            .unwrap_or(100);
+        let velocity_score = scores
+            .iter()
+            .find(|s| s.signal_type == "velocity")
+            .map(|s| s.score)
+            .unwrap_or(100);
+        let has_exit_warning = scores
+            .iter()
+            .any(|s| s.signal_type == "velocity_exit_warning");
+        // tx_success_rate scoring in microstructure: 90=100%, 70=~94%, 15=~22%
+        // Using score < 30 as proxy for "success rate under 30%"
+        let is_crashing = tx_rate_score >= 30
+            && tx_success_score < 30
+            && (velocity_score < 30 || has_exit_warning);
+
+        let classification = if let Some(v) = veto_signal {
+            format!("UNSAFE:{}", v.signal_type)
+        } else if is_crashing {
+            "CRASHING".to_string()
+        } else if distribution > 50
+            && has_demand_congestion
+            && congestion_score > 70
+            && recency_score >= 60
+            && tx_rate_score >= 30
+        {
             "GRINDER".to_string()
         } else if momentum > 70 && distribution > 50 {
             "STAIRCASE".to_string()
@@ -207,39 +257,71 @@ impl Confidence {
             "DEVELOPING".to_string()
         };
 
+        // UNSAFE vetoes override the total score — never let a risky token carry
+        // confidence into downstream ranking.
+        if classification.starts_with("UNSAFE") {
+            total = 0;
+        }
+
+        // Reasoning strings carry raw metrics only. No narrative, no hopeful
+        // language ("multi-wave potential", "coiled for ignition"). The reader
+        // has the numbers and the classification rule — that's the truth.
         let reasoning = match classification.as_str() {
+            c if c.starts_with("UNSAFE") => {
+                let suffix = c.strip_prefix("UNSAFE:").unwrap_or("unknown");
+                format!("UNSAFE · {} · total forced to 0", suffix)
+            }
+            "CRASHING" => format!(
+                "CRASHING · mom {} · dist {} · tpm_score {} · success {} · vel {}",
+                momentum, distribution, tx_rate_score, tx_success_score, velocity_score
+            ),
             "GRINDER" => format!(
-                "GRINDER — distribution {}, congestion {}, momentum {} — deep holder base with sustained demand exceeding supply",
+                "GRINDER · dist {} · congestion {} · mom {}",
                 distribution, congestion_score, momentum
             ),
             "STAIRCASE" => format!(
-                "STAIRCASE — momentum {}, distribution {}, spring {} — active with deep holder base, multi-wave potential",
+                "STAIRCASE · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
             "SURGE" => format!(
-                "SURGE — momentum {}, distribution {}, spring {} — explosive activity on concentrated token, window may be open",
+                "SURGE · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
             "SPRING" => format!(
-                "SPRING — momentum {}, distribution {}, spring {} — distributed and quiet, coiled for potential ignition",
+                "SPRING · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
             "DEAD" => format!(
-                "DEAD — momentum {}, distribution {}, spring {} — concentrated with no activity",
+                "DEAD · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
             "ACTIVE_TRAP" => format!(
-                "ACTIVE TRAP — momentum {}, distribution {}, spring {} — activity but still concentrated, watch for distribution",
+                "ACTIVE_TRAP · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
             _ => format!(
-                "DEVELOPING — momentum {}, distribution {}, spring {} — between states, watch for classification change",
+                "DEVELOPING · mom {} · dist {} · spring {}",
                 momentum, distribution, spring
             ),
         };
 
+        // Decomposition — expose the breakdown so downstream can show WHY
+        // the total landed where it did. Base = weighted sum before bonuses.
+        let base_total = ((momentum as f64 * 0.40)
+            + (distribution as f64 * 0.30)
+            + (spring as f64 * 0.30)) as i32;
+        let bonus_pct = if top_holder_score >= 90 {
+            15
+        } else if top_holder_score >= 75 {
+            10
+        } else {
+            0
+        };
+
         Self {
             total: total.clamp(0, 100),
+            base_total: base_total.clamp(0, 100),
+            top_holder_bonus_pct: bonus_pct,
             momentum: momentum.clamp(0, 100),
             distribution: distribution.clamp(0, 100),
             spring: spring.clamp(0, 100),
@@ -274,7 +356,12 @@ pub struct TokenAnalysis {
 }
 
 /// Run all signal layers against a live token, store snapshot, compute delta
-pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<&Arc<crate::db::Db>>) -> Result<TokenAnalysis> {
+pub async fn analyze_token(
+    rpc: &Arc<RpcRouter>,
+    mint_address: &str,
+    db: Option<&Arc<crate::db::Db>>,
+    prefetched_market: Option<crate::market::MarketData>,
+) -> Result<TokenAnalysis> {
     let safety_checker = safety::SafetyChecker::new();
     let micro = microstructure::MicrostructureAnalyzer::new();
     let onchain_analyzer = onchain::OnChainAnalyzer::new();
@@ -324,37 +411,151 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<
         all_scores.extend(onchain_analyzer.analyze_supply(supply, mint));
     }
 
-    // 3. Fetch largest holders
+    // 3. Fetch largest holders — propagate RPC errors so we don't persist
+    // zero-data snapshots that would misclassify the token as DEAD.
     let holders = rpc
         .get_token_largest_accounts(mint_address)
         .await
-        .unwrap_or_default();
+        .with_context(|| format!("fetch largest accounts for {}", mint_address))?;
     let holder_count = holders.len();
     let top_holder_pct = if !holders.is_empty() && supply_ui > 0.0 {
         (holders[0].ui_amount / supply_ui) * 100.0
     } else {
         0.0
     };
-    let top5_pct: f64 = holders.iter().take(5).map(|h| {
-        if supply_ui > 0.0 { (h.ui_amount / supply_ui) * 100.0 } else { 0.0 }
-    }).sum();
-    let top10_pct: f64 = holders.iter().take(10).map(|h| {
-        if supply_ui > 0.0 { (h.ui_amount / supply_ui) * 100.0 } else { 0.0 }
-    }).sum();
+    let top5_pct: f64 = holders
+        .iter()
+        .take(5)
+        .map(|h| {
+            if supply_ui > 0.0 {
+                (h.ui_amount / supply_ui) * 100.0
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    let top10_pct: f64 = holders
+        .iter()
+        .take(10)
+        .map(|h| {
+            if supply_ui > 0.0 {
+                (h.ui_amount / supply_ui) * 100.0
+            } else {
+                0.0
+            }
+        })
+        .sum();
 
     all_scores.extend(safety_checker.analyze_holders(&holders, supply_ui));
 
-    // 4. Fetch recent transactions
+    // 4. Fetch recent transactions — propagate RPC errors for the same reason
+    // as the holders fetch above.
     let signatures = rpc
         .get_recent_signatures(mint_address, 50)
         .await
-        .unwrap_or_default();
+        .with_context(|| format!("fetch signatures for {}", mint_address))?;
     let recent_tx_count = signatures.len();
 
     // Compute raw metrics for snapshot storage and cross-layer synthesis
     let metrics = micro.compute_metrics(&signatures);
     all_scores.extend(micro.analyze_activity(&signatures));
     all_scores.extend(onchain_analyzer.analyze_history_depth(&signatures));
+
+    // 4b. Fetch DexScreener market data — gives us price, mcap, liquidity, volume,
+    // buy/sell split, and host DEX. Signals keyed purely to DEX-agnostic holder
+    // state can't answer "is this real liquidity?" or "is there buy pressure?";
+    // this is where those answers come from. Errors are non-fatal — a freshly
+    // deployed mint may not be indexed yet.
+    let market = if let Some(m) = prefetched_market {
+        Some(m)
+    } else {
+        match crate::market::get_market(mint_address).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("dexscreener fetch failed for {}: {}", mint_address, e);
+                None
+            }
+        }
+    };
+    if let Some(m) = &market {
+        // Liquidity floor — below $5k is noise, above $50k is healthy.
+        // Skip entirely when liquidity is 0 — that means DexScreener failed to
+        // return data (not a real zero), and penalising momentum would cause
+        // false DEAD classifications.
+        if m.liquidity_usd > 0.0 {
+            let liq_score = if m.liquidity_usd < 2_000.0 {
+                5
+            } else if m.liquidity_usd < 5_000.0 {
+                20
+            } else if m.liquidity_usd < 20_000.0 {
+                55
+            } else if m.liquidity_usd < 50_000.0 {
+                75
+            } else {
+                85
+            };
+            all_scores.push(SignalScore::new(
+                SignalLayer::Microstructure,
+                "liquidity_depth",
+                liq_score,
+                &format!("liq ${:.0}k", m.liquidity_usd / 1000.0),
+            ));
+        }
+
+        // Buy/sell pressure — net inflow over the last hour.
+        let pressure = m.buy_pressure();
+        let total_txns = m.buys_h1 + m.sells_h1;
+        if total_txns >= 20 {
+            let score = (pressure * 100.0) as i32;
+            all_scores.push(SignalScore::new(
+                SignalLayer::Microstructure,
+                "buy_pressure_h1",
+                score,
+                &format!(
+                    "buys {} vs sells {} ({:.0}%)",
+                    m.buys_h1,
+                    m.sells_h1,
+                    pressure * 100.0
+                ),
+            ));
+        }
+
+        // LP lock/burn hint — DexScreener occasionally tags pairs with a
+        // "burnt" or "locked" label when it can detect the LP tokens sitting
+        // at a known burn/lock address. It's not comprehensive (most pump.fun
+        // pairs carry no label), so we treat it as a bonus when present, not
+        // a veto when absent.
+        let lp_marker = m.labels.iter().any(|l| {
+            let l = l.to_lowercase();
+            l.contains("burn") || l.contains("lock")
+        });
+        if lp_marker {
+            all_scores.push(SignalScore::new(
+                SignalLayer::Safety,
+                "lp_secured",
+                85,
+                &format!("LP labeled {:?} — liquidity de-risked", m.labels),
+            ));
+        }
+
+        // Freshly graduated from Pump.fun to a full AMM — single biggest
+        // inflection in a Pump.fun token's life cycle. Boost confidence.
+        if m.is_graduated() {
+            let age_hours = if m.pair_created_at > 0 {
+                (chrono::Utc::now().timestamp_millis() - m.pair_created_at) as f64 / 3_600_000.0
+            } else {
+                f64::INFINITY
+            };
+            if age_hours < 6.0 {
+                all_scores.push(SignalScore::new(
+                    SignalLayer::Microstructure,
+                    "post_graduation_fresh",
+                    85,
+                    &format!("graduated to {} {:.1}h ago", m.pair_dex, age_hours),
+                ));
+            }
+        }
+    }
 
     // 5. Cross-layer signal synthesis — patterns that emerge from combining layers
     let has_deep_holders = holder_count >= 15;
@@ -434,11 +635,174 @@ pub async fn analyze_token(rpc: &Arc<RpcRouter>, mint_address: &str, db: Option<
         classification: confidence.classification.clone(),
         confidence: confidence.total,
         timestamp: now,
+        price_usd: market.as_ref().map(|m| m.price_usd).unwrap_or(0.0),
+        mcap_usd: market.as_ref().map(|m| m.mcap_usd).unwrap_or(0.0),
+        liquidity_usd: market.as_ref().map(|m| m.liquidity_usd).unwrap_or(0.0),
+        volume_h1_usd: market.as_ref().map(|m| m.volume_h1_usd).unwrap_or(0.0),
+        buys_h1: market.as_ref().map(|m| m.buys_h1).unwrap_or(0),
+        sells_h1: market.as_ref().map(|m| m.sells_h1).unwrap_or(0),
+        price_change_h1: market.as_ref().map(|m| m.price_change_h1).unwrap_or(0.0),
+        pair_dex: market
+            .as_ref()
+            .map(|m| m.pair_dex.clone())
+            .unwrap_or_default(),
     };
 
     let delta = if let Some(db) = db {
-        let d = db.compute_delta(mint_address, &current_snapshot).ok().flatten();
+        // Record the deployer on first sight. The largest holder at the
+        // moment of first scan is a reliable proxy for the creator wallet
+        // on pump.fun-style launches, and the only information we need to
+        // track their future dumping behavior.
+        if let Some(top) = holders.first() {
+            let _ = db.set_deployer_if_empty(mint_address, &top.address, top.ui_amount);
+        }
+
+        // First-time sniper cohort capture: the top-20 holders at first-scan
+        // are our best proxy for the early-buyer cohort on a pump.fun mint
+        // we just discovered. Resolve each token account to its owner wallet
+        // and persist. Skipped silently for tokens that already have a
+        // cohort recorded.
+        if !holders.is_empty() && !db.has_sniper_cohort(mint_address).unwrap_or(true) {
+            let addrs: Vec<String> = holders.iter().take(20).map(|h| h.address.clone()).collect();
+            if let Ok(batch) = rpc.get_multiple_token_account_owners(&addrs).await {
+                let owners: Vec<String> = batch.into_iter().flatten().collect();
+                if !owners.is_empty() {
+                    let _ = db.insert_snipers(mint_address, &owners);
+                }
+            }
+        }
+
+        // Detect graduation: prior snapshot was Pump.fun, current is a full AMM.
+        if let Ok(Some(prev)) = db.get_previous_snapshot(mint_address) {
+            let was_pumpfun = matches!(prev.pair_dex.as_str(), "pumpswap" | "pumpfun");
+            let is_amm = matches!(
+                current_snapshot.pair_dex.as_str(),
+                "raydium" | "meteora" | "orca"
+            );
+            if was_pumpfun && is_amm {
+                let mcap_k = current_snapshot.mcap_usd / 1000.0;
+                let _ = db.insert_alert(
+                    "graduation",
+                    Some(mint_address),
+                    &format!(
+                        "GRADUATION {} · {} → {} · mcap ${:.0}k · liq ${:.0}k",
+                        mint_address,
+                        prev.pair_dex,
+                        current_snapshot.pair_dex,
+                        mcap_k,
+                        current_snapshot.liquidity_usd / 1000.0,
+                    ),
+                    85,
+                );
+
+                // Fire a background scout — deployer profile + website text
+                // land as a follow-up `graduation_scout` alert a few seconds
+                // later. Kept off the hot path so graduation latency stays
+                // tight even when a website is slow.
+                let mint_clone = mint_address.to_string();
+                let rpc_clone = rpc.clone();
+                let db_clone = db.clone();
+                tokio::spawn(async move {
+                    let report = match crate::scout::scout(&mint_clone, &rpc_clone, &db_clone).await
+                    {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(d) = &report.deployer {
+                        let age = d
+                            .seconds_since_last_tx
+                            .map(|s| {
+                                if s < 3600 {
+                                    format!("{}m", s / 60)
+                                } else if s < 86_400 {
+                                    format!("{}h", s / 3600)
+                                } else {
+                                    format!("{}d", s / 86_400)
+                                }
+                            })
+                            .unwrap_or_else(|| "—".to_string());
+                        parts.push(format!(
+                            "deployer sold {:.1}% · 7d tx {} · last {}",
+                            d.pct_sold, d.tx_count_7d, age
+                        ));
+                    }
+                    if let Some(w) = &report.website {
+                        // Include only first 240 chars of stripped text as a
+                        // teaser — full text is available via /scout.
+                        let snippet: String = w
+                            .text
+                            .chars()
+                            .take(240)
+                            .collect::<String>()
+                            .replace('\n', " ");
+                        parts.push(format!("site {} · \"{}…\"", w.url, snippet));
+                    } else if !report.socials.is_empty() {
+                        parts.push(format!("socials: {}", report.socials.len()));
+                    }
+                    if parts.is_empty() {
+                        return;
+                    }
+                    let msg = format!("GRADUATION_SCOUT {} · {}", mint_clone, parts.join(" · "));
+                    let _ = db_clone.insert_alert("graduation_scout", Some(&mint_clone), &msg, 82);
+                });
+            }
+        }
+
+        let d = db
+            .compute_delta(mint_address, &current_snapshot)
+            .ok()
+            .flatten();
         let _ = db.insert_snapshot(&current_snapshot);
+
+        // Persist the top-20 addresses+balances JSON on the just-inserted
+        // snapshot so holder_evolution can diff composition over time.
+        // Kept separate from the INSERT to avoid adding yet another
+        // `params!` positional; a trailing UPDATE is cheaper than widening
+        // the hot-path INSERT statement.
+        if !holders.is_empty() {
+            let json = serde_json::to_string(
+                &holders
+                    .iter()
+                    .take(20)
+                    .map(|h| {
+                        serde_json::json!({
+                            "address": h.address,
+                            "ui_amount": h.ui_amount,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_string());
+            let _ = db.update_latest_top_holders_json(mint_address, &json);
+        }
+
+        // Dev-wallet sell detector: compare current deployer balance against
+        // the recorded "initial" balance from discovery time. A drop of ≥10%
+        // in their holding is a classic rug-in-progress signal.
+        if let Ok(Some((dep_addr, initial_bal))) = db.get_deployer(mint_address) {
+            if !dep_addr.is_empty() && initial_bal > 0.0 {
+                // Current balance: find the deployer in the fresh holder list.
+                let current_bal = holders
+                    .iter()
+                    .find(|h| h.address == dep_addr)
+                    .map(|h| h.ui_amount)
+                    .unwrap_or(0.0);
+                let drop_pct = (1.0 - current_bal / initial_bal) * 100.0;
+                if drop_pct >= 10.0 {
+                    let _ = db.insert_alert(
+                        "dev_selling",
+                        Some(mint_address),
+                        &format!(
+                            "DEV_SELLING {} · deployer down {:.1}% ({:.0} → {:.0})",
+                            mint_address, drop_pct, initial_bal, current_bal,
+                        ),
+                        (50.0 + drop_pct).min(95.0) as i32,
+                    );
+                }
+            }
+        }
+
         d
     } else {
         None
