@@ -241,14 +241,18 @@ impl BackgroundScanner {
                         }
                     }
 
-                    // Drop dead/trap/concentrated tokens quickly so the
-                    // shortlist keeps cycling through viable candidates.
-                    // When an active call exists for this token, also auto-close
-                    // it as 'failed' so the public ledger shows a clean exit
-                    // rather than an orphaned open position.
+                    // Drop dead/trap/concentrated tokens from the watchlist so
+                    // the shortlist keeps cycling through viable candidates.
+                    // Auto-failing a call is a separate, stricter gate: only
+                    // on-chain confirmed safety violations (UNSAFE:*) justify
+                    // writing a loss to the public ledger automatically.
+                    // DEAD/CRASHING/ACTIVE_TRAP may be transient or data-quality
+                    // false positives — leave those calls open for manual review.
                     if should_remove_from_watchlist(&analysis) {
                         self.db.deactivate_watchlist(addr)?;
-                        if self.db.has_active_call(addr).unwrap_or(false) {
+                        if self.db.has_active_call(addr).unwrap_or(false)
+                            && is_confirmed_unsafe(&analysis)
+                        {
                             let exit_price = crate::metadata::fetch(addr)
                                 .await
                                 .ok()
@@ -263,7 +267,7 @@ impl BackgroundScanner {
                             );
                             let _ = self.db.fail_call(addr, exit_price, &exit_note);
                             tracing::info!(
-                                "call auto-failed: {} class={} top={:.1}%",
+                                "call auto-failed (unsafe): {} class={} top={:.1}%",
                                 addr, analysis.confidence.classification, analysis.top_holder_pct
                             );
                             // Update Telegram delivery if one exists.
@@ -719,7 +723,7 @@ fn should_remove_from_watchlist(analysis: &TokenAnalysis) -> bool {
     let class = analysis.confidence.classification.as_str();
     // DEAD requires a confirmed liquidity_depth signal — that signal is only
     // added when DexScreener returns liquidity_usd > 0. Missing market data
-    // (fetch failure returning 0 or no response) must not auto-fail calls.
+    // (fetch failure returning 0 or no response) must not trigger removal.
     let has_market_signal = analysis
         .scores
         .iter()
@@ -728,6 +732,14 @@ fn should_remove_from_watchlist(analysis: &TokenAnalysis) -> bool {
         || matches!(class, "CRASHING" | "ACTIVE_TRAP")
         || class.starts_with("UNSAFE")
         || (analysis.holder_count < 25 && analysis.top_holder_pct >= 33.0)
+}
+
+// Only auto-close a public call for on-chain confirmed safety violations.
+// Classification-based signals (DEAD, CRASHING, ACTIVE_TRAP) can be transient
+// or driven by stale market data — writing a public loss on that alone risks
+// reputation damage from false positives.
+fn is_confirmed_unsafe(analysis: &TokenAnalysis) -> bool {
+    analysis.confidence.classification.starts_with("UNSAFE")
 }
 
 pub struct ScannerHandle {
