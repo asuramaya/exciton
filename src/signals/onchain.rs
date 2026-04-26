@@ -71,15 +71,49 @@ impl OnChainAnalyzer {
         // If 50 transactions span a long window = moderate activity on an established token
         // If 50 transactions span seconds = extremely active (just launched or pumping)
         let (depth_score, depth_label) = if window_hours > 24.0 {
-            (85, format!("{:.0} txs over {:.0}d — established activity", signatures.len(), window_hours / 24.0))
+            (
+                85,
+                format!(
+                    "{:.0} txs over {:.0}d — established activity",
+                    signatures.len(),
+                    window_hours / 24.0
+                ),
+            )
         } else if window_hours > 1.0 {
-            (70, format!("{:.0} txs over {:.1}h — active trading", signatures.len(), window_hours))
+            (
+                70,
+                format!(
+                    "{:.0} txs over {:.1}h — active trading",
+                    signatures.len(),
+                    window_hours
+                ),
+            )
         } else if window_seconds > 300 {
-            (55, format!("{:.0} txs over {:.0}m — moderate activity", signatures.len(), window_seconds as f64 / 60.0))
+            (
+                55,
+                format!(
+                    "{:.0} txs over {:.0}m — moderate activity",
+                    signatures.len(),
+                    window_seconds as f64 / 60.0
+                ),
+            )
         } else if window_seconds > 30 {
-            (40, format!("{:.0} txs in {:.0}s — very high activity, possible launch/pump", signatures.len(), window_seconds))
+            (
+                40,
+                format!(
+                    "{:.0} txs in {:.0}s — very high activity, possible launch/pump",
+                    signatures.len(),
+                    window_seconds
+                ),
+            )
         } else {
-            (25, format!("{:.0} txs in <30s — extreme burst, likely just launched", signatures.len()))
+            (
+                25,
+                format!(
+                    "{:.0} txs in <30s — extreme burst, likely just launched",
+                    signatures.len()
+                ),
+            )
         };
 
         scores.push(SignalScore::new(

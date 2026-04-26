@@ -3,4 +3,10 @@ photon.db
 photon.db-wal
 photon.db-shm
 config.toml
+config.vm.toml
 .mcp.json
+.env
+.envrc
+.DS_Store
+.claude/
+.playwright-mcp/

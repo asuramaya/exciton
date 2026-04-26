@@ -69,10 +69,13 @@ impl BackgroundScanner {
         }
     }
 
-    /// At startup, auto-fail any call that has an active status in the `calls`
-    /// table but whose watchlist entry is already inactive. This handles the
-    /// race where the service restarted between watchlist deactivation and the
-    /// auto-fail hook firing.
+    /// At startup, log any active call whose watchlist entry is inactive.
+    /// We deliberately don't auto-fail or auto-void these: most watchlist
+    /// deactivations are non-UNSAFE (DEAD/CRASHING/concentrated) which
+    /// runtime intentionally leaves open for operator review (see scanner
+    /// `should_remove_from_watchlist` vs `is_confirmed_unsafe` split). The
+    /// 14-day `expires_at` handles abandoned rows; everything else needs an
+    /// explicit operator `/close_call` to write a verdict.
     async fn cleanup_orphaned_calls(&self) {
         let orphans = match self.db.list_orphaned_calls() {
             Ok(v) => v,
@@ -84,33 +87,12 @@ impl BackgroundScanner {
         if orphans.is_empty() {
             return;
         }
-        tracing::info!("cleanup: {} orphaned call(s) to auto-fail", orphans.len());
+        tracing::info!(
+            "startup: {} active call(s) with inactive watchlist — left open for operator review",
+            orphans.len()
+        );
         for mint in &orphans {
-            let exit_price = crate::metadata::fetch(mint)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.price_usd)
-                .unwrap_or(0.0);
-            let note = "auto-failed: orphaned call (watchlist inactive at startup)";
-            match self.db.fail_call(mint, exit_price, note) {
-                Ok(_) => {
-                    tracing::info!("orphan auto-failed: {}", mint);
-                    if let Some(ref n) = self.notifier {
-                        let mint_owned = mint.clone();
-                        let n = n.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = n
-                                .update_call_outcome(&mint_owned, "failed", None, note)
-                                .await
-                            {
-                                tracing::warn!("orphan update_call_outcome failed: {}", e);
-                            }
-                        });
-                    }
-                }
-                Err(e) => tracing::warn!("fail_call for orphan {} failed: {}", mint, e),
-            }
+            tracing::info!("orphan call (left active): {}", mint);
         }
     }
 
@@ -445,11 +427,41 @@ impl BackgroundScanner {
             }
         }
 
+        // Phase 2b: Graduation detection — walk recent pumpswap AMM signatures to
+        // catch pump.fun tokens that just bonded-curve-graduated. These are already
+        // in our `tokens` table but not on the watchlist. Re-analyze immediately
+        // instead of waiting for Phase 4's polling cycle.
+        match discovery::check_graduated_tokens(&self.db, &self.rpc, 3).await {
+            Ok(graduated) => {
+                for analysis in &graduated {
+                    if should_track_on_watchlist(analysis, self.alert_threshold) {
+                        let _ = self
+                            .db
+                            .add_to_watchlist(&analysis.address, &analysis.confidence.classification);
+                        tracing::info!(
+                            "graduation: watchlisted {} ({})",
+                            analysis.address,
+                            analysis.confidence.classification
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("check_graduated_tokens failed: {}", e);
+            }
+        }
+
         // Phase 3: Smart-wallet tracker — for each user-curated wallet, diff
         // the current SPL holdings against our stored view; every newly-seen
         // mint becomes a `smart_wallet_buy` alert. Imitation alpha: when a
         // proven caller's wallet buys something, we want to know immediately.
         self.scan_smart_wallets().await;
+
+        // Phase 4: Re-ingest. Every cycle, batch-query DexScreener for recently-
+        // discovered tokens that failed the initial watchlist gate (too concentrated,
+        // too few holders, or no pair yet). One HTTP call for 30 candidates per cycle;
+        // full RPC analysis only fires when a token crosses the volume floor.
+        self.run_reingest_phase().await;
 
         // Tick the hourly digest — notifier dedups by hour bucket internally,
         // so calling once per cycle is safe and self-pacing.
@@ -468,6 +480,109 @@ impl BackgroundScanner {
         }
 
         Ok(alert_count)
+    }
+
+    /// Phase 4: Re-evaluate tokens that were discovered but not watchlisted.
+    /// Pump.fun tokens often launch with concentrated ownership and no DexScreener
+    /// pair; they mature within 30-120 minutes and become legitimate signals.
+    /// We check recently-discovered, non-watchlisted tokens via a DexScreener batch
+    /// call and fully re-analyze any showing meaningful volume.
+    async fn run_reingest_phase(&self) {
+        // Candidates: discovered 30min–48h ago, no active watchlist entry,
+        // no snapshot in the last 30 minutes (prevents repeated hammering).
+        let candidates = match self
+            .db
+            .list_stale_discovered_candidates(30 * 60, 6 * 3600, 30 * 60, 30)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("reingest: list_stale_discovered_candidates failed: {}", e);
+                return;
+            }
+        };
+        tracing::debug!("reingest: {} candidates queued for DexScreener check", candidates.len());
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Batch DexScreener lookup — one HTTP call for up to 40 mints.
+        let mint_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let markets = match crate::market::get_market_batch(&mint_refs).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("reingest: DexScreener batch failed: {}", e);
+                return;
+            }
+        };
+        tracing::debug!("reingest: DexScreener returned {} pairs for {} candidates", markets.len(), candidates.len());
+
+        // Rank by h1 volume descending; only proceed with the top N that
+        // show meaningful market activity.
+        const REINGEST_VOLUME_FLOOR: f64 = 5_000.0;
+        const REINGEST_MAX_FULL_ANALYSES: usize = 3;
+
+        let mut ranked: Vec<(&str, f64)> = candidates
+            .iter()
+            .filter_map(|mint| {
+                let m = markets.get(mint.as_str())?;
+                let vol = m.volume_h1_usd;
+                if vol >= REINGEST_VOLUME_FLOOR {
+                    Some((mint.as_str(), vol))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(REINGEST_MAX_FULL_ANALYSES);
+
+        if ranked.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "reingest: {} candidates, {} above volume floor, re-analyzing",
+            candidates.len(),
+            ranked.len()
+        );
+
+        for (mint, vol) in ranked {
+            match signals::analyze_token(&self.rpc, mint, Some(&self.db), None).await {
+                Ok(analysis) => {
+                    // Always write a snapshot so the recent_snapshot_cutoff
+                    // prevents us from re-checking the same token next cycle.
+                    let _ = self.db.insert_token(mint, analysis.confidence.total);
+                    if should_track_on_watchlist(&analysis, self.alert_threshold) {
+                        let _ = self.db.add_to_watchlist(
+                            mint,
+                            &analysis.confidence.classification,
+                        );
+                        tracing::info!(
+                            "reingest: added {} to watchlist · class={} conf={} holders={} top={:.1}% vol_h1=${:.0}",
+                            mint,
+                            analysis.confidence.classification,
+                            analysis.confidence.total,
+                            analysis.holder_count,
+                            analysis.top_holder_pct,
+                            vol,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "reingest: {} still below threshold · class={} conf={} holders={} top={:.1}% vol_h1=${:.0}",
+                            mint,
+                            analysis.confidence.classification,
+                            analysis.confidence.total,
+                            analysis.holder_count,
+                            analysis.top_holder_pct,
+                            vol,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("reingest: analyze_token {} failed: {}", mint, e);
+                }
+            }
+        }
     }
 
     async fn scan_smart_wallets(&self) {

@@ -1,0 +1,20 @@
+services:
+  photon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: photon:latest
+    container_name: photon
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PHOTON_DB_PATH: /data/photon.db
+    working_dir: /data
+    volumes:
+      - ${PHOTON_STATE_DIR:-./state}:/data
+      - ${MADAPES_REPO_DIR:-./MadApes.ai}:/srv/MadApes.ai
+      - ${PHOTON_SSH_DIR:-./ssh}:/root/.ssh
+      - ${PHOTON_CONFIG_PATH:-./deploy/config.container.toml.example}:/etc/photon/config.toml:ro
+    stdin_open: true
+    tty: true

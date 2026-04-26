@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_response::RpcTokenAccountBalance;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_transaction_status::option_serializer::OptionSerializer;
+use solana_transaction_status::UiTransactionEncoding;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -19,10 +22,7 @@ struct Endpoint {
 
 impl Endpoint {
     fn new(url: &str) -> Self {
-        let client = RpcClient::new_with_commitment(
-            url.to_string(),
-            CommitmentConfig::confirmed(),
-        );
+        let client = RpcClient::new_with_commitment(url.to_string(), CommitmentConfig::confirmed());
         Self {
             url: url.to_string(),
             client,
@@ -80,16 +80,17 @@ impl RpcRouter {
         })
     }
 
-    /// Get the next healthy endpoint, round-robin with failover
-    fn next_client(&self) -> Option<&RpcClient> {
+    /// Get the next healthy endpoint, round-robin with failover.
+    /// Returns (endpoint_index, client) so callers can attribute health records
+    /// to the actual endpoint used, not the one `current` happened to point to.
+    fn next_client(&self) -> Option<(usize, &RpcClient)> {
         let len = self.endpoints.len();
         let start = self.current.fetch_add(1, Ordering::Relaxed) % len;
 
-        // Try from current position, wrapping around
         for i in 0..len {
             let idx = (start + i) % len;
             if self.endpoints[idx].is_healthy() {
-                return Some(&self.endpoints[idx].client);
+                return Some((idx, &self.endpoints[idx].client));
             }
         }
 
@@ -98,7 +99,8 @@ impl RpcRouter {
         for ep in &self.endpoints {
             ep.reset_errors();
         }
-        Some(&self.endpoints[start % len].client)
+        let idx = start % len;
+        Some((idx, &self.endpoints[idx].client))
     }
 
     fn record_result(&self, idx: usize, success: bool) {
@@ -111,8 +113,18 @@ impl RpcRouter {
         }
     }
 
-    fn current_index(&self) -> usize {
-        self.current.load(Ordering::Relaxed).wrapping_sub(1) % self.endpoints.len()
+    fn record_failure(&self, idx: usize, error: &str) {
+        if let Some(ep) = self.endpoints.get(idx) {
+            ep.record_error();
+            if is_rate_limited(error) {
+                ep.healthy.store(false, Ordering::Relaxed);
+                ep.error_count.store(4, Ordering::Relaxed);
+                tracing::warn!(
+                    "RPC endpoint rate-limited, sidelining provider: {}",
+                    mask_url(&ep.url)
+                );
+            }
+        }
     }
 
     pub fn endpoint_count(&self) -> usize {
@@ -123,208 +135,668 @@ impl RpcRouter {
         self.endpoints.iter().filter(|e| e.is_healthy()).count()
     }
 
-    /// Get balance for a wallet
-    pub async fn get_balance(&self, pubkey: &str) -> Result<u64> {
-        let pk = Pubkey::from_str(pubkey).context("Invalid public key")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
-
-        match client.get_balance(&pk).await {
-            Ok(balance) => {
-                self.record_result(idx, true);
-                Ok(balance)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                // Try one more endpoint on failure
-                if let Some(retry_client) = self.next_client() {
-                    let retry_idx = self.current_index();
-                    match retry_client.get_balance(&pk).await {
-                        Ok(balance) => {
-                            self.record_result(retry_idx, true);
-                            Ok(balance)
-                        }
-                        Err(e2) => {
-                            self.record_result(retry_idx, false);
-                            Err(e2.into())
-                        }
-                    }
-                } else {
-                    Err(e.into())
+    /// Send a signed VersionedTransaction to the network via the best available endpoint.
+    pub async fn send_versioned_transaction(
+        &self,
+        tx: &solana_sdk::transaction::VersionedTransaction,
+    ) -> Result<Signature> {
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.send_transaction(tx).await {
+                Ok(sig) => {
+                    self.record_result(idx, true);
+                    return Ok(sig);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
                 }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Get balance for a wallet
+    pub async fn get_balance(&self, pubkey: &str) -> Result<u64> {
+        let pk = Pubkey::from_str(pubkey).context("Invalid public key")?;
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_balance(&pk).await {
+                Ok(balance) => {
+                    self.record_result(idx, true);
+                    return Ok(balance);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    tracing::warn!(
+                        "getBalance failed on endpoint {}: {}",
+                        mask_url(&self.endpoints[idx].url),
+                        err
+                    );
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
     /// Get recent blockhash to verify connectivity
     pub async fn check_connection(&self) -> Result<bool> {
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
-
-        match client.get_latest_blockhash().await {
-            Ok(_) => {
-                self.record_result(idx, true);
-                Ok(true)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                tracing::warn!("RPC connection check failed: {}", e);
-                Ok(false)
+        let attempts = self.endpoints.len();
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_latest_blockhash().await {
+                Ok(_) => {
+                    self.record_result(idx, true);
+                    return Ok(true);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    tracing::warn!(
+                        "RPC connection check failed on endpoint {}: {}",
+                        mask_url(&self.endpoints[idx].url),
+                        err
+                    );
+                }
             }
         }
+        Ok(false)
     }
 
     /// Get slot to check data freshness
     pub async fn get_slot(&self) -> Result<u64> {
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        match client.get_slot().await {
-            Ok(slot) => {
-                self.record_result(idx, true);
-                Ok(slot)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                Err(e.into())
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_slot().await {
+                Ok(slot) => {
+                    self.record_result(idx, true);
+                    return Ok(slot);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
     /// Get token account balance
     pub async fn get_token_account_balance(&self, token_account: &str) -> Result<u64> {
         let pk = Pubkey::from_str(token_account).context("Invalid token account")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        match client.get_token_account_balance(&pk).await {
-            Ok(balance) => {
-                self.record_result(idx, true);
-                let amount = balance.amount.parse::<u64>().unwrap_or(0);
-                Ok(amount)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                Err(e.into())
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_token_account_balance(&pk).await {
+                Ok(balance) => {
+                    self.record_result(idx, true);
+                    let amount = balance.amount.parse::<u64>().unwrap_or(0);
+                    return Ok(amount);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
     /// Get raw account info for a mint address — used to read authorities and extensions
     pub async fn get_account_info(&self, address: &str) -> Result<Option<Account>> {
         let pk = Pubkey::from_str(address).context("Invalid address")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        match client.get_account(&pk).await {
-            Ok(account) => {
-                self.record_result(idx, true);
-                Ok(Some(account))
-            }
-            Err(e) => {
-                // Account not found is not an error — it just doesn't exist
-                let err_str = e.to_string();
-                if err_str.contains("AccountNotFound") || err_str.contains("could not find account")
-                {
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_account(&pk).await {
+                Ok(account) => {
                     self.record_result(idx, true);
-                    Ok(None)
-                } else {
-                    self.record_result(idx, false);
-                    Err(e.into())
+                    return Ok(Some(account));
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("AccountNotFound")
+                        || err_str.contains("could not find account")
+                    {
+                        self.record_result(idx, true);
+                        return Ok(None);
+                    }
+                    self.record_failure(idx, &err_str);
+                    last_err = Some(e.into());
                 }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
     /// Get token supply for a mint
     pub async fn get_token_supply(&self, mint: &str) -> Result<TokenSupplyInfo> {
         let pk = Pubkey::from_str(mint).context("Invalid mint address")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        match client.get_token_supply(&pk).await {
-            Ok(supply) => {
-                self.record_result(idx, true);
-                Ok(TokenSupplyInfo {
-                    amount: supply.amount.parse::<u64>().unwrap_or(0),
-                    decimals: supply.decimals,
-                    ui_amount: supply.ui_amount.unwrap_or(0.0),
-                })
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                Err(e.into())
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_token_supply(&pk).await {
+                Ok(supply) => {
+                    self.record_result(idx, true);
+                    return Ok(TokenSupplyInfo {
+                        amount: supply.amount.parse::<u64>().unwrap_or(0),
+                        decimals: supply.decimals,
+                        ui_amount: supply.ui_amount.unwrap_or(0.0),
+                    });
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
-    /// Get largest token holders — critical for concentration analysis
-    pub async fn get_token_largest_accounts(
-        &self,
-        mint: &str,
-    ) -> Result<Vec<TokenHolderInfo>> {
+    /// Get largest token holders — critical for concentration analysis.
+    /// Retries across endpoints on failure so a quota-exhausted provider
+    /// (e.g. Helius 429) doesn't kill a scan when healthier peers exist.
+    pub async fn get_token_largest_accounts(&self, mint: &str) -> Result<Vec<TokenHolderInfo>> {
         let pk = Pubkey::from_str(mint).context("Invalid mint address")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        match client.get_token_largest_accounts(&pk).await {
-            Ok(accounts) => {
-                self.record_result(idx, true);
-                let holders: Vec<TokenHolderInfo> = accounts
-                    .iter()
-                    .map(|a| TokenHolderInfo {
-                        address: a.address.clone(),
-                        amount: a.amount.amount.parse::<u64>().unwrap_or(0),
-                        ui_amount: a.amount.ui_amount.unwrap_or(0.0),
-                        decimals: a.amount.decimals,
-                    })
-                    .collect();
-                Ok(holders)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                Err(e.into())
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_token_largest_accounts(&pk).await {
+                Ok(accounts) => {
+                    self.record_result(idx, true);
+                    let holders: Vec<TokenHolderInfo> = accounts
+                        .iter()
+                        .map(|a| TokenHolderInfo {
+                            address: a.address.clone(),
+                            amount: a.amount.amount.parse::<u64>().unwrap_or(0),
+                            ui_amount: a.amount.ui_amount.unwrap_or(0.0),
+                            decimals: a.amount.decimals,
+                        })
+                        .collect();
+                    return Ok(holders);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    tracing::warn!(
+                        "getTokenLargestAccounts failed on endpoint {}: {}",
+                        mask_url(&self.endpoints[idx].url),
+                        err
+                    );
+                    last_err = Some(e.into());
+                }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
-    /// Get recent transaction signatures for an address
+    /// Get recent transaction signatures for an address.
+    /// Retries across endpoints on failure — same rationale as
+    /// `get_token_largest_accounts`.
     pub async fn get_recent_signatures(
         &self,
         address: &str,
         limit: usize,
     ) -> Result<Vec<SignatureInfo>> {
         let pk = Pubkey::from_str(address).context("Invalid address")?;
-        let client = self.next_client().context("No RPC endpoints available")?;
-        let idx = self.current_index();
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let config = solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-            limit: Some(limit),
-            ..Default::default()
-        };
-
-        match client
-            .get_signatures_for_address_with_config(&pk, config)
-            .await
-        {
-            Ok(sigs) => {
-                self.record_result(idx, true);
-                let infos: Vec<SignatureInfo> = sigs
-                    .iter()
-                    .map(|s| SignatureInfo {
-                        signature: s.signature.clone(),
-                        slot: s.slot,
-                        block_time: s.block_time,
-                        err: s.err.is_some(),
-                    })
-                    .collect();
-                Ok(infos)
-            }
-            Err(e) => {
-                self.record_result(idx, false);
-                Err(e.into())
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            let config = solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                limit: Some(limit),
+                ..Default::default()
+            };
+            match client
+                .get_signatures_for_address_with_config(&pk, config)
+                .await
+            {
+                Ok(sigs) => {
+                    self.record_result(idx, true);
+                    let infos: Vec<SignatureInfo> = sigs
+                        .iter()
+                        .map(|s| SignatureInfo {
+                            signature: s.signature.clone(),
+                            slot: s.slot,
+                            block_time: s.block_time,
+                            err: s.err.is_some(),
+                        })
+                        .collect();
+                    return Ok(infos);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    tracing::warn!(
+                        "getSignaturesForAddress failed on endpoint {}: {}",
+                        mask_url(&self.endpoints[idx].url),
+                        err
+                    );
+                    last_err = Some(e.into());
+                }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Return the SPL token holdings (mint, ui_balance) of a wallet. Used by
+    /// the smart-wallet tracker to detect when a watched address picks up a
+    /// new mint. Filters to the SPL Token program; silently drops accounts
+    /// whose parsed shape is unexpected.
+    pub async fn get_wallet_token_holdings(&self, owner: &str) -> Result<Vec<(String, f64)>> {
+        use solana_client::rpc_request::TokenAccountsFilter;
+        const TOKEN_PROGRAM_IDS: [&str; 2] = [
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ];
+
+        let owner_pk = Pubkey::from_str(owner).context("invalid owner address")?;
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            let mut holdings_by_mint: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            let mut endpoint_ok = true;
+
+            for program_id in TOKEN_PROGRAM_IDS {
+                let program_pk =
+                    Pubkey::from_str(program_id).expect("constant token program id is valid");
+                let filter = TokenAccountsFilter::ProgramId(program_pk);
+                match client.get_token_accounts_by_owner(&owner_pk, filter).await {
+                    Ok(accounts) => {
+                        for acc in accounts {
+                            let Ok(v) = serde_json::to_value(&acc.account.data) else {
+                                continue;
+                            };
+                            let info = &v["parsed"]["info"];
+                            let mint = info["mint"].as_str().unwrap_or("").to_string();
+                            let ui = info["tokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+                            if !mint.is_empty() && ui > 0.0 {
+                                *holdings_by_mint.entry(mint).or_insert(0.0) += ui;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err = e.to_string();
+                        self.record_failure(idx, &err);
+                        tracing::warn!(
+                            "getTokenAccountsByOwner failed on endpoint {} for program {}: {}",
+                            mask_url(&self.endpoints[idx].url),
+                            program_id,
+                            err
+                        );
+                        last_err = Some(e.into());
+                        endpoint_ok = false;
+                    }
+                }
+            }
+
+            if endpoint_ok {
+                // Endpoint responded without error — empty map is valid (wallet holds nothing).
+                self.record_result(idx, true);
+                let mut holdings: Vec<(String, f64)> = holdings_by_mint.into_iter().collect();
+                holdings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                return Ok(holdings);
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Return the owner wallet for a given SPL token account. `getTokenLargestAccounts`
+    /// gives us token-account addresses, not the wallets behind them — we need
+    /// this resolution step before we can trace a holder's activity.
+    pub async fn get_token_account_owner(&self, token_account: &str) -> Result<String> {
+        let pk = Pubkey::from_str(token_account).context("invalid token account")?;
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_account(&pk).await {
+                Ok(acc) => {
+                    self.record_result(idx, true);
+                    // SPL token account layout: mint[32] | owner[32] | ...
+                    if acc.data.len() < 64 {
+                        return Err(anyhow::anyhow!("token account data too short"));
+                    }
+                    let owner_bytes: [u8; 32] = acc.data[32..64]
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("owner slice conversion failed"))?;
+                    return Ok(Pubkey::new_from_array(owner_bytes).to_string());
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Batch-resolve owner wallets for multiple SPL token accounts in a single
+    /// `getMultipleAccounts` RPC call instead of N sequential `getAccountInfo`
+    /// calls. Returns one `Option<String>` per input address — `None` when an
+    /// account is missing or its layout is too short to parse. Chunks at 100
+    /// to stay within standard RPC server limits.
+    pub async fn get_multiple_token_account_owners(
+        &self,
+        token_accounts: &[String],
+    ) -> Result<Vec<Option<String>>> {
+        if token_accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pks: Vec<Pubkey> = token_accounts
+            .iter()
+            .map(|a| Pubkey::from_str(a).context("invalid token account"))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut all_owners: Vec<Option<String>> = Vec::with_capacity(pks.len());
+        for chunk in pks.chunks(100) {
+            let owners = self.resolve_owner_chunk(chunk).await?;
+            all_owners.extend(owners);
+        }
+        Ok(all_owners)
+    }
+
+    async fn resolve_owner_chunk(&self, pks: &[Pubkey]) -> Result<Vec<Option<String>>> {
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_multiple_accounts(pks).await {
+                Ok(accounts) => {
+                    self.record_result(idx, true);
+                    return Ok(accounts
+                        .into_iter()
+                        .map(|opt| {
+                            let acc = opt?;
+                            if acc.data.len() < 64 {
+                                return None;
+                            }
+                            // SPL token account layout: mint[32] | owner[32] | ...
+                            let bytes: [u8; 32] = acc.data[32..64].try_into().ok()?;
+                            Some(Pubkey::new_from_array(bytes).to_string())
+                        })
+                        .collect());
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Return the net SPL token balance changes for a transaction — one entry
+    /// per (owner, mint) pair that had a pre/post delta. Used by `whale_trace`
+    /// and `sniper_cohort` to attribute buys vs sells from raw chain data
+    /// without needing an enhanced-API wrapper.
+    pub async fn get_tx_balance_changes(&self, signature: &str) -> Result<Vec<TokenBalanceChange>> {
+        let sig = Signature::from_str(signature).context("invalid signature")?;
+        let cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_transaction_with_config(&sig, cfg).await {
+                Ok(tx) => {
+                    self.record_result(idx, true);
+                    let Some(meta) = tx.transaction.meta else {
+                        return Ok(Vec::new());
+                    };
+                    let pre = match meta.pre_token_balances {
+                        OptionSerializer::Some(v) => v,
+                        _ => Vec::new(),
+                    };
+                    let post = match meta.post_token_balances {
+                        OptionSerializer::Some(v) => v,
+                        _ => Vec::new(),
+                    };
+                    // Key balances by (owner, mint) so we can diff post vs pre.
+                    let mut map: std::collections::HashMap<(String, String), (f64, f64)> =
+                        std::collections::HashMap::new();
+                    for b in &pre {
+                        let owner = match &b.owner {
+                            OptionSerializer::Some(o) => o.clone(),
+                            _ => continue,
+                        };
+                        let ui = b.ui_token_amount.ui_amount.unwrap_or(0.0);
+                        map.entry((owner, b.mint.clone()))
+                            .and_modify(|v| v.0 = ui)
+                            .or_insert((ui, 0.0));
+                    }
+                    for b in &post {
+                        let owner = match &b.owner {
+                            OptionSerializer::Some(o) => o.clone(),
+                            _ => continue,
+                        };
+                        let ui = b.ui_token_amount.ui_amount.unwrap_or(0.0);
+                        map.entry((owner, b.mint.clone()))
+                            .and_modify(|v| v.1 = ui)
+                            .or_insert((0.0, ui));
+                    }
+                    let mut out = Vec::new();
+                    for ((owner, mint), (pre_ui, post_ui)) in map {
+                        let delta = post_ui - pre_ui;
+                        if delta.abs() < f64::EPSILON {
+                            continue;
+                        }
+                        out.push(TokenBalanceChange {
+                            owner,
+                            mint,
+                            pre_ui_amount: pre_ui,
+                            post_ui_amount: post_ui,
+                            delta_ui: delta,
+                        });
+                    }
+                    return Ok(out);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Combined wallet-centric summary of a transaction — both the native
+    /// SOL delta for the owner's account AND every SPL token delta touching
+    /// that owner. Used by the publisher to derive trade cost basis from
+    /// chain data (SOL out + token in = buy; the inverse = sell).
+    pub async fn get_tx_wallet_summary(
+        &self,
+        signature: &str,
+        owner: &str,
+    ) -> Result<WalletTxSummary> {
+        let sig = Signature::from_str(signature).context("invalid signature")?;
+        let cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_transaction_with_config(&sig, cfg).await {
+                Ok(tx) => {
+                    self.record_result(idx, true);
+
+                    // Account keys are needed to map owner → index for the
+                    // native SOL balance vectors. Raw (UiMessage::Raw)
+                    // carries them as strings; Parsed wraps them.
+                    let account_keys: Vec<String> = match &tx.transaction.transaction {
+                        solana_transaction_status::EncodedTransaction::Json(ui_tx) => {
+                            match &ui_tx.message {
+                                solana_transaction_status::UiMessage::Raw(raw) => {
+                                    raw.account_keys.clone()
+                                }
+                                solana_transaction_status::UiMessage::Parsed(p) => {
+                                    p.account_keys.iter().map(|a| a.pubkey.clone()).collect()
+                                }
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    let Some(meta) = tx.transaction.meta else {
+                        return Ok(WalletTxSummary::default());
+                    };
+
+                    let owner_idx = account_keys.iter().position(|k| k == owner);
+                    let sol_delta_ui = match owner_idx {
+                        Some(i) => {
+                            let pre = meta.pre_balances.get(i).copied().unwrap_or(0) as i64;
+                            let post = meta.post_balances.get(i).copied().unwrap_or(0) as i64;
+                            (post - pre) as f64 / 1e9
+                        }
+                        None => 0.0,
+                    };
+
+                    // Token deltas, filtered to our owner.
+                    let pre_tok = match meta.pre_token_balances {
+                        OptionSerializer::Some(v) => v,
+                        _ => Vec::new(),
+                    };
+                    let post_tok = match meta.post_token_balances {
+                        OptionSerializer::Some(v) => v,
+                        _ => Vec::new(),
+                    };
+                    let mut map: std::collections::HashMap<String, (f64, f64)> =
+                        std::collections::HashMap::new();
+                    for b in &pre_tok {
+                        let o = match &b.owner {
+                            OptionSerializer::Some(o) => o.as_str(),
+                            _ => continue,
+                        };
+                        if o != owner {
+                            continue;
+                        }
+                        let ui = b.ui_token_amount.ui_amount.unwrap_or(0.0);
+                        map.entry(b.mint.clone())
+                            .and_modify(|v| v.0 = ui)
+                            .or_insert((ui, 0.0));
+                    }
+                    for b in &post_tok {
+                        let o = match &b.owner {
+                            OptionSerializer::Some(o) => o.as_str(),
+                            _ => continue,
+                        };
+                        if o != owner {
+                            continue;
+                        }
+                        let ui = b.ui_token_amount.ui_amount.unwrap_or(0.0);
+                        map.entry(b.mint.clone())
+                            .and_modify(|v| v.1 = ui)
+                            .or_insert((0.0, ui));
+                    }
+                    let mut token_deltas = Vec::new();
+                    for (mint, (pre_ui, post_ui)) in map {
+                        let delta = post_ui - pre_ui;
+                        if delta.abs() < f64::EPSILON {
+                            continue;
+                        }
+                        token_deltas.push((mint, delta));
+                    }
+                    return Ok(WalletTxSummary {
+                        sol_delta_ui,
+                        token_deltas,
+                    });
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
+    }
+
+    /// Return the unique SPL mint addresses referenced by a transaction's
+    /// token balance changes. Used by discovery to extract tokens involved
+    /// in a program's recent activity without needing a provider-specific
+    /// enhanced API — works against any standard Solana RPC.
+    pub async fn get_transaction_mints(&self, signature: &str) -> Result<Vec<String>> {
+        let sig = Signature::from_str(signature).context("invalid signature")?;
+        let cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let attempts = self.endpoints.len();
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for _ in 0..attempts {
+            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+            match client.get_transaction_with_config(&sig, cfg).await {
+                Ok(tx) => {
+                    self.record_result(idx, true);
+                    let mut mints: Vec<String> = Vec::new();
+                    if let Some(meta) = tx.transaction.meta {
+                        if let OptionSerializer::Some(balances) = meta.post_token_balances {
+                            for b in balances {
+                                if !mints.contains(&b.mint) {
+                                    mints.push(b.mint);
+                                }
+                            }
+                        }
+                        if let OptionSerializer::Some(balances) = meta.pre_token_balances {
+                            for b in balances {
+                                if !mints.contains(&b.mint) {
+                                    mints.push(b.mint);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(mints);
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.record_failure(idx, &err);
+                    tracing::debug!(
+                        "getTransaction failed on endpoint {}: {}",
+                        mask_url(&self.endpoints[idx].url),
+                        err
+                    );
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 }
 
@@ -335,6 +807,27 @@ pub struct TokenSupplyInfo {
     pub amount: u64,
     pub decimals: u8,
     pub ui_amount: f64,
+}
+
+/// Wallet-centric view of a single transaction — the native SOL delta for
+/// the queried owner plus every SPL token delta touching that owner. Used
+/// by the publisher to derive trade cost basis (SOL out + token in = buy).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WalletTxSummary {
+    pub sol_delta_ui: f64,
+    pub token_deltas: Vec<(String, f64)>,
+}
+
+/// A single (owner, mint) balance delta inside a transaction — the raw
+/// primitive that lets `whale_trace` attribute net buys vs net sells from
+/// chain data alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenBalanceChange {
+    pub owner: String,
+    pub mint: String,
+    pub pre_ui_amount: f64,
+    pub post_ui_amount: f64,
+    pub delta_ui: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,7 +855,63 @@ pub struct MintInfo {
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,
     pub is_token_2022: bool,
+    /// Token-2022 extensions discovered on the mint — empty for classic SPL.
+    /// Critical ones are surfaced on dedicated fields below; this list keeps
+    /// everything for display/debugging.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// PermanentDelegate authority — can move/burn ANY account's tokens. Veto.
+    #[serde(default)]
+    pub permanent_delegate: Option<String>,
+    /// TransferHook program — runs custom code on every transfer. Flag.
+    #[serde(default)]
+    pub transfer_hook_program: Option<String>,
+    /// TransferFeeConfig — skims on every transfer. Flag with basis points.
+    #[serde(default)]
+    pub transfer_fee_bps: Option<u16>,
+    /// Mints that freeze new accounts by default are honeypots.
+    #[serde(default)]
+    pub default_frozen: bool,
+    #[serde(default)]
+    pub non_transferable: bool,
 }
+
+// Token-2022 extension type IDs (stable from spl-token-2022)
+const EXT_UNINITIALIZED: u16 = 0;
+const EXT_TRANSFER_FEE_CONFIG: u16 = 1;
+const EXT_MINT_CLOSE_AUTHORITY: u16 = 3;
+const EXT_DEFAULT_ACCOUNT_STATE: u16 = 6;
+const EXT_NON_TRANSFERABLE: u16 = 9;
+const EXT_INTEREST_BEARING: u16 = 10;
+const EXT_PERMANENT_DELEGATE: u16 = 12;
+const EXT_TRANSFER_HOOK: u16 = 14;
+const EXT_METADATA_POINTER: u16 = 18;
+const EXT_TOKEN_METADATA: u16 = 19;
+const EXT_GROUP_POINTER: u16 = 20;
+
+fn ext_name(id: u16) -> &'static str {
+    match id {
+        EXT_TRANSFER_FEE_CONFIG => "TransferFeeConfig",
+        EXT_MINT_CLOSE_AUTHORITY => "MintCloseAuthority",
+        EXT_DEFAULT_ACCOUNT_STATE => "DefaultAccountState",
+        EXT_NON_TRANSFERABLE => "NonTransferable",
+        EXT_INTEREST_BEARING => "InterestBearingConfig",
+        EXT_PERMANENT_DELEGATE => "PermanentDelegate",
+        EXT_TRANSFER_HOOK => "TransferHook",
+        EXT_METADATA_POINTER => "MetadataPointer",
+        EXT_TOKEN_METADATA => "TokenMetadata",
+        EXT_GROUP_POINTER => "GroupPointer",
+        _ => "Unknown",
+    }
+}
+
+/// Token-2022 mint account layout:
+/// bytes 0..82   — base mint data (same as SPL)
+/// bytes 82..165 — padding to the account-data-length boundary
+/// byte 165      — AccountType discriminator (1 = Mint)
+/// bytes 166..   — TLV extensions (type u16 LE, length u16 LE, data)
+const T22_ACCOUNT_TYPE_OFFSET: usize = 165;
+const T22_EXTENSIONS_OFFSET: usize = 166;
 
 /// Parse a Solana SPL Token mint account from raw bytes
 pub fn parse_mint_account(address: &str, data: &[u8], owner: &Pubkey) -> Option<MintInfo> {
@@ -408,14 +957,86 @@ pub fn parse_mint_account(address: &str, data: &[u8], owner: &Pubkey) -> Option<
         None
     };
 
-    Some(MintInfo {
+    let mut info = MintInfo {
         address: address.to_string(),
         supply,
         decimals,
         mint_authority,
         freeze_authority,
         is_token_2022,
-    })
+        extensions: Vec::new(),
+        permanent_delegate: None,
+        transfer_hook_program: None,
+        transfer_fee_bps: None,
+        default_frozen: false,
+        non_transferable: false,
+    };
+
+    if is_token_2022 && data.len() > T22_EXTENSIONS_OFFSET {
+        let account_type = data[T22_ACCOUNT_TYPE_OFFSET];
+        // AccountType 1 = Mint
+        if account_type == 1 {
+            let mut cursor = T22_EXTENSIONS_OFFSET;
+            while cursor + 4 <= data.len() {
+                let ext_type = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
+                let ext_len = u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]) as usize;
+                cursor += 4;
+                if ext_type == EXT_UNINITIALIZED {
+                    break;
+                }
+                if cursor + ext_len > data.len() {
+                    break;
+                }
+                let slice = &data[cursor..cursor + ext_len];
+                info.extensions.push(ext_name(ext_type).to_string());
+                match ext_type {
+                    EXT_PERMANENT_DELEGATE => {
+                        if slice.len() == 32 {
+                            if let Ok(pk) = Pubkey::try_from(slice) {
+                                info.permanent_delegate = Some(pk.to_string());
+                            }
+                        }
+                    }
+                    EXT_TRANSFER_HOOK => {
+                        // layout: authority (32) + program_id (32)
+                        if slice.len() >= 64 {
+                            if let Ok(pk) = Pubkey::try_from(&slice[32..64]) {
+                                // All-zero pubkey means hook disabled
+                                let all_zero = slice[32..64].iter().all(|b| *b == 0);
+                                if !all_zero {
+                                    info.transfer_hook_program = Some(pk.to_string());
+                                }
+                            }
+                        }
+                    }
+                    EXT_TRANSFER_FEE_CONFIG => {
+                        // TransferFeeConfig layout includes current fee basis_points at offset:
+                        //   transfer_fee_config_authority (32) + withdraw_authority (32) +
+                        //   withheld_amount (8) + older_fee (TransferFee = 24 bytes) +
+                        //   newer_fee (TransferFee). TransferFee = { epoch(8), maximum_fee(8), basis_points(2) }.
+                        // We read the newer_fee basis_points if buffer is big enough.
+                        if slice.len() >= 108 {
+                            let bps = u16::from_le_bytes([slice[106], slice[107]]);
+                            info.transfer_fee_bps = Some(bps);
+                        }
+                    }
+                    EXT_DEFAULT_ACCOUNT_STATE => {
+                        // 1 byte: 0 = Uninitialized, 1 = Initialized, 2 = Frozen
+                        if !slice.is_empty() && slice[0] == 2 {
+                            info.default_frozen = true;
+                        }
+                    }
+                    EXT_NON_TRANSFERABLE => {
+                        info.non_transferable = true;
+                    }
+                    _ => {}
+                }
+                cursor += ext_len;
+            }
+        }
+    }
+
+    Some(info)
 }
 
 /// Mask API keys in URLs for safe logging
@@ -447,22 +1068,29 @@ fn mask_url(url: &str) -> String {
     }
 }
 
+fn is_rate_limited(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    error.contains("429") || lowered.contains("too many requests") || lowered.contains("rate limit")
+}
+
 /// Resolve endpoint URLs, substituting environment variables
 /// Supports ${VAR_NAME} syntax in endpoint strings
 pub fn resolve_endpoints(endpoints: &[String]) -> Vec<String> {
-    endpoints
-        .iter()
-        .map(|ep| resolve_env_vars(ep))
-        .collect()
+    endpoints.iter().map(|ep| resolve_env_vars(ep)).collect()
 }
 
-fn resolve_env_vars(s: &str) -> String {
+pub fn resolve_env_vars(s: &str) -> String {
     let mut result = s.to_string();
     while let Some(start) = result.find("${") {
         if let Some(end) = result[start..].find('}') {
             let var_name = &result[start + 2..start + end];
             let value = std::env::var(var_name).unwrap_or_default();
-            result = format!("{}{}{}", &result[..start], value, &result[start + end + 1..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                value,
+                &result[start + end + 1..]
+            );
         } else {
             break;
         }

@@ -1,0 +1,563 @@
+use crate::metadata::TokenMeta;
+use crate::signals::{SignalLayer, TokenAnalysis};
+
+#[derive(Debug, Clone, Copy)]
+pub enum Template {
+    Monster,
+    Winner,
+    Ops,
+    Inspect,
+}
+
+impl Template {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "monster" => Some(Self::Monster),
+            "winner" => Some(Self::Winner),
+            "ops" => Some(Self::Ops),
+            "inspect" | "inspect_full" => Some(Self::Inspect),
+            _ => None,
+        }
+    }
+}
+
+pub fn render(analysis: &TokenAnalysis, meta: Option<&TokenMeta>, template: Template) -> String {
+    match template {
+        Template::Monster => render_monster(analysis, meta),
+        Template::Winner => render_winner(analysis, meta),
+        Template::Ops => render_ops_card(analysis, meta),
+        Template::Inspect => render_inspect_full(analysis, meta),
+    }
+}
+
+// -- helpers ------------------------------------------------------------------
+
+fn short_addr(addr: &str) -> String {
+    if addr.len() > 14 {
+        format!("{}…{}", &addr[..6], &addr[addr.len() - 5..])
+    } else {
+        addr.to_string()
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn find_detail<'a>(a: &'a TokenAnalysis, kind: &str) -> Option<&'a str> {
+    a.scores
+        .iter()
+        .find(|s| s.signal_type == kind)
+        .map(|s| s.details.as_str())
+}
+
+fn arrow(delta: i32) -> &'static str {
+    if delta > 3 {
+        "▲"
+    } else if delta < -3 {
+        "▼"
+    } else {
+        "─"
+    }
+}
+
+fn pct_arrow(pct: f64) -> &'static str {
+    if pct > 1.0 {
+        "▲"
+    } else if pct < -1.0 {
+        "▼"
+    } else {
+        "─"
+    }
+}
+
+fn emoji_for(cls: &str) -> &'static str {
+    if cls.starts_with("UNSAFE") {
+        return "⛔";
+    }
+    match cls {
+        "STAIRCASE" => "📈",
+        "GRINDER" => "⛏️",
+        "SURGE" => "🚀",
+        "SPRING" => "🌀",
+        "ACTIVE_TRAP" => "🪤",
+        "CRASHING" => "💥",
+        "DEAD" => "☠️",
+        "DEVELOPING" => "🌱",
+        _ => "•",
+    }
+}
+
+/// Compact USD: $1.2k, $34.5k, $1.8M
+fn fmt_usd(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1_000_000_000.0 {
+        format!("${:.1}B", v / 1e9)
+    } else if a >= 1_000_000.0 {
+        format!("${:.1}M", v / 1e6)
+    } else if a >= 1_000.0 {
+        format!("${:.1}k", v / 1e3)
+    } else if a >= 1.0 {
+        format!("${:.0}", v)
+    } else if a >= 0.01 {
+        format!("${:.4}", v)
+    } else {
+        format!("${:.2e}", v)
+    }
+}
+
+fn fmt_pct(v: f64) -> String {
+    format!("{}{:.1}%", if v >= 0.0 { "+" } else { "" }, v)
+}
+
+fn momentum_dir(a: &TokenAnalysis) -> &'static str {
+    a.delta
+        .as_ref()
+        .map(|d| arrow(d.momentum_delta))
+        .unwrap_or("─")
+}
+
+/// Render the "why this fired" line — required per style guide (line 2 of every
+/// signal card must state which criteria triggered, with concrete numbers).
+pub fn why_line_for_signal(a: &TokenAnalysis, effective_conf: i32) -> String {
+    let dir = match a.delta.as_ref().map(|d| d.momentum_delta) {
+        Some(d) if d > 3 => "rising",
+        Some(d) if d < -3 => "falling",
+        Some(_) => "neutral",
+        None => "first-seen",
+    };
+    format!(
+        "<i>Triggered by: {cls} · conf {conf} · top {top:.2}% · momentum {dir}</i>",
+        cls = a.confidence.classification,
+        conf = effective_conf,
+        top = a.top_holder_pct,
+        dir = dir,
+    )
+}
+
+pub fn why_line_for_fail(a: &TokenAnalysis, effective_conf: i32, prev_class: &str) -> String {
+    let cls_part = if prev_class != a.confidence.classification {
+        format!("{} → {}", prev_class, a.confidence.classification)
+    } else {
+        format!(
+            "{} · conf dropped to {}",
+            a.confidence.classification, effective_conf
+        )
+    };
+    let top_part = if a.top_holder_pct >= 20.0 {
+        format!(" · top jumped to {:.2}%", a.top_holder_pct)
+    } else {
+        String::new()
+    };
+    format!("<i>Triggered by: {}{}</i>", cls_part, top_part)
+}
+
+/// Render the compact body of a token card — metrics only, no header, no
+/// timeline, no links. Notifier composes the header/timeline/keyboard around
+/// this per the style guide.
+///
+/// Precision note: top_holder percentages use 2 decimals because thresholds
+/// like the 20% signal gate are decided at that precision — rounding to 1 dp
+/// can hide near-misses.
+pub fn render_card_body(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let c = &a.confidence;
+    let mut lines = Vec::new();
+
+    if let Some(p) = price_line(meta) {
+        lines.push(p);
+    }
+    if let Some(m) = market_line(meta) {
+        lines.push(m);
+    }
+    lines.push(format!(
+        "<b>top</b> {top:.2}% / {t5:.2}% / {t10:.2}% · <b>holders</b> {h}",
+        top = a.top_holder_pct,
+        t5 = a.top5_pct,
+        t10 = a.top10_pct,
+        h = a.holder_count,
+    ));
+    lines.push(format!(
+        "<b>mom</b> {m}{dir} · <b>dist</b> {d} · <b>spring</b> {s} · <b>tpm</b> {tx:.1}",
+        m = c.momentum,
+        dir = momentum_dir(a),
+        d = c.distribution,
+        s = c.spring,
+        tx = a.tx_rate,
+    ));
+    // Confidence breakdown — expose the formula that produced the total.
+    if c.top_holder_bonus_pct > 0 {
+        lines.push(format!(
+            "<b>conf</b> {t} = base {b} · +{bp}% dist bonus",
+            t = c.total,
+            b = c.base_total,
+            bp = c.top_holder_bonus_pct,
+        ));
+    } else {
+        lines.push(format!("<b>conf</b> {t}", t = c.total));
+    }
+    if let Some(warn) = token_2022_summary(a) {
+        lines.push(warn);
+    }
+    lines.join("\n")
+}
+
+fn ticker_line(meta: Option<&TokenMeta>) -> Option<String> {
+    let m = meta?;
+    let name = esc(&m.name);
+    let sym = esc(&m.symbol);
+    Some(format!("<b>${}</b> {}", sym, name))
+}
+
+/// Market line: mcap · liq · 24h vol · age. Only rendered when any piece present.
+fn market_line(meta: Option<&TokenMeta>) -> Option<String> {
+    let m = meta?;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(mc) = m.market_cap_usd.or(m.fdv_usd) {
+        parts.push(format!("mc {}", fmt_usd(mc)));
+    }
+    if let Some(l) = m.liquidity_usd {
+        parts.push(format!("liq {}", fmt_usd(l)));
+    }
+    if let Some(v) = m.volume_24h_usd {
+        parts.push(format!("24h {}", fmt_usd(v)));
+    }
+    if let Some(age) = m.age_human() {
+        parts.push(format!("age {}", age));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+/// Price change snapshot: 5m/1h/24h with arrows
+fn price_line(meta: Option<&TokenMeta>) -> Option<String> {
+    let m = meta?;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = m.price_usd {
+        parts.push(format!("px {}", fmt_usd(p)));
+    }
+    if let Some(c) = m.price_change_5m {
+        parts.push(format!("5m {}{}", pct_arrow(c), fmt_pct(c)));
+    }
+    if let Some(c) = m.price_change_1h {
+        parts.push(format!("1h {}{}", pct_arrow(c), fmt_pct(c)));
+    }
+    if let Some(c) = m.price_change_24h {
+        parts.push(format!("24h {}{}", pct_arrow(c), fmt_pct(c)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn links_line(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let pair_url = meta
+        .and_then(|m| m.pair_url.clone())
+        .unwrap_or_else(|| format!("https://dexscreener.com/solana/{}", a.address));
+    format!(
+        "<a href=\"{p}\">chart</a> · <a href=\"https://solscan.io/token/{a}\">solscan</a> · <a href=\"https://photon-sol.tinyastro.io/en/lp/{a}\">photon</a>",
+        p = pair_url,
+        a = a.address,
+    )
+}
+
+// -- templates ----------------------------------------------------------------
+
+pub fn render_monster(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let c = &a.confidence;
+    let header = match ticker_line(meta) {
+        Some(t) => format!(
+            "{emoji} <b>{cls}</b> {conf} · {t}",
+            emoji = emoji_for(&c.classification),
+            cls = c.classification,
+            conf = c.total,
+            t = t
+        ),
+        None => format!(
+            "{emoji} <b>{cls}</b> {conf}",
+            emoji = emoji_for(&c.classification),
+            cls = c.classification,
+            conf = c.total,
+        ),
+    };
+    let mut lines = vec![header];
+    // Structure line: top / tx rate / mom / dist
+    lines.push(format!(
+        "top {top:.1}% · {tx:.0} tpm · {mom}{dir}/{dist}",
+        top = a.top_holder_pct,
+        tx = a.tx_rate,
+        mom = c.momentum,
+        dir = momentum_dir(a),
+        dist = c.distribution,
+    ));
+    if let Some(ml) = market_line(meta) {
+        lines.push(ml);
+    }
+    lines.push(format!("<code>{}</code>", a.address));
+    lines.push(links_line(a, meta));
+    lines.join("\n")
+}
+
+pub fn render_winner(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let c = &a.confidence;
+    let mut lines: Vec<String> = Vec::new();
+
+    // Header
+    let ticker = ticker_line(meta).unwrap_or_else(|| "<b>—</b>".to_string());
+    lines.push(format!(
+        "🏆 <b>WINNER</b> {} · {} {} {}",
+        c.classification,
+        c.total,
+        momentum_dir(a),
+        ticker
+    ));
+
+    // Market data
+    if let Some(p) = price_line(meta) {
+        lines.push(p);
+    }
+    if let Some(m) = market_line(meta) {
+        lines.push(m);
+    }
+
+    // Structure
+    lines.push(format!(
+        "mom {m}/{d}/{s} · top {t:.1}%/{t5:.1}%/{t10:.1}% · {h} holders · {tx:.0} tpm",
+        m = c.momentum,
+        d = c.distribution,
+        s = c.spring,
+        t = a.top_holder_pct,
+        t5 = a.top5_pct,
+        t10 = a.top10_pct,
+        h = a.holder_count,
+        tx = a.tx_rate,
+    ));
+
+    // Delta + transition
+    if let Some(d) = &a.delta {
+        let parts = [
+            format!("Δmom {:+}", d.momentum_delta),
+            format!("Δtop {:+.1}%", d.top_holder_delta),
+            d.concentration_direction.clone(),
+        ]
+        .join(" · ");
+        if d.classification_changed {
+            lines.push(format!(
+                "{} → <b>{}</b> · {}",
+                d.previous.classification, c.classification, parts
+            ));
+        } else {
+            lines.push(parts);
+        }
+    }
+
+    // Critical signal snippets
+    let recency = esc(find_detail(a, "recency").unwrap_or(""));
+    let success = esc(find_detail(a, "tx_success_rate").unwrap_or(""));
+    let exit = find_detail(a, "velocity_exit_warning").map(|s| esc(s));
+    let congestion = find_detail(a, "demand_congestion").map(|s| esc(s));
+    let mut flags: Vec<String> = Vec::new();
+    if !recency.is_empty() {
+        flags.push(recency);
+    }
+    if !success.is_empty() {
+        flags.push(success);
+    }
+    if let Some(c) = congestion {
+        flags.push(format!("🔥 {}", c));
+    }
+    if let Some(e) = exit {
+        flags.push(format!("⚠️ {}", e));
+    }
+    if !flags.is_empty() {
+        lines.push(flags.join(" · "));
+    }
+
+    if let Some(warn) = token_2022_summary(a) {
+        lines.push(warn);
+    }
+
+    lines.push(format!("<code>{}</code>", a.address));
+    lines.push(links_line(a, meta));
+    lines.join("\n")
+}
+
+/// Summarize Token-2022 extension posture from the safety signal scores.
+/// Returns an explicit line for risky extensions, a reassuring line for benign
+/// ones, or None for classic SPL.
+fn token_2022_summary(a: &TokenAnalysis) -> Option<String> {
+    if !a.is_token_2022 {
+        return None;
+    }
+    // Hard vetoes
+    for v in ["permanent_delegate", "default_frozen", "non_transferable"] {
+        if let Some(s) = a.scores.iter().find(|s| s.signal_type == v && s.score == 0) {
+            return Some(format!("⛔ <b>VETO</b> — {}", esc(&s.details)));
+        }
+    }
+    // Flags
+    let hook = a.scores.iter().find(|s| s.signal_type == "transfer_hook");
+    let fee = a.scores.iter().find(|s| s.signal_type == "transfer_fee");
+    match (hook, fee) {
+        (Some(h), Some(f)) => Some(format!("⚠️ {} · {}", esc(&h.details), esc(&f.details))),
+        (Some(h), None) => Some(format!("⚠️ {}", esc(&h.details))),
+        (None, Some(f)) => Some(format!("⚠️ {}", esc(&f.details))),
+        (None, None) => {
+            // Check for benign-cleared Token-2022
+            if a.scores
+                .iter()
+                .any(|s| s.signal_type == "token_2022_extensions")
+            {
+                Some("✓ Token-2022 extensions benign".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn render_ops_card(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let c = &a.confidence;
+    let sym = meta
+        .map(|m| format!(" ${}", esc(&m.symbol)))
+        .unwrap_or_default();
+    let mc = meta
+        .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+        .map(|v| format!(" · {}", fmt_usd(v)))
+        .unwrap_or_default();
+    format!(
+        "{e} <code>{addr}</code>{sym} <b>{cls}</b> {conf} {dir}{mc}",
+        e = emoji_for(&c.classification),
+        addr = short_addr(&a.address),
+        sym = sym,
+        cls = c.classification,
+        conf = c.total,
+        dir = momentum_dir(a),
+        mc = mc,
+    )
+}
+
+pub fn render_inspect_full(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
+    let c = &a.confidence;
+    let dir = momentum_dir(a);
+    let mut lines: Vec<String> = Vec::new();
+
+    // Header
+    let ticker = ticker_line(meta).unwrap_or_else(|| "<i>no metadata</i>".to_string());
+    lines.push(format!(
+        "🔬 <b>{}</b> {} {} · {}",
+        c.classification, c.total, dir, ticker
+    ));
+
+    // Market
+    if let Some(p) = price_line(meta) {
+        lines.push(p);
+    }
+    if let Some(m) = market_line(meta) {
+        lines.push(m);
+    }
+
+    // Structure
+    lines.push(format!(
+        "mom {m}/{d}/{s} (total {t})",
+        m = c.momentum,
+        d = c.distribution,
+        s = c.spring,
+        t = c.total
+    ));
+    lines.push(format!(
+        "{h} holders · top {top:.1}% · top5 {t5:.1}% · top10 {t10:.1}%",
+        h = a.holder_count,
+        top = a.top_holder_pct,
+        t5 = a.top5_pct,
+        t10 = a.top10_pct
+    ));
+    lines.push(format!(
+        "{tx:.1} tpm · velocity {v:.2}x",
+        tx = a.tx_rate,
+        v = a.velocity
+    ));
+
+    if let Some(warn) = token_2022_summary(a) {
+        lines.push(warn);
+    }
+
+    // Signal table
+    lines.push(String::new()); // blank line
+    lines.push("<b>signals</b>".to_string());
+    let mut signal_rows: Vec<(i32, String)> = a
+        .scores
+        .iter()
+        .filter(|s| s.layer != SignalLayer::Safety)
+        .map(|s| {
+            (
+                s.score,
+                format!(
+                    "  {:3} {} — <i>{}</i>",
+                    s.score,
+                    esc(&s.signal_type),
+                    esc(&s.details)
+                ),
+            )
+        })
+        .collect();
+    signal_rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, row) in signal_rows {
+        lines.push(row);
+    }
+
+    lines.push(String::new());
+    lines.push("<b>safety</b>".to_string());
+    let mut safety_rows: Vec<(i32, String)> = a
+        .scores
+        .iter()
+        .filter(|s| s.layer == SignalLayer::Safety)
+        .map(|s| {
+            (
+                s.score,
+                format!(
+                    "  {:3} {} — <i>{}</i>",
+                    s.score,
+                    esc(&s.signal_type),
+                    esc(&s.details)
+                ),
+            )
+        })
+        .collect();
+    safety_rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, row) in safety_rows {
+        lines.push(row);
+    }
+
+    // Delta
+    if let Some(d) = &a.delta {
+        let elapsed = if d.time_elapsed_seconds < 60 {
+            format!("{}s", d.time_elapsed_seconds)
+        } else if d.time_elapsed_seconds < 3600 {
+            format!("{}m", d.time_elapsed_seconds / 60)
+        } else {
+            format!("{:.1}h", d.time_elapsed_seconds as f64 / 3600.0)
+        };
+        let changed = if d.classification_changed {
+            format!(" · {} → {}", d.previous.classification, c.classification)
+        } else {
+            String::new()
+        };
+        lines.push(String::new());
+        lines.push(format!(
+            "<b>Δ</b> ({} ago{}) · mom {:+} {} · top {:+.1}% · {}",
+            elapsed, changed, d.momentum_delta, dir, d.top_holder_delta, d.concentration_direction
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(format!("<code>{}</code>", a.address));
+    lines.push(links_line(a, meta));
+    lines.join("\n")
+}

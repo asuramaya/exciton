@@ -2,133 +2,81 @@ use crate::db::Db;
 use crate::ingester::RpcRouter;
 use crate::signals::{self, TokenAnalysis};
 use anyhow::Result;
-use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMPSWAP_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+// Don't re-analyze a graduating token more than once per 10 minutes.
+const GRADUATION_COOLDOWN_SECS: i64 = 10 * 60;
 
-/// Response from Helius enhanced transaction API
-#[derive(Debug, Deserialize)]
-struct HeliusTx {
-    #[serde(default)]
-    description: String,
-    #[serde(rename = "type", default)]
-    tx_type: String,
-    #[serde(default)]
-    source: String,
-    #[serde(default)]
-    signature: String,
-    #[serde(default)]
-    timestamp: i64,
-    #[serde(rename = "tokenTransfers", default)]
-    token_transfers: Vec<HeliusTokenTransfer>,
-}
+// Signatures pulled per discovery cycle, and cap on per-cycle full-tx fetches.
+// Each full-tx fetch is one extra RPC call; the cap controls spend while still
+// giving us enough fresh mints per cycle to keep the watchlist moving.
+const SIG_BATCH: usize = 40;
+const MAX_TX_FETCHES: usize = 12;
 
-#[derive(Debug, Deserialize)]
-struct HeliusTokenTransfer {
-    #[serde(default)]
-    mint: String,
-    #[serde(rename = "tokenAmount", default)]
-    token_amount: f64,
-}
-
-/// Discover new tokens from Pump.fun activity via Helius enhanced API
+/// Discover new tokens by walking recent Pump.fun program signatures via the
+/// RPC router. Provider-agnostic — works against any standard Solana RPC
+/// (Alchemy, QuickNode, Helius) because it only uses `getSignaturesForAddress`
+/// and `getTransaction`.
 pub async fn discover_new_tokens(
-    helius_endpoint: &str,
     db: &Arc<Db>,
     rpc: &Arc<RpcRouter>,
     limit: usize,
 ) -> Result<Vec<TokenAnalysis>> {
-    // Extract API key from the RPC endpoint URL
-    let api_key = extract_api_key(helius_endpoint)
-        .ok_or_else(|| anyhow::anyhow!("Could not extract Helius API key from endpoint URL"))?;
+    let signatures = rpc
+        .get_recent_signatures(PUMPFUN_PROGRAM, SIG_BATCH)
+        .await?;
 
-    // Fetch recent Pump.fun transactions
-    let url = format!(
-        "https://api.helius.xyz/v0/addresses/{}/transactions?api-key={}&limit=30",
-        PUMPFUN_PROGRAM, api_key
-    );
-
-    let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("Helius API returned status {}", resp.status());
-    }
-
-    let txs: Vec<HeliusTx> = resp.json().await?;
-
-    // Extract unique token mints (excluding SOL)
     let mut seen_mints: HashSet<String> = HashSet::new();
-    let mut new_mints: Vec<String> = Vec::new();
+    let mut fresh_mints: Vec<String> = Vec::new();
+    let mut tx_fetches = 0usize;
 
-    for tx in &txs {
-        for transfer in &tx.token_transfers {
-            if !transfer.mint.is_empty()
-                && transfer.mint != SOL_MINT
-                && !seen_mints.contains(&transfer.mint)
-            {
-                seen_mints.insert(transfer.mint.clone());
-                new_mints.push(transfer.mint.clone());
+    for sig in &signatures {
+        if fresh_mints.len() >= limit || tx_fetches >= MAX_TX_FETCHES {
+            break;
+        }
+        tx_fetches += 1;
+        let mints = match rpc.get_transaction_mints(&sig.signature).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("discovery: skip sig {}: {}", sig.signature, e);
+                continue;
+            }
+        };
+        for mint in mints {
+            if mint == SOL_MINT || seen_mints.contains(&mint) {
+                continue;
+            }
+            seen_mints.insert(mint.clone());
+            match db.get_token(&mint) {
+                Ok(Some(_)) => {}
+                _ => fresh_mints.push(mint),
+            }
+            if fresh_mints.len() >= limit {
+                break;
             }
         }
     }
 
     tracing::info!(
-        "Discovery: found {} unique tokens in {} Pump.fun transactions",
-        new_mints.len(),
-        txs.len()
+        "Discovery: walked {} sigs, {} tx, {} new mints",
+        signatures.len(),
+        tx_fetches,
+        fresh_mints.len()
     );
 
-    // Filter out tokens we've already analyzed recently
-    let fresh_mints: Vec<String> = new_mints
-        .into_iter()
-        .filter(|m| {
-            // Check if token is already in DB with a recent score
-            match db.get_token(m) {
-                Ok(Some(_)) => false, // Already analyzed
-                _ => true,            // New — analyze it
-            }
-        })
-        .take(limit)
-        .collect();
-
-    tracing::info!(
-        "Discovery: {} tokens are new, analyzing up to {}",
-        fresh_mints.len(),
-        limit
-    );
-
-    // Analyze each new token
     let mut analyses: Vec<TokenAnalysis> = Vec::new();
-
     for mint in &fresh_mints {
-        match signals::analyze_token(rpc, mint, Some(db)).await {
+        match signals::analyze_token(rpc, mint, Some(db), None).await {
             Ok(analysis) => {
-                // Store in DB
                 let _ = db.insert_token(&analysis.address, analysis.confidence.total);
                 let _ = db.audit_log(
                     "discovery",
                     "new_token",
-                    &format!(
-                        "{} confidence={} safety_avg={}",
-                        mint,
-                        analysis.confidence.total,
-                        analysis
-                            .scores
-                            .iter()
-                            .filter(|s| s.layer == signals::SignalLayer::Safety)
-                            .map(|s| s.score)
-                            .sum::<i32>()
-                            / analysis
-                                .scores
-                                .iter()
-                                .filter(|s| s.layer == signals::SignalLayer::Safety)
-                                .count()
-                                .max(1) as i32
-                    ),
+                    &format!("{} confidence={}", mint, analysis.confidence.total),
                 );
                 analyses.push(analysis);
             }
@@ -138,42 +86,80 @@ pub async fn discover_new_tokens(
         }
     }
 
-    // Sort by confidence, highest first
     analyses.sort_by(|a, b| b.confidence.total.cmp(&a.confidence.total));
-
     Ok(analyses)
 }
 
-/// Extract API key from a Helius endpoint URL
-fn extract_api_key(url: &str) -> Option<String> {
-    if let Some(idx) = url.find("api-key=") {
-        let rest = &url[idx + 8..];
-        let end = rest.find('&').unwrap_or(rest.len());
-        Some(rest[..end].to_string())
-    } else {
-        None
-    }
-}
+/// Walk recent PumpSwap AMM signatures to detect pump.fun graduations.
+/// When a mint we already know from pump.fun discovery appears in pumpswap
+/// transactions but isn't on the watchlist yet, it just graduated — re-analyze
+/// it immediately instead of waiting for Phase 4's 22-minute polling cycle.
+///
+/// Returns analyses for any graduated mints that are now worth tracking.
+/// The caller (scanner) applies should_track_on_watchlist() to decide.
+pub async fn check_graduated_tokens(
+    db: &Arc<Db>,
+    rpc: &Arc<RpcRouter>,
+    limit: usize,
+) -> Result<Vec<TokenAnalysis>> {
+    let signatures = rpc
+        .get_recent_signatures(PUMPSWAP_PROGRAM, 30)
+        .await?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let mut seen_mints: HashSet<String> = HashSet::new();
+    let mut graduated: Vec<String> = Vec::new();
+    let mut tx_fetches = 0usize;
 
-    #[test]
-    fn test_extract_api_key() {
-        let url = "https://mainnet.helius-rpc.com/?api-key=abc123";
-        assert_eq!(extract_api_key(url), Some("abc123".to_string()));
+    for sig in &signatures {
+        if graduated.len() >= limit || tx_fetches >= 8 {
+            break;
+        }
+        tx_fetches += 1;
+        let mints = match rpc.get_transaction_mints(&sig.signature).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("graduation: skip sig {}: {}", sig.signature, e);
+                continue;
+            }
+        };
+        for mint in mints {
+            if mint == SOL_MINT || seen_mints.contains(&mint) {
+                continue;
+            }
+            seen_mints.insert(mint.clone());
+            // Only re-analyze mints we've already seen on pump.fun that haven't
+            // made it to the watchlist yet, and aren't in cooldown.
+            match db.is_graduation_candidate(&mint, GRADUATION_COOLDOWN_SECS) {
+                Ok(true) => {
+                    graduated.push(mint);
+                }
+                _ => {}
+            }
+            if graduated.len() >= limit {
+                break;
+            }
+        }
     }
 
-    #[test]
-    fn test_extract_api_key_with_params() {
-        let url = "https://mainnet.helius-rpc.com/?api-key=abc123&other=val";
-        assert_eq!(extract_api_key(url), Some("abc123".to_string()));
+    if !graduated.is_empty() {
+        tracing::info!(
+            "graduation: {} known mints active on pumpswap, re-analyzing",
+            graduated.len()
+        );
     }
 
-    #[test]
-    fn test_extract_api_key_missing() {
-        let url = "https://api.mainnet-beta.solana.com";
-        assert_eq!(extract_api_key(url), None);
+    let mut analyses: Vec<TokenAnalysis> = Vec::new();
+    for mint in &graduated {
+        match signals::analyze_token(rpc, mint, Some(db), None).await {
+            Ok(analysis) => {
+                let _ = db.insert_token(&analysis.address, analysis.confidence.total);
+                analyses.push(analysis);
+            }
+            Err(e) => {
+                tracing::warn!("graduation: analyze_token {} failed: {}", mint, e);
+            }
+        }
     }
+
+    Ok(analyses)
 }

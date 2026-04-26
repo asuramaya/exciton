@@ -1,0 +1,41 @@
+[rpc]
+endpoints = [
+    "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}",
+    "https://side-thrilling-card.solana-mainnet.quiknode.pro/${QUICKNODE_API_KEY}/",
+    "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}",
+]
+
+[wallet]
+public_key = "${PHOTON_WALLET_PUBLIC_KEY}"
+
+[risk]
+max_position_pct = 15.0
+default_position_pct = 0.5
+high_confidence_threshold = 80
+slippage_bps = 100
+priority_fee_lamports = 10000
+
+[tracking]
+wallets = []
+max_active_tokens = 200
+
+[alerts]
+confidence_threshold = 70
+stale_feed_seconds = 30
+
+[telegram]
+enabled = true
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+signals_chat_id = "${TELEGRAM_SIGNALS_CHAT_ID}"
+ops_chat_id = "${TELEGRAM_OPS_CHAT_ID}"
+dm_enabled = true
+admin_user_ids = [5408654040]
+dm_rate_limit_per_minute = 30
+
+[madapes]
+enabled = true
+repo_path = "${MADAPES_REPO_PATH}"
+interval_seconds = 300
+sol_price_fallback_usd = 150.0
+recraft_api_key = "${RECRAFT_API_KEY}"
+image_interval_seconds = 900

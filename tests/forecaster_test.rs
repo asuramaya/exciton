@@ -33,7 +33,11 @@ fn test_spring_detection() {
     ];
     let spring_conf = forecaster.aggregate(&spring_scores);
     assert_eq!(spring_conf.classification, "SPRING");
-    assert!(spring_conf.spring > 50, "Spring score {} should be > 50", spring_conf.spring);
+    assert!(
+        spring_conf.spring > 50,
+        "Spring score {} should be > 50",
+        spring_conf.spring
+    );
 }
 
 #[test]
@@ -47,7 +51,12 @@ fn test_staircase_detection() {
         SignalScore::new(SignalLayer::Safety, "mint_authority", 90, "renounced"),
         SignalScore::new(SignalLayer::Microstructure, "tx_rate", 95, "very active"),
         SignalScore::new(SignalLayer::Microstructure, "velocity", 90, "accelerating"),
-        SignalScore::new(SignalLayer::OnChain, "history_depth", 70, "hours of trading"),
+        SignalScore::new(
+            SignalLayer::OnChain,
+            "history_depth",
+            70,
+            "hours of trading",
+        ),
     ];
     let conf = forecaster.aggregate(&staircase_scores);
     assert_eq!(conf.classification, "STAIRCASE");
@@ -62,7 +71,12 @@ fn test_surge_detection() {
         SignalScore::new(SignalLayer::Safety, "top_holder", 5, "99% concentrated"),
         SignalScore::new(SignalLayer::Safety, "holder_count", 20, "few holders"),
         SignalScore::new(SignalLayer::Microstructure, "tx_rate", 95, "explosive"),
-        SignalScore::new(SignalLayer::Microstructure, "velocity", 90, "5x acceleration"),
+        SignalScore::new(
+            SignalLayer::Microstructure,
+            "velocity",
+            90,
+            "5x acceleration",
+        ),
         SignalScore::new(SignalLayer::OnChain, "history_depth", 25, "just launched"),
     ];
     let conf = forecaster.aggregate(&surge_scores);
@@ -101,8 +115,20 @@ fn test_forecaster_position_sizing() {
 #[test]
 fn test_regime_classification() {
     let forecaster = Forecaster::new();
-    assert_eq!(forecaster.classify_regime(500.0, 50, 3.0), Regime::LaunchFrenzy);
-    assert_eq!(forecaster.classify_regime(10.0, 2, 1.1), Regime::LowActivityGrind);
-    assert_eq!(forecaster.classify_regime(200.0, 5, 0.3), Regime::DumpCascade);
-    assert_eq!(forecaster.classify_regime(80.0, 10, 1.8), Regime::WhaleAccumulation);
+    assert_eq!(
+        forecaster.classify_regime(500.0, 50, 3.0),
+        Regime::LaunchFrenzy
+    );
+    assert_eq!(
+        forecaster.classify_regime(10.0, 2, 1.1),
+        Regime::LowActivityGrind
+    );
+    assert_eq!(
+        forecaster.classify_regime(200.0, 5, 0.3),
+        Regime::DumpCascade
+    );
+    assert_eq!(
+        forecaster.classify_regime(80.0, 10, 1.8),
+        Regime::WhaleAccumulation
+    );
 }

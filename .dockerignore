@@ -1,0 +1,10 @@
+.git
+target
+photon.db
+photon.db-shm
+photon.db-wal
+.DS_Store
+.claude
+.playwright-mcp
+config.toml
+tmp

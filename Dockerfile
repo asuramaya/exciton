@@ -1,12 +1,35 @@
-FROM rust:1.82 AS builder
+FROM rust:1.88-bookworm AS chef
+RUN cargo install cargo-chef --version 0.1.77 --locked
 WORKDIR /app
+
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN cargo build --release
+COPY src ./src
+COPY examples ./examples
+COPY deploy ./deploy
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY examples ./examples
+COPY deploy ./deploy
+RUN cargo build --release --bin photon
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         openssh-client     && git config --global --add safe.directory /srv/MadApes.ai     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /data
+
 COPY --from=builder /app/target/release/photon /usr/local/bin/photon
-COPY config.example.toml /etc/photon/config.toml
-VOLUME ["/data"]
-ENTRYPOINT ["photon", "/etc/photon/config.toml"]
+COPY deploy/config.container.toml.example /etc/photon/config.toml
+
+ENV PHOTON_DB_PATH=/data/photon.db
+
+VOLUME ["/data", "/srv/MadApes.ai", "/root/.ssh"]
+
+ENTRYPOINT ["photon"]
+CMD ["/etc/photon/config.toml"]

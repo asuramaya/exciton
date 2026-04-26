@@ -24,7 +24,11 @@ impl SafetyChecker {
         scores.push(SignalScore::new(
             SignalLayer::Safety,
             "mint_authority",
-            if mint.mint_authority.is_some() { 10 } else { 90 },
+            if mint.mint_authority.is_some() {
+                10
+            } else {
+                90
+            },
             &mint_details,
         ));
 
@@ -44,17 +48,106 @@ impl SafetyChecker {
             },
         ));
 
-        // Token-2022
+        // Token-2022 program itself is not a risk — the extensions are.
+        // Score neutrally on the standard, then emit per-extension signals below.
         scores.push(SignalScore::new(
             SignalLayer::Safety,
             "token_standard",
-            if mint.is_token_2022 { 30 } else { 80 },
+            if mint.is_token_2022 { 60 } else { 80 },
             if mint.is_token_2022 {
-                "WARNING: Token-2022 program — check for Permanent Delegate and other extensions"
+                "Token-2022 program — extensions evaluated below"
             } else {
                 "Standard SPL Token program"
             },
         ));
+
+        if mint.is_token_2022 {
+            // Hard vetoes: PermanentDelegate, DefaultAccountState=Frozen, NonTransferable
+            if let Some(pd) = &mint.permanent_delegate {
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "permanent_delegate",
+                    0,
+                    &format!(
+                        "VETO: PermanentDelegate set ({}) — can move/burn any holder's tokens",
+                        pd
+                    ),
+                ));
+            }
+            if mint.default_frozen {
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "default_frozen",
+                    0,
+                    "VETO: DefaultAccountState=Frozen — new holders blocked from trading",
+                ));
+            }
+            if mint.non_transferable {
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "non_transferable",
+                    0,
+                    "VETO: NonTransferable mint — tokens cannot be transferred",
+                ));
+            }
+
+            // Flags: TransferHook, TransferFeeConfig
+            if let Some(hook) = &mint.transfer_hook_program {
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "transfer_hook",
+                    25,
+                    &format!(
+                        "WARNING: TransferHook program {} — custom code on every transfer",
+                        hook
+                    ),
+                ));
+            }
+            if let Some(bps) = mint.transfer_fee_bps {
+                let score = if bps >= 1000 {
+                    10
+                } else if bps >= 500 {
+                    30
+                } else if bps >= 100 {
+                    50
+                } else {
+                    70
+                };
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "transfer_fee",
+                    score,
+                    &format!(
+                        "Transfer fee {}.{}%  — {} bps skimmed on every move",
+                        bps / 100,
+                        bps % 100,
+                        bps
+                    ),
+                ));
+            }
+
+            // If no risky extensions found, celebrate
+            let has_risky = mint.permanent_delegate.is_some()
+                || mint.default_frozen
+                || mint.non_transferable
+                || mint.transfer_hook_program.is_some()
+                || mint.transfer_fee_bps.is_some();
+            if !has_risky {
+                scores.push(SignalScore::new(
+                    SignalLayer::Safety,
+                    "token_2022_extensions",
+                    80,
+                    &if mint.extensions.is_empty() {
+                        "Token-2022 with no extensions — equivalent to classic SPL".to_string()
+                    } else {
+                        format!(
+                            "Token-2022 extensions present but benign: {}",
+                            mint.extensions.join(", ")
+                        )
+                    },
+                ));
+            }
+        }
 
         scores
     }
@@ -125,10 +218,7 @@ impl SafetyChecker {
             SignalLayer::Safety,
             "top_holder",
             top1_score,
-            &format!(
-                "Top holder owns {:.1}% of supply",
-                top1_pct
-            ),
+            &format!("Top holder owns {:.1}% of supply", top1_pct),
         ));
 
         // Top 5 concentration score
@@ -146,21 +236,21 @@ impl SafetyChecker {
             SignalLayer::Safety,
             "top5_concentration",
             top5_score,
-            &format!(
-                "Top 5 holders own {:.1}% of supply",
-                top5_pct
-            ),
+            &format!("Top 5 holders own {:.1}% of supply", top5_pct),
         ));
 
         // Top 10 concentration
         scores.push(SignalScore::new(
             SignalLayer::Safety,
             "top10_concentration",
-            if top10_pct > 90.0 { 15 } else if top10_pct > 70.0 { 40 } else { 75 },
-            &format!(
-                "Top 10 holders own {:.1}% of supply",
-                top10_pct
-            ),
+            if top10_pct > 90.0 {
+                15
+            } else if top10_pct > 70.0 {
+                40
+            } else {
+                75
+            },
+            &format!("Top 10 holders own {:.1}% of supply", top10_pct),
         ));
 
         // Number of significant holders (holding > 0.1% of supply)

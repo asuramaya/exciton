@@ -22,7 +22,7 @@ struct TokenSignal {
 
 let DB_PATH: String = {
     FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Code/photon/photon.db").path
+        .appendingPathComponent("Code/MadApesAI/photon/photon.db").path
 }()
 
 // MARK: - DB

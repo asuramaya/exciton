@@ -3,7 +3,12 @@ use photon::signals::{Confidence, SignalLayer, SignalScore};
 
 #[test]
 fn test_signal_score_creation() {
-    let score = SignalScore::new(SignalLayer::Safety, "honeypot_clear", 90, "Sell simulation passed");
+    let score = SignalScore::new(
+        SignalLayer::Safety,
+        "honeypot_clear",
+        90,
+        "Sell simulation passed",
+    );
     assert_eq!(score.layer, SignalLayer::Safety);
     assert_eq!(score.score, 90);
 }

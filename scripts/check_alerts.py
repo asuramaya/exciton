@@ -52,8 +52,12 @@ def check_alerts():
         conn = sqlite3.connect(str(DB_PATH), timeout=1)
         conn.execute("PRAGMA journal_mode=wal")
 
+        # Only surface alerts that are still fresh. The notifier uses the same
+        # 30-minute horizon (STALE_SECS=1800 in src/notifier.rs). Older rows
+        # describe a world that no longer exists and must not pin the top-3.
         count = conn.execute(
-            "SELECT COUNT(*) FROM alerts WHERE acknowledged = 0"
+            "SELECT COUNT(*) FROM alerts "
+            "WHERE acknowledged = 0 AND timestamp > strftime('%s','now') - 1800"
         ).fetchone()[0]
 
         if count == 0:
@@ -61,13 +65,16 @@ def check_alerts():
 
         rows = conn.execute(
             """SELECT alert_type, message, confidence
-               FROM alerts WHERE acknowledged = 0
-               ORDER BY confidence DESC LIMIT 5""",
+               FROM alerts
+               WHERE acknowledged = 0 AND timestamp > strftime('%s','now') - 1800
+               ORDER BY confidence DESC, timestamp DESC LIMIT 5""",
         ).fetchall()
 
         type_counts = {}
         for row in conn.execute(
-            "SELECT alert_type, COUNT(*) FROM alerts WHERE acknowledged = 0 GROUP BY alert_type"
+            "SELECT alert_type, COUNT(*) FROM alerts "
+            "WHERE acknowledged = 0 AND timestamp > strftime('%s','now') - 1800 "
+            "GROUP BY alert_type"
         ).fetchall():
             type_counts[row[0]] = row[1]
 

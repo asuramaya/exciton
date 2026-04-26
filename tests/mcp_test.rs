@@ -10,9 +10,8 @@ fn test_server_creation() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Db::open(&dir.path().join("test.db")).unwrap());
     let config = Config::default();
-    let rpc = Arc::new(
-        RpcRouter::new(&["https://api.mainnet-beta.solana.com".to_string()]).unwrap(),
-    );
+    let rpc =
+        Arc::new(RpcRouter::new(&["https://api.mainnet-beta.solana.com".to_string()]).unwrap());
     let endpoints = vec!["https://api.mainnet-beta.solana.com".to_string()];
     let server = PhotonServer::new(db, config, rpc, endpoints);
     assert!(server.is_healthy());
