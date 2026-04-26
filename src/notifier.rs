@@ -760,6 +760,18 @@ impl Notifier {
                     .as_ref()
                     .and_then(|m| m.dex_id.clone())
                     .unwrap_or_default();
+                // Auto-call horizon heuristic: pump.fun memecoins live and die
+                // in hours, but anything entering at >= $1M mcap is past the
+                // bonding-curve life cycle — those are sit-on-it positions,
+                // not 6h swings. Without this tag, settle_calls() would
+                // expire ROTUS-class entries on its 6h SHORT timeout. Operator
+                // can still override via /close_call. The settling phase
+                // reads this tag on every cycle; missing tag = SHORT.
+                let auto_horizon = if mcap >= 1_000_000.0 {
+                    "horizon=LONG"
+                } else {
+                    "horizon=SHORT"
+                };
                 let inserted = self.db.insert_call(
                     &a.address,
                     &sym,
@@ -771,7 +783,7 @@ impl Notifier {
                     liq,
                     a.top_holder_pct,
                     &dex,
-                    "",
+                    auto_horizon,
                     "notifier",
                 );
                 if let Ok(Some(_)) = inserted {
