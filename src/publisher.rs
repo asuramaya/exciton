@@ -197,13 +197,21 @@ impl Publisher {
         std::fs::create_dir_all(&data_dir).context("create data/ dir")?;
         let now = chrono::Utc::now().timestamp();
 
-        // 1. Wallet state + live SOL price.
-        let sol_lamports = self
-            .rpc
-            .get_balance(&self.wallet)
-            .await
-            .context("wallet balance read failed; skipping publish tick")?;
-        let sol_balance = sol_lamports as f64 / 1e9;
+        // 1. Wallet state + live SOL price. RPC failure here used to abort
+        // the entire tick, which froze the public ledger whenever both RPCs
+        // were 429'd — calls.json, scout receipts, and whale snapshots all
+        // stopped publishing for unrelated reasons. Now: log + degrade to 0
+        // so the rest of the pipeline still ships fresh data.
+        let sol_balance = match self.rpc.get_balance(&self.wallet).await {
+            Ok(lamports) => lamports as f64 / 1e9,
+            Err(e) => {
+                tracing::warn!(
+                    "publisher: get_balance failed ({}) — degrading wallet snapshot, continuing",
+                    e
+                );
+                0.0
+            }
+        };
         let sol_price_usd = fetch_sol_price()
             .await
             .unwrap_or(self.cfg.sol_price_fallback_usd);
