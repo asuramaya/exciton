@@ -65,8 +65,17 @@ pub struct TelegramConfig {
     /// Master switch — defaults to `false` so local runs never post by accident.
     #[serde(default)]
     pub enabled: bool,
-    /// Bot token. Supports ${ENV_VAR} expansion so secrets stay out of config.
+    /// Bot token used for channel posts (signals, calls, ops digest).
+    /// Supports ${ENV_VAR} expansion so secrets stay out of config.
     pub bot_token: String,
+    /// Optional separate bot token for the DM interface. When empty,
+    /// `bot_token` is used. Splitting matters when the channel bot is
+    /// also bound to other consumers (group webhooks, etc) — long-poll
+    /// + sendMessage on the same token from two clients triggers
+    /// 409 Conflict on getUpdates. Configure a dedicated bot for DMs
+    /// to keep the long-poll exclusive.
+    #[serde(default)]
+    pub dm_bot_token: String,
     /// Channel ID for signal cards — "we think this makes money" calls.
     /// Verdict evolves in-card; failures stay visible with FAILED header.
     pub signals_chat_id: String,

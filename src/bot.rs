@@ -52,6 +52,18 @@ impl DmBot {
         })
     }
 
+    /// Token used for DM interactions. Falls back to the channel bot token
+    /// when no dedicated DM bot is configured. Splitting prevents 409 Conflict
+    /// when the channel bot is shared with other long-pollers (group webhooks
+    /// etc.) — only one process can `getUpdates` per token at a time.
+    fn dm_token(&self) -> &str {
+        if self.cfg.dm_bot_token.is_empty() {
+            &self.cfg.bot_token
+        } else {
+            &self.cfg.dm_bot_token
+        }
+    }
+
     pub fn start(self: Arc<Self>) {
         self.running.store(true, Ordering::SeqCst);
         let me = self.clone();
@@ -65,14 +77,14 @@ impl DmBot {
                 .http
                 .post(format!(
                     "https://api.telegram.org/bot{}/deleteWebhook",
-                    me.cfg.bot_token
+                    me.dm_token()
                 ))
                 .send()
                 .await;
             // Register commands with Telegram for client-side autocomplete
             let _ = me.register_commands().await;
 
-            tracing::info!("DM bot started, long-polling @MadApesAIBot");
+            tracing::info!("DM bot started, long-polling for direct messages");
             me.poll_loop().await;
         });
     }
@@ -137,7 +149,7 @@ impl DmBot {
         self.http
             .post(format!(
                 "https://api.telegram.org/bot{}/setMyCommands",
-                self.cfg.bot_token
+                self.dm_token()
             ))
             .json(&json)
             .send()
@@ -172,7 +184,7 @@ impl DmBot {
     async fn get_updates(&self, offset: i64) -> Result<Vec<serde_json::Value>> {
         let url = format!(
             "https://api.telegram.org/bot{}/getUpdates",
-            self.cfg.bot_token
+            self.dm_token()
         );
         let resp = self
             .http
@@ -330,7 +342,7 @@ impl DmBot {
             .http
             .post(format!(
                 "https://api.telegram.org/bot{}/answerCallbackQuery",
-                self.cfg.bot_token
+                self.dm_token()
             ))
             .form(&[("callback_query_id", cb_id.to_string())])
             .send()
@@ -367,7 +379,7 @@ impl DmBot {
             .http
             .post(format!(
                 "https://api.telegram.org/bot{}/sendMessage",
-                self.cfg.bot_token
+                self.dm_token()
             ))
             .form(&form)
             .send()
@@ -1830,7 +1842,7 @@ impl DmBot {
             .http
             .post(format!(
                 "https://api.telegram.org/bot{}/sendChatAction",
-                self.cfg.bot_token
+                self.dm_token()
             ))
             .form(&[
                 ("chat_id", chat_id.to_string()),

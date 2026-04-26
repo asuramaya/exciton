@@ -1600,6 +1600,15 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a stale digest row by id. Used when an edit fails because the
+    /// Telegram message no longer exists (deleted in the channel) — we drop
+    /// the cached pointer and the next tick posts a fresh message.
+    pub fn delete_digest(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM telegram_digests WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Pending alerts grouped by type — for the hourly digest.
     pub fn pending_alerts_by_type(&self) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().unwrap();

@@ -814,7 +814,16 @@ fn watchlist_priority(candidate: &crate::db::WatchlistCandidate, now: i64) -> f6
 
 fn should_track_on_watchlist(analysis: &TokenAnalysis, alert_threshold: i32) -> bool {
     let class = analysis.confidence.classification.as_str();
-    match class {
+    // Hard floors that apply to everything: never observe a confirmed
+    // honeypot/freeze/permanent-delegate token.
+    if class.starts_with("UNSAFE") {
+        return false;
+    }
+
+    // Strong-signal tokens: standard post-graduation thresholds. These are
+    // tokens trading on a real DEX with diverse holder bases — the gate is
+    // tuned for "candidate worth re-analyzing every 15s".
+    let strong = match class {
         "STAIRCASE" | "GRINDER" | "SPRING" => {
             analysis.holder_count >= 20 && analysis.top_holder_pct <= 30.0
         }
@@ -831,7 +840,26 @@ fn should_track_on_watchlist(analysis: &TokenAnalysis, alert_threshold: i32) -> 
                 && analysis.top_holder_pct <= 25.0
         }
         _ => false,
+    };
+    if strong {
+        return true;
     }
+
+    // Observation track: pump.fun launches start with the bonding curve
+    // account holding ~100% of supply, so the strong-signal gate above
+    // rejects every fresh launch by design. We watch them anyway when
+    // they show real activity (momentum + multiple holders), so we
+    // accumulate the snapshots needed for `should_signal` to ever fire.
+    // No alerts come out of this — the watchlist is observational; the
+    // call gate (signal_threshold + classification + delta history) is
+    // unchanged downstream.
+    let observable = matches!(
+        class,
+        "DEVELOPING" | "GRINDER" | "STAIRCASE" | "SPRING" | "SURGE"
+    );
+    observable
+        && analysis.confidence.momentum >= 55
+        && analysis.holder_count >= 10
 }
 
 fn should_remove_from_watchlist(analysis: &TokenAnalysis) -> bool {

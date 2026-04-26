@@ -1080,8 +1080,30 @@ impl Notifier {
 
         match self.db.get_digest(hour_bucket)? {
             Some(d) => {
-                self.edit_message(&chat_id, d.message_id, body).await?;
-                self.db.touch_digest(d.id)?;
+                match self.edit_message(&chat_id, d.message_id, body).await {
+                    Ok(_) => {
+                        self.db.touch_digest(d.id)?;
+                    }
+                    Err(e) => {
+                        // Self-heal: when the upstream message has been
+                        // deleted (Telegram returns 400 "message to edit
+                        // not found"), drop the cached pointer and post
+                        // anew. Otherwise the loop spins forever editing
+                        // a ghost.
+                        let stale = format!("{}", e).contains("message to edit not found");
+                        if stale {
+                            tracing::info!(
+                                "digest message {} no longer exists — reposting fresh",
+                                d.message_id
+                            );
+                            self.db.delete_digest(d.id)?;
+                            let msg_id = self.send_message(&chat_id, body).await?;
+                            self.db.insert_digest(hour_bucket, "ops", msg_id)?;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             }
             None => {
                 let msg_id = self.send_message(&chat_id, body).await?;
