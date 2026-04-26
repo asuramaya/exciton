@@ -1174,6 +1174,20 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// Expire a single active call by mint, with a custom exit_note.
+    /// Used by the horizon-aware settling phase.
+    pub fn expire_call(&self, mint: &str, exit_price_usd: f64, exit_note: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let changed = conn.execute(
+            "UPDATE calls SET status='expired', closed_at=?1,
+             exit_price_usd=?2, exit_note=?3
+             WHERE mint=?4 AND status='active'",
+            params![now, exit_price_usd, exit_note, mint],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Expire any active call whose `expires_at` timestamp has passed.
     /// Records the outcome as `expired`, banks whatever the mark-to-market
     /// price was at the moment of expiry. Returns the number expired.

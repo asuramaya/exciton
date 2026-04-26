@@ -230,11 +230,19 @@ impl BackgroundScanner {
                     // writing a loss to the public ledger automatically.
                     // DEAD/CRASHING/ACTIVE_TRAP may be transient or data-quality
                     // false positives — leave those calls open for manual review.
+                    let has_active_call = self.db.has_active_call(addr).unwrap_or(false);
                     if should_remove_from_watchlist(&analysis) {
-                        self.db.deactivate_watchlist(addr)?;
-                        if self.db.has_active_call(addr).unwrap_or(false)
-                            && is_confirmed_unsafe(&analysis)
-                        {
+                        // Don't pull active-call mints off the watchlist. The
+                        // settling phase needs ongoing analysis to apply
+                        // horizon-aware close rules — once we deactivate, the
+                        // token disappears from re-analysis and the call
+                        // either drifts forever or sails past a real exit.
+                        // The watchlist row is the runtime tracker for live
+                        // calls, not just for unknown candidates.
+                        if !has_active_call {
+                            self.db.deactivate_watchlist(addr)?;
+                        }
+                        if has_active_call && is_confirmed_unsafe(&analysis) {
                             let exit_price = crate::metadata::fetch(addr)
                                 .await
                                 .ok()
@@ -463,6 +471,14 @@ impl BackgroundScanner {
         // full RPC analysis only fires when a token crosses the volume floor.
         self.run_reingest_phase().await;
 
+        // Phase 5: Settling — apply horizon-aware close rules to every active
+        // call. This is the lifecycle manager: SHORT calls book wins/losses
+        // fast (+50%/+100% withdrew, -40% failed, 6h timeout); LONG calls hold
+        // through normal volatility (-70% catastrophic fail only, 30d timeout).
+        // Without this, calls drift indefinitely and TIME MACHINE's +126% sat
+        // open while mOK's -98% never resolved.
+        self.settle_calls().await;
+
         // Tick the hourly digest — notifier dedups by hour bucket internally,
         // so calling once per cycle is safe and self-pacing.
         if let Some(n) = &self.notifier {
@@ -480,6 +496,124 @@ impl BackgroundScanner {
         }
 
         Ok(alert_count)
+    }
+
+    /// Phase 5: Settling — apply horizon-aware lifecycle rules to active
+    /// calls. Reads `horizon=SHORT` / `horizon=LONG` from the call's note
+    /// (defaults to SHORT — auto-calls all use the short profile). Compares
+    /// current price to entry, age to horizon window, and either closes the
+    /// call cleanly or leaves it active.
+    ///
+    /// Settle outcomes (writes to DB + edits the channel card):
+    ///   SHORT  ≥+100%  → withdrew · "2x done"
+    ///   SHORT  ≥+50%   → withdrew · "took the win"
+    ///   SHORT  ≤-40%   → failed   · "thesis broke"
+    ///   SHORT  age≥6h  → expired  · "no follow-through"
+    ///   LONG   ≤-70%   → failed   · "thesis broke"
+    ///   LONG   age≥30d → expired  · "30d hold complete"
+    ///
+    /// Velocity-collapse settle for SHORT is intentionally deferred: it
+    /// needs the entry tx_rate persisted on the call row, which it isn't
+    /// today. The +50% / -40% / 6h envelope already settles the noise; an
+    /// explicit velocity rule is a refinement.
+    async fn settle_calls(&self) {
+        let active = match self.db.list_calls(true, 200) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("settle: list_calls failed: {}", e);
+                return;
+            }
+        };
+        if active.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        for call in active {
+            // Horizon parsing — substring match keeps this independent of
+            // the notifier's parse_horizon_from_note (which also strips the
+            // tag for display, irrelevant here).
+            let is_long = call.note.contains("horizon=LONG");
+            let market = crate::market::get_market(&call.mint).await.ok().flatten();
+            let current_price = market.as_ref().map(|m| m.price_usd).unwrap_or(0.0);
+            // No reliable price → nothing to settle on. Could happen during
+            // a DexScreener outage; skip and try next cycle.
+            if call.entry_price_usd <= 0.0 || current_price <= 0.0 {
+                continue;
+            }
+            let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
+            let age = now - call.called_at;
+
+            // Outcome decision: returns (action, status_str, exit_note).
+            // Action determines which DB call + which TG outcome string.
+            let outcome: Option<(&'static str, String)> = if is_long {
+                if pct <= -70.0 {
+                    Some(("failed", format!("{:+.1}% · thesis broke", pct)))
+                } else if age >= 30 * 86_400 {
+                    Some(("expired", format!("{:+.1}% · 30d hold complete", pct)))
+                } else {
+                    None
+                }
+            } else if pct >= 100.0 {
+                Some(("withdrew", format!("{:+.1}% · 2x done", pct)))
+            } else if pct >= 50.0 {
+                Some(("withdrew", format!("{:+.1}% · took the win", pct)))
+            } else if pct <= -40.0 {
+                Some(("failed", format!("{:+.1}% · thesis broke", pct)))
+            } else if age >= 6 * 3600 {
+                Some(("expired", format!("{:+.1}% · no follow-through", pct)))
+            } else {
+                None
+            };
+
+            let Some((status, exit_note)) = outcome else {
+                continue;
+            };
+
+            // Apply DB write per outcome. Each helper is idempotent on the
+            // (mint, status='active') unique partial index — safe under any
+            // double-fire race with another scan cycle.
+            let db_ok = match status {
+                "withdrew" => self.db.close_call(&call.mint, current_price, &exit_note),
+                "failed" => self.db.fail_call(&call.mint, current_price, &exit_note),
+                "expired" => self.db.expire_call(&call.mint, current_price, &exit_note),
+                _ => Ok(false),
+            };
+            match db_ok {
+                Ok(true) => tracing::info!(
+                    "settle: {} {} ({}={:+.1}%, age={}m, horizon={})",
+                    status,
+                    call.symbol,
+                    if is_long { "long" } else { "short" },
+                    pct,
+                    age / 60,
+                    if is_long { "LONG" } else { "SHORT" }
+                ),
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("settle: {} {} failed: {}", status, call.symbol, e);
+                    continue;
+                }
+            }
+
+            // Flip the TG channel card to the terminal state. update_call_outcome
+            // handles all four canonical outcomes (active/withdrew/failed/expired);
+            // we pass the same status verbatim so the card header matches the DB.
+            if let Some(ref n) = self.notifier {
+                let mint = call.mint.clone();
+                let n = n.clone();
+                let note = exit_note.clone();
+                let status_owned = status.to_string();
+                let exit_pct = Some(pct);
+                tokio::spawn(async move {
+                    if let Err(e) = n
+                        .update_call_outcome(&mint, &status_owned, exit_pct, &note)
+                        .await
+                    {
+                        tracing::warn!("settle: update_call_outcome failed for {}: {}", mint, e);
+                    }
+                });
+            }
+        }
     }
 
     /// Phase 4: Re-evaluate tokens that were discovered but not watchlisted.

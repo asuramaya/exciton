@@ -54,6 +54,16 @@ pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 75;
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 20.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 pub const SIGNAL_DEDUP_HOURS: i64 = 6;
+// Liquidity floor — calls on a $4k pool catch a -98% mOK-class loss when
+// any holder dumps. Real exits need real depth.
+pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 20_000.0;
+// 24h volume floor — proves the token is actually trading, not a dead curve
+// with a stale top_holder reading.
+pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
+// Token must be at least this old to auto-call. Fresh-deploy dumpsters that
+// pump for 5 minutes off creator buying then bleed back to zero are the
+// majority of -90% calls. One hour gives the holder base time to validate.
+pub const SIGNAL_MIN_TOKEN_AGE_SECS: i64 = 3600;
 
 // =============================================================================
 // MATERIAL CHANGE THRESHOLDS — only edit the card when something notable moves.
@@ -249,7 +259,13 @@ impl Notifier {
         None
     }
 
-    pub fn should_signal(&self, a: &TokenAnalysis, effective_conf: i32) -> bool {
+    pub fn should_signal(
+        &self,
+        a: &TokenAnalysis,
+        effective_conf: i32,
+        meta: Option<&TokenMeta>,
+        first_seen: Option<i64>,
+    ) -> bool {
         if self.halted() {
             return false;
         }
@@ -262,7 +278,29 @@ impl Notifier {
         let momentum_ok = a.delta.as_ref().map_or(true, |d| d.momentum_delta >= 0);
         // Require at least one prior snapshot — prevents first-sight signals.
         let history_ok = a.delta.is_some();
-        class_ok && conf_ok && holder_ok && momentum_ok && history_ok
+        // Market-data floors: prove the token has tradeable depth and is
+        // actually trading. Missing meta (DexScreener fetch failed) means
+        // the token isn't on any DEX — block. mOK-class -98% calls came
+        // from auto-calling tokens with $4k liquidity and no real volume.
+        let liq_ok = meta
+            .and_then(|m| m.liquidity_usd)
+            .map_or(false, |v| v >= SIGNAL_MIN_LIQUIDITY_USD);
+        let vol_ok = meta
+            .and_then(|m| m.volume_24h_usd)
+            .map_or(false, |v| v >= SIGNAL_MIN_VOLUME_24H_USD);
+        // Age floor: token must have existed long enough that the holder
+        // base reflects organic distribution, not creator + initial 5
+        // bonding-curve buyers.
+        let now = chrono::Utc::now().timestamp();
+        let age_ok = first_seen.map_or(false, |fs| now - fs >= SIGNAL_MIN_TOKEN_AGE_SECS);
+        class_ok
+            && conf_ok
+            && holder_ok
+            && momentum_ok
+            && history_ok
+            && liq_ok
+            && vol_ok
+            && age_ok
     }
 
     /// Decides when an open signal's verdict has collapsed.
@@ -416,14 +454,10 @@ impl Notifier {
         timeline: &[TimelineEntry],
         status: &str,
         effective_conf: i32,
-        prev_class_on_fail: Option<&str>,
+        _prev_class_on_fail: Option<&str>,
     ) -> String {
         let ticker_name = match meta {
-            Some(m) => format!(
-                "<b>${}</b> — {}",
-                html_escape(&m.symbol),
-                html_escape(&m.name)
-            ),
+            Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
             None => format!(
                 "<code>{}…{}</code>",
                 &a.address[..6],
@@ -436,23 +470,17 @@ impl Notifier {
             _ => format!("📊 <b>SIGNAL</b> · {}", ticker_name),
         };
 
-        let why = match status {
-            "failed" => templates::why_line_for_fail(
-                a,
-                effective_conf,
-                prev_class_on_fail.unwrap_or(&a.confidence.classification),
-            ),
-            _ => templates::why_line_for_signal(a, effective_conf),
-        };
+        // Caller voice paragraph — what the bot would *say* about this
+        // token. No horizon on signal cards (auto-fired = SHORT by gate).
+        let paragraph = templates::caller_paragraph(a, meta, None);
 
-        let body = templates::render_card_body(a, meta);
+        // Collapsed numbers block — all internal scoring lives here.
+        let numbers = templates::numbers_block(a, meta, effective_conf);
 
-        let mut html = format!("{}\n{}\n\n{}", header, why, body);
+        let mut html = format!("{}\n{}\n\n{}", header, paragraph, numbers);
 
         if !timeline.is_empty() {
-            // Expandable blockquote keeps the card glanceable while preserving
-            // the full evidence trail one tap away.
-            html.push_str("\n\n<blockquote expandable>— history ——");
+            html.push_str("\n<blockquote expandable>▾ history");
             for e in timeline {
                 let t = chrono::DateTime::from_timestamp(e.ts, 0)
                     .map(|dt| dt.format("%H:%M UTC").to_string())
@@ -462,7 +490,6 @@ impl Notifier {
             html.push_str("</blockquote>");
         }
 
-        // Hard limit: editMessageText caps at 4096 chars (Telegram API).
         if html.len() > 4000 {
             html.truncate(4000);
             html.push_str("\n…[truncated]");
@@ -479,11 +506,7 @@ impl Notifier {
         note: &str,
     ) -> String {
         let ticker_name = match meta {
-            Some(m) => format!(
-                "<b>${}</b> — {}",
-                html_escape(&m.symbol),
-                html_escape(&m.name)
-            ),
+            Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
             None => {
                 let end = address.len().saturating_sub(5);
                 format!("<code>{}…{}</code>", &address[..6.min(address.len())], &address[end..])
@@ -492,28 +515,44 @@ impl Notifier {
         // Parse horizon tag from note: "horizon=SHORT" or "horizon=LONG"
         let (horizon_badge, clean_note) = parse_horizon_from_note(note);
         let term_label = horizon_badge.map(|h| format!(" · <b>{}</b>", h)).unwrap_or_default();
+        // Header emoji + verb. Settling phase produces explicit verdict
+        // strings ("took the win" / "2x done" / "thesis broke" / "no
+        // follow-through" / "30d hold complete") that are richer than the
+        // bare status — those come through `note` for closed states.
         let header = match status {
-            "withdrew" | "closed" => format!("✅ <b>WITHDREW</b>{} · {}", term_label, ticker_name),
-            "failed"   => format!("❌ <b>FAILED</b>{} · {}", term_label, ticker_name),
+            "withdrew" | "closed" => format!("🟢 <b>BANKED</b>{} · {}", term_label, ticker_name),
+            "failed"   => format!("🔴 <b>FAILED</b>{} · {}", term_label, ticker_name),
             "expired"  => format!("⏰ <b>EXPIRED</b>{} · {}", term_label, ticker_name),
-            _          => format!("📣 <b>CALLED</b>{} · {}", term_label, ticker_name),
+            _          => format!("📣 <b>NEW CALL</b>{} · {}", term_label, ticker_name),
         };
-        let why = if clean_note.is_empty() {
-            "<i>manual call</i>".to_string()
+        // Lead line. For active calls: operator's clean note (or a default
+        // caller phrase if blank). For closed calls: the verdict line from
+        // the settling phase ("+52% · took the win"), already written to
+        // `note` by update_call_outcome.
+        let lead = if clean_note.is_empty() {
+            match status {
+                "active" => "swing taken on this one.".to_string(),
+                _ => "—".to_string(),
+            }
         } else {
-            format!("<i>{}</i>", html_escape(&clean_note))
+            html_escape(&clean_note)
         };
         let body = match meta {
             Some(m) => {
-                let mc  = m.market_cap_usd.or(m.fdv_usd).map(|v| format!("MC {}", compact_usd(v))).unwrap_or_else(|| "MC ?".to_string());
+                let mc  = m.market_cap_usd.or(m.fdv_usd).map(|v| format!("mc {}", compact_usd(v))).unwrap_or_else(|| "mc ?".to_string());
                 let liq = m.liquidity_usd.map(|v| format!("liq {}", compact_usd(v))).unwrap_or_default();
-                let vol = m.volume_24h_usd.map(|v| format!("vol {}", compact_usd(v))).unwrap_or_default();
-                let px  = m.price_usd.map(|v| format!("${:.8}", v)).unwrap_or_else(|| "?".to_string());
-                format!("{} · {} · {}\n{}", mc, liq, vol, px)
+                let vol = m.volume_24h_usd.map(|v| format!("24h {}", compact_usd(v))).unwrap_or_default();
+                let px  = m.price_usd.map(|v| format!("px ${:.6}", v)).unwrap_or_else(|| "px ?".to_string());
+                let parts: Vec<&str> = [&px as &str, &mc, &liq, &vol]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect();
+                parts.join(" · ")
             }
             None => "no market data".to_string(),
         };
-        let mut html = format!("{}\n{}\n\n{}", header, why, body);
+        let mut html = format!("{}\n{}\n\n{}", header, lead, body);
         if !timeline.is_empty() {
             html.push_str("\n\n<blockquote expandable>— history ——");
             for e in timeline {
@@ -617,6 +656,19 @@ impl Notifier {
         if !self.cfg.enabled {
             return Ok(());
         }
+        // Defense against transient RPC data glitches. When getMultipleAccounts
+        // returns a partial response, top_holder_pct can come back 0.0 with
+        // holders > 0 — the analyzer then computes a low confidence and any
+        // existing card flips to FAILED (one-way demote) on what is actually
+        // a winning trade. TIME MACHINE was the canonical example: +126%
+        // recovery, frozen FAILED card. Skip this snapshot entirely.
+        if a.top_holder_pct == 0.0 && a.holder_count > 0 {
+            tracing::debug!(
+                "process_token: skipping {} — top_holder=0.0 with {} holders (data glitch)",
+                a.address, a.holder_count
+            );
+            return Ok(());
+        }
         let channel = "winners"; // legacy internal DB key — kept stable to preserve
                                  // existing telegram_deliveries rows across the rename.
         let chat_id = self.cfg.signals_chat_id.clone();
@@ -624,12 +676,18 @@ impl Notifier {
         let existing = self.db.get_active_delivery(&a.address, channel)?;
         let meta = metadata::fetch(&a.address).await.ok().flatten();
         let price = meta.as_ref().and_then(|m| m.price_usd);
+        let first_seen = self
+            .db
+            .get_token(&a.address)
+            .ok()
+            .flatten()
+            .map(|t| t.first_seen);
 
         match existing {
             None => {
                 // No existing card — check if this token qualifies for a new signal.
                 // If not, check for a near-miss and log it for truth-telling.
-                if !self.should_signal(a, effective_conf) {
+                if !self.should_signal(a, effective_conf, meta.as_ref(), first_seen) {
                     if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf) {
                         let mom_delta = a.delta.as_ref().map(|d| d.momentum_delta);
                         let _ = self.db.insert_near_miss(

@@ -154,6 +154,109 @@ pub fn why_line_for_fail(a: &TokenAnalysis, effective_conf: i32, prev_class: &st
     format!("<i>Triggered by: {}{}</i>", cls_part, top_part)
 }
 
+/// Caller voice — a single natural-language paragraph the operator would
+/// speak when fronting this call. Names the structural read in trader
+/// language ("stair-stepping with steady accumulation", "compressing with
+/// momentum building underneath"), then drops the few numbers that matter
+/// at the entry: mcap, liquidity, top-holder posture, holder count.
+///
+/// The full scoring breakdown (mom/dist/spring/tpm/conf-math) belongs in
+/// the collapsed `numbers_block` — readers who want internals can tap.
+/// Cards that lead with this paragraph read like a caller's note, not a
+/// model dump. Default voice: confident but not screaming. No emojis in
+/// the paragraph itself — those live in the header.
+pub fn caller_paragraph(
+    a: &TokenAnalysis,
+    meta: Option<&TokenMeta>,
+    horizon: Option<&str>,
+) -> String {
+    let class = a.confidence.classification.as_str();
+    // Lead phrase per classification — what the bot is *seeing*.
+    let lead: &str = match class {
+        "STAIRCASE" => "stair-stepping with steady accumulation",
+        "GRINDER" => "grinding sideways with quiet accumulation",
+        "SPRING" => "compressing with momentum building underneath",
+        "SURGE" => "surging — sharp lift on heavy buys",
+        "DEVELOPING" => "still building out the base",
+        "CRASHING" => "rolling over hard",
+        "DEAD" => "no flow, no buyers",
+        "ACTIVE_TRAP" => "distribution score collapsed — looks like a trap",
+        c if c.starts_with("UNSAFE") => "vetoed on-chain — do not touch",
+        _ => "in motion",
+    };
+    let top = a.top_holder_pct;
+    let holders = a.holder_count;
+    let mcap = meta
+        .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+        .map(|v| format!(" at {} mcap", fmt_usd(v)))
+        .unwrap_or_default();
+    let liq = meta
+        .and_then(|m| m.liquidity_usd)
+        .map(|v| format!(", liquidity {}", fmt_usd(v)))
+        .unwrap_or_default();
+    let horizon_clause = match horizon {
+        Some("SHORT TERM") | Some("SHORT") => " — taking it short.",
+        Some("LONG TERM") | Some("LONG") => " — sitting on this one.",
+        _ => ".",
+    };
+    format!(
+        "{lead}, top holder at {top:.1}% with {holders} buyers in{mcap}{liq}{horizon}",
+        lead = lead,
+        top = top,
+        holders = holders,
+        mcap = mcap,
+        liq = liq,
+        horizon = horizon_clause,
+    )
+}
+
+/// Collapsed `▾ numbers` block — every internal score, only visible if
+/// the reader taps. This is the old `render_card_body` content moved
+/// inside an expandable blockquote so the surface card stays glanceable.
+pub fn numbers_block(
+    a: &TokenAnalysis,
+    meta: Option<&TokenMeta>,
+    effective_conf: i32,
+) -> String {
+    let c = &a.confidence;
+    let mut lines = Vec::new();
+    if let Some(p) = price_line(meta) {
+        lines.push(p);
+    }
+    if let Some(m) = market_line(meta) {
+        lines.push(m);
+    }
+    lines.push(format!(
+        "top {top:.2}% / {t5:.2}% / {t10:.2}% · holders {h}",
+        top = a.top_holder_pct,
+        t5 = a.top5_pct,
+        t10 = a.top10_pct,
+        h = a.holder_count,
+    ));
+    lines.push(format!(
+        "{cls} · conf {conf}  ·  mom {m}{dir} · dist {d} · spring {s} · tpm {tx:.1}",
+        cls = c.classification,
+        conf = effective_conf,
+        m = c.momentum,
+        dir = momentum_dir(a),
+        d = c.distribution,
+        s = c.spring,
+        tx = a.tx_rate,
+    ));
+    if c.top_holder_bonus_pct > 0 {
+        lines.push(format!(
+            "score = base {b} · +{bp}% dist bonus",
+            b = c.base_total,
+            bp = c.top_holder_bonus_pct,
+        ));
+    }
+    if let Some(warn) = token_2022_summary(a) {
+        lines.push(warn);
+    }
+    let body = lines.join("\n");
+    format!("<blockquote expandable>▾ numbers\n{}</blockquote>", body)
+}
+
 /// Render the compact body of a token card — metrics only, no header, no
 /// timeline, no links. Notifier composes the header/timeline/keyboard around
 /// this per the style guide.
