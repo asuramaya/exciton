@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
     let mut config = Config::load(&config_path)?;
     if let Some(tg_cfg) = config.telegram.as_mut() {
         tg_cfg.bot_token = ingester::resolve_env_vars(&tg_cfg.bot_token);
+        tg_cfg.dm_bot_token = ingester::resolve_env_vars(&tg_cfg.dm_bot_token);
         tg_cfg.signals_chat_id = ingester::resolve_env_vars(&tg_cfg.signals_chat_id);
         tg_cfg.ops_chat_id = ingester::resolve_env_vars(&tg_cfg.ops_chat_id);
         tg_cfg.anthropic_api_key = ingester::resolve_env_vars(&tg_cfg.anthropic_api_key);
