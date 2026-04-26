@@ -1001,9 +1001,29 @@ impl Notifier {
         let traps = self.render_hour_traps(prev.hour_bucket, 8).await?;
         let final_text = format!("{}{}", body, traps);
         // Target was posted to the ops chat originally
-        self.edit_message(&self.cfg.ops_chat_id, prev.message_id, &final_text)
-            .await?;
-        self.db.finalize_digest(prev.id)?;
+        match self
+            .edit_message(&self.cfg.ops_chat_id, prev.message_id, &final_text)
+            .await
+        {
+            Ok(_) => {
+                self.db.finalize_digest(prev.id)?;
+            }
+            Err(e) => {
+                let stale = format!("{}", e).contains("message to edit not found");
+                if stale {
+                    // Original digest message was deleted — nothing to
+                    // append to. Mark finalized anyway so we stop trying
+                    // to edit a ghost on every cycle.
+                    tracing::info!(
+                        "previous-hour digest {} no longer exists — finalizing without trap wrap",
+                        prev.message_id
+                    );
+                    self.db.finalize_digest(prev.id)?;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 
