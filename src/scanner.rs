@@ -171,9 +171,12 @@ impl BackgroundScanner {
                 Ok(_) => count += 1,
                 Err(e) => tracing::warn!("backfill: force_update_card {} failed: {}", c.mint, e),
             }
-            // Light pacing — Telegram caps at 30 edits/sec/bot. 200ms
-            // keeps us well under, and the backfill only runs once.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Pacing — Telegram channel-edit rate limit is the bottleneck
+            // (~1 edit/sec/channel; bursts trigger 429 with 30s+ retry_after).
+            // 2s/card = ~30 cards/min, comfortably under any per-channel
+            // budget. The backfill only runs once at startup so total
+            // wall-time isn't critical.
+            tokio::time::sleep(Duration::from_millis(2000)).await;
         }
         if count > 0 {
             tracing::info!("backfill: re-rendered {} terminal card(s)", count);

@@ -107,6 +107,20 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Extract `retry_after` seconds from a Telegram 429 error body. The body
+/// shape is `{"description":"Too Many Requests: retry after N","error_code":429,..."parameters":{"retry_after":N}}`.
+/// We do a substring scan rather than a JSON parse since the error has
+/// already been stringified by anyhow by the time we see it.
+fn parse_retry_after(err_text: &str) -> Option<u64> {
+    let key = "\"retry_after\":";
+    let pos = err_text.find(key)?;
+    let after = &err_text[pos + key.len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse::<u64>().ok()
+}
+
 /// Extract horizon display string + cleaned note. Thin wrapper around
 /// the shared `crate::horizon` module — kept here only to preserve the
 /// `(Option<&'static str>, String)` shape the existing call-card
@@ -708,18 +722,40 @@ impl Notifier {
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
         // Soft-error on edits: when re-running a backfill we may hit
         // "message is not modified" or "message to edit not found"
-        // (channel scrubbed). Log and continue rather than aborting the
-        // whole pass.
-        if let Err(e) = self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await {
-            let s = format!("{}", e);
-            if s.contains("not modified") {
-                // Already in the right state — continue and persist
-                // the timeline entry if we added one.
-            } else if force && (s.contains("message to edit not found") || s.contains("MESSAGE_ID_INVALID")) {
-                tracing::info!("force_update_card: msg_id {} no longer exists for {}, skipping", d.message_id, address);
-                return Ok(());
-            } else {
-                return Err(e);
+        // (channel scrubbed). 429 Too Many Requests honours retry_after.
+        // Log + continue rather than aborting the whole pass.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await {
+                Ok(_) => break,
+                Err(e) => {
+                    let s = format!("{}", e);
+                    if s.contains("not modified") {
+                        // Already in the right state — continue and persist
+                        // the timeline entry if we added one.
+                        break;
+                    }
+                    if force && (s.contains("message to edit not found") || s.contains("MESSAGE_ID_INVALID")) {
+                        tracing::info!("force_update_card: msg_id {} no longer exists for {}, skipping", d.message_id, address);
+                        return Ok(());
+                    }
+                    // Telegram channel-edit rate limit. Parse retry_after
+                    // from the JSON error body (looks like
+                    // `..."retry_after":35,...`) and back off, retry once
+                    // before giving up.
+                    if let Some(secs) = parse_retry_after(&s) {
+                        if force && attempt < 3 {
+                            tracing::debug!(
+                                "force_update_card: 429 on {} — sleeping {}s",
+                                address, secs
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
 
