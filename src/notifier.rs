@@ -808,7 +808,16 @@ impl Notifier {
                     price,
                     Some(a.top_holder_pct),
                 );
-                let failed = self.should_fail(a, effective_conf);
+                // Active calls are owned by the settling phase — its
+                // horizon-aware rules decide success/failure based on price
+                // and age, not on classification dips. process_token can
+                // still write running timeline updates for active calls,
+                // but it must NOT flip the card to FAILED preemptively.
+                // ROTUS / TIME MACHINE-class bugs lived here: a transient
+                // CRASHING classification or a confidence dip would demote
+                // a winning long-thesis card while the price kept running.
+                let has_active_call = self.db.has_active_call(&a.address).unwrap_or(false);
+                let failed = !has_active_call && self.should_fail(a, effective_conf);
 
                 if !material && !failed {
                     return Ok(());
