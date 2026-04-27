@@ -1016,8 +1016,20 @@ impl DmBot {
         };
 
         let called_at = chrono::Utc::now().timestamp();
+        // Manual calls don't have a fresh analyzer snapshot at hand, so
+        // entry_tx_rate is read from the most-recent token_snapshots row
+        // when one exists. 0 disables the volume-collapse rule for this
+        // call (settling falls back to the price/age envelope only).
+        let entry_tx_rate = self
+            .db
+            .get_latest_snapshot(mint)
+            .ok()
+            .flatten()
+            .map(|s| s.tx_rate)
+            .unwrap_or(0.0);
         let inserted = self.db.insert_call(
             mint, &sym, "MANUAL", 0, called_at, mcap, price, liq, top_pct, &dex, &full_note, "dm",
+            entry_tx_rate,
         )?;
 
         if inserted.is_none() {

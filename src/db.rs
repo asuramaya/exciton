@@ -394,6 +394,16 @@ impl Db {
         // after N days auto-expire. Keeps the book free of zombie "active"
         // rows that no one remembers. Default 14 days; 0 = no expiration.
         let _ = conn.execute("ALTER TABLE calls ADD COLUMN expires_at INTEGER", []);
+        // Entry tx_rate (transactions/min at call-fire). Lets the
+        // settling phase fire a volume-collapse close: SHORT calls
+        // whose tx_rate has fallen ≤10% of entry across two snapshots
+        // are silently dying — no need to wait for the price to drop
+        // 40% or 6h to elapse. Migration; pre-existing rows get 0
+        // which disables the rule for them.
+        let _ = conn.execute(
+            "ALTER TABLE calls ADD COLUMN entry_tx_rate REAL NOT NULL DEFAULT 0",
+            [],
+        );
 
         Ok(())
     }
@@ -1100,14 +1110,16 @@ impl Db {
         entry_pair_dex: &str,
         note: &str,
         source: &str,
+        entry_tx_rate: f64,
     ) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
             "INSERT OR IGNORE INTO calls
              (mint, symbol, classification, confidence, called_at,
               entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
-              entry_top_holder_pct, entry_pair_dex, note, source, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active')",
+              entry_top_holder_pct, entry_pair_dex, note, source, status,
+              entry_tx_rate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13)",
             params![
                 mint,
                 symbol,
@@ -1121,6 +1133,7 @@ impl Db {
                 entry_pair_dex,
                 note,
                 source,
+                entry_tx_rate,
             ],
         )?;
         if changed == 0 {
@@ -1233,13 +1246,15 @@ impl Db {
             "SELECT id, mint, symbol, classification, confidence, called_at,
                     entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
                     entry_top_holder_pct, entry_pair_dex, note, source,
-                    status, closed_at, exit_price_usd, exit_note, expires_at
+                    status, closed_at, exit_price_usd, exit_note, expires_at,
+                    entry_tx_rate
              FROM calls WHERE status='active' ORDER BY called_at DESC LIMIT ?1"
         } else {
             "SELECT id, mint, symbol, classification, confidence, called_at,
                     entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
                     entry_top_holder_pct, entry_pair_dex, note, source,
-                    status, closed_at, exit_price_usd, exit_note, expires_at
+                    status, closed_at, exit_price_usd, exit_note, expires_at,
+                    entry_tx_rate
              FROM calls ORDER BY called_at DESC LIMIT ?1"
         };
         let conn = self.conn.lock().unwrap();
@@ -1265,6 +1280,7 @@ impl Db {
                     exit_price_usd: row.get(15).ok(),
                     exit_note: row.get(16).ok(),
                     expires_at: row.get(17).ok(),
+                    entry_tx_rate: row.get(18).unwrap_or(0.0),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2102,6 +2118,10 @@ pub struct CallRow {
     pub exit_price_usd: Option<f64>,
     pub exit_note: Option<String>,
     pub expires_at: Option<i64>,
+    /// Transactions per minute at entry. Used by the settling phase's
+    /// volume-collapse rule. Zero on legacy rows or when the entry
+    /// path didn't have an analyzer snapshot to read from.
+    pub entry_tx_rate: f64,
 }
 
 /// Column list shared by every `SELECT … FROM token_snapshots` — keeps the

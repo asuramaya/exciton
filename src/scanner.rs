@@ -661,6 +661,14 @@ impl BackgroundScanner {
                 Some(("failed", format!("{:+.1}% · early collapse", pct)))
             } else if pct <= -40.0 {
                 Some(("failed", format!("{:+.1}% · thesis broke", pct)))
+            } else if call.entry_tx_rate > 0.0
+                && self.detect_volume_collapse(&call.mint, call.entry_tx_rate)
+            {
+                // Volume-collapse rule: two consecutive snapshots showing
+                // tx_rate ≤ 10% of entry. The token is silently dying —
+                // price hasn't moved -40% yet but flow is gone. Better
+                // close at break-even-ish than wait 6h for the bleed.
+                Some(("withdrew", format!("{:+.1}% · energy gone", pct)))
             } else if age >= 6 * 3600 {
                 Some(("expired", format!("{:+.1}% · no follow-through", pct)))
             } else {
@@ -745,6 +753,21 @@ impl BackgroundScanner {
                     n.dm_admins(&dm).await;
                 });
             }
+        }
+    }
+
+    /// Two consecutive snapshots whose tx_rate ≤ 10% of `entry_tx_rate`
+    /// → the token is dying silently. Price-based settling alone misses
+    /// this: a token at +5% with no flow is dead, not still working.
+    /// Stateless via DB; resets on restart since "consecutive" is read
+    /// from `token_snapshots`, not in-memory state.
+    fn detect_volume_collapse(&self, mint: &str, entry_tx_rate: f64) -> bool {
+        let threshold = entry_tx_rate * 0.10;
+        match self.db.get_snapshot_history(mint, 2) {
+            Ok(snaps) if snaps.len() >= 2 => {
+                snaps.iter().all(|s| s.tx_rate <= threshold)
+            }
+            _ => false,
         }
     }
 

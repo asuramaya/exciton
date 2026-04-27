@@ -527,7 +527,18 @@ impl Publisher {
         // Telegram-channel readability; for the stream we prefer the
         // shortened form since the mint already rides along as a structured
         // field that the UI renders as a link.
+        //
+        // Producer-side dedup: keep at most 3 most-recent per
+        // (mint, alert_type). Without this, runs of "DEV SELLING"
+        // updates dominate the stream wall — the screenshot showed 11
+        // identical rows for one mint. Client-side grouping handles
+        // visual presentation but the underlying noise is still in
+        // the JSON. 3 lets the trend stay readable (latest, prior,
+        // earlier) without flooding.
+        const PER_KEY_KEEP: usize = 3;
         if let Ok(alerts) = self.db.get_pending_alerts(40) {
+            let mut by_key: std::collections::HashMap<(String, String), Vec<StreamEvent>> =
+                std::collections::HashMap::new();
             for a in alerts {
                 if a.confidence < 50 {
                     continue;
@@ -537,7 +548,11 @@ impl Publisher {
                     Some(mint) => a.message.replace(mint, &mint_short(mint)),
                     None => a.message,
                 };
-                events.push(StreamEvent {
+                let key = (
+                    a.token_address.clone().unwrap_or_default(),
+                    a.alert_type.clone(),
+                );
+                by_key.entry(key).or_default().push(StreamEvent {
                     ts: a.timestamp,
                     kind: "alert".into(),
                     tag,
@@ -545,6 +560,11 @@ impl Publisher {
                     mint: a.token_address,
                     signature: None,
                 });
+            }
+            for (_, mut bucket) in by_key {
+                bucket.sort_by(|a, b| b.ts.cmp(&a.ts));
+                bucket.truncate(PER_KEY_KEEP);
+                events.extend(bucket);
             }
         }
 

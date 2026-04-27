@@ -1111,6 +1111,13 @@ impl PhotonServer {
 
         let called_at = chrono::Utc::now().timestamp();
         let note = params.note.clone().unwrap_or_default();
+        let entry_tx_rate = self
+            .db
+            .get_latest_snapshot(&params.mint)
+            .ok()
+            .flatten()
+            .map(|s| s.tx_rate)
+            .unwrap_or(0.0);
         let inserted = self.db.insert_call(
             &params.mint,
             &sym,
@@ -1124,6 +1131,7 @@ impl PhotonServer {
             &dex,
             &note,
             "mcp",
+            entry_tx_rate,
         );
         let id = match inserted {
             Ok(Some(id)) => id,

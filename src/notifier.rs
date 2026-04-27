@@ -922,6 +922,7 @@ impl Notifier {
                     &dex,
                     auto_horizon_tag,
                     "notifier",
+                    a.tx_rate,
                 );
                 if let Ok(Some(_)) = inserted {
                     // Align expires_at with the horizon-based settling window
@@ -1017,8 +1018,93 @@ impl Notifier {
                     &timeline_json,
                 )?;
             }
-            Some(_) => {
-                // Already in a terminal state — nothing to do
+            Some(delivery) => {
+                // Terminal-but-recoverable. Two cohorts land here:
+                //   - status="demoted" cards from the legacy should_fail
+                //     era that flipped on classification dips/data
+                //     glitches. Token may have recovered.
+                //   - status="demoted" cards from settling (close was
+                //     written; we leave those alone).
+                // Recovery only fires when:
+                //   1. Delivery is demoted (not "settled" — those stay)
+                //   2. There is no active call for this mint (settling
+                //      already owns the lifecycle of any active call)
+                //   3. The token now passes the full should_signal gate
+                //      (would re-promote if seen fresh today)
+                if delivery.status != "demoted" {
+                    return Ok(());
+                }
+                if self.db.has_active_call(&a.address).unwrap_or(false) {
+                    return Ok(());
+                }
+                let first_seen = self
+                    .db
+                    .get_token(&a.address)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.first_seen);
+                if !self.should_signal(a, effective_conf, meta.as_ref(), first_seen) {
+                    return Ok(());
+                }
+                // Recovery flip: append timeline entry, edit card to
+                // active state, mark delivery active. Next tick takes
+                // over with the normal update path.
+                let mut timeline: Vec<TimelineEntry> =
+                    serde_json::from_str(&delivery.timeline_json).unwrap_or_default();
+                let now = chrono::Utc::now().timestamp();
+                let line = format!(
+                    "{cls} {conf} · top {top:.1}% · momentum back",
+                    cls = a.confidence.classification,
+                    conf = effective_conf,
+                    top = a.top_holder_pct,
+                );
+                timeline.push(TimelineEntry {
+                    ts: now,
+                    kind: "rebound".into(),
+                    line,
+                });
+                let html = self.render_signal_with_timeline(
+                    a,
+                    meta.as_ref(),
+                    &timeline,
+                    "active",
+                    effective_conf,
+                    None,
+                );
+                let kb = self.token_keyboard(
+                    &a.address,
+                    meta.as_ref().and_then(|m| m.pair_url.as_deref()),
+                );
+                if let Err(e) = self
+                    .edit_message_ex(&chat_id, delivery.message_id, &html, Some(&kb))
+                    .await
+                {
+                    // Original message gone — give up rather than try
+                    // to re-post under a new id (would lose history).
+                    let s = format!("{}", e);
+                    if s.contains("message to edit not found") {
+                        tracing::info!(
+                            "rebound: msg_id {} no longer exists for {}, leaving demoted",
+                            delivery.message_id, a.address
+                        );
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+                let timeline_json = serde_json::to_string(&timeline)?;
+                self.db.update_delivery(
+                    delivery.id,
+                    "active",
+                    effective_conf,
+                    &a.confidence.classification,
+                    price,
+                    Some(a.top_holder_pct),
+                    &timeline_json,
+                )?;
+                tracing::info!(
+                    "rebound: {} restored to active ({} {})",
+                    a.address, a.confidence.classification, effective_conf
+                );
             }
         }
         Ok(())
