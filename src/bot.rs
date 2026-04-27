@@ -1030,9 +1030,18 @@ impl DmBot {
             return Ok(());
         }
 
-        let expiry_days = self.call_expiry_days.max(0);
-        let expires_at = if expiry_days > 0 {
-            Some(called_at + expiry_days * 86_400)
+        // Horizon-aware expiry: SHORT calls auto-settle at 6h, LONG at 30d
+        // (matches scanner::settle_calls thresholds). Configured
+        // `call_expiry_days` is the unknown-horizon backstop only.
+        let window_secs: i64 = if full_note.contains("horizon=SHORT") {
+            6 * 3600
+        } else if full_note.contains("horizon=LONG") {
+            30 * 86_400
+        } else {
+            self.call_expiry_days.max(0) * 86_400
+        };
+        let expires_at = if window_secs > 0 {
+            Some(called_at + window_secs)
         } else {
             None
         };

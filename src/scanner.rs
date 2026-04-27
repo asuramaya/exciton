@@ -557,6 +557,14 @@ impl BackgroundScanner {
                 Some(("withdrew", format!("{:+.1}% · 2x done", pct)))
             } else if pct >= 50.0 {
                 Some(("withdrew", format!("{:+.1}% · took the win", pct)))
+            } else if age <= 30 * 60 && pct <= -25.0 {
+                // Fast-fail: SHORT calls that drop ≥25% within the first 30
+                // minutes are dead. Memecoins don't recover from a -25% in
+                // half an hour — waiting for the regular -40% / 6h envelope
+                // just publishes a more catastrophic loss. mOK lost -98%
+                // because we waited; this stops at -25% with the runway
+                // intact.
+                Some(("failed", format!("{:+.1}% · early collapse", pct)))
             } else if pct <= -40.0 {
                 Some(("failed", format!("{:+.1}% · thesis broke", pct)))
             } else if age >= 6 * 3600 {

@@ -160,12 +160,44 @@ struct CallSnapshot {
     current_price_usd: f64,
     current_liquidity_usd: f64,
     pct_from_call: Option<f64>,
+    // Journey: best and worst price observed between called_at..closed_at
+    // (or called_at..now for active calls), derived from token_snapshots.
+    // Lets the front end show "peaked at +210%, troughed at -8%" — entry
+    // and exit alone don't tell the story.
+    peak_pct: Option<f64>,
+    peak_at: Option<i64>,
+    trough_pct: Option<f64>,
+    trough_at: Option<i64>,
+}
+
+/// Per-horizon aggregate stats for the public ledger. Computed over the
+/// rows the publisher just emitted — gives the page a track-record
+/// summary without the client doing the math.
+#[derive(Debug, Serialize, Default)]
+struct CallStatsBucket {
+    count: usize,
+    wins: usize,
+    losses: usize,
+    expired: usize,
+    win_rate: f64,
+    avg_winner_pct: f64,
+    avg_loser_pct: f64,
+    best_pct: f64,
+    worst_pct: f64,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct CallStats {
+    short: CallStatsBucket,
+    long: CallStatsBucket,
+    overall: CallStatsBucket,
 }
 
 #[derive(Debug, Serialize)]
 struct CallsFile {
     active: Vec<CallSnapshot>,
     history: Vec<CallSnapshot>,
+    stats: CallStats,
 }
 
 pub struct Publisher {
@@ -592,6 +624,7 @@ impl Publisher {
     async fn build_calls_file(&self) -> CallsFile {
         let mut active: Vec<CallSnapshot> = Vec::new();
         let mut history: Vec<CallSnapshot> = Vec::new();
+        let now = chrono::Utc::now().timestamp();
         let rows = self.db.list_calls(false, 200).unwrap_or_default();
         for row in rows {
             // The public ledger only carries calls with a real lifecycle
@@ -636,6 +669,26 @@ impl Publisher {
             }
             .to_string();
 
+            // Journey from token_snapshots: peak/trough between call-time
+            // and (closed_at or now). Lets the front end show "ran +210%
+            // before settling at +50%" — the entry/exit pair alone hides
+            // the swing magnitude. Skip when we can't compute a pct.
+            let (peak_pct, peak_at, trough_pct, trough_at) =
+                if row.entry_price_usd > 0.0 {
+                    let until = row.closed_at.unwrap_or(now);
+                    match self.db.get_price_extremes(&row.mint, row.called_at, until) {
+                        Ok(Some(((hi, hi_ts), (lo, lo_ts)))) => (
+                            Some((hi / row.entry_price_usd - 1.0) * 100.0),
+                            Some(hi_ts),
+                            Some((lo / row.entry_price_usd - 1.0) * 100.0),
+                            Some(lo_ts),
+                        ),
+                        _ => (None, None, None, None),
+                    }
+                } else {
+                    (None, None, None, None)
+                };
+
             let snap = CallSnapshot {
                 id: row.id,
                 mint: row.mint.clone(),
@@ -660,6 +713,10 @@ impl Publisher {
                 current_price_usd: current_price,
                 current_liquidity_usd: current_liq,
                 pct_from_call,
+                peak_pct,
+                peak_at,
+                trough_pct,
+                trough_at,
             };
             if is_active {
                 active.push(snap);
@@ -667,7 +724,8 @@ impl Publisher {
                 history.push(snap);
             }
         }
-        CallsFile { active, history }
+        let stats = compute_call_stats(&history);
+        CallsFile { active, history, stats }
     }
 
     /// For each active call, emit a one-shot scout receipt that freezes the
@@ -941,6 +999,78 @@ async fn fetch_sol_price() -> Option<f64> {
         Some(m.price_usd)
     } else {
         None
+    }
+}
+
+/// Aggregate stats for the public history view. Computed in three buckets:
+/// short-horizon, long-horizon, overall. Excludes calls without a valid
+/// pct (entry_price=0 + no exit). `wins` counts withdrew, `losses` counts
+/// failed, `expired` is its own bucket. win_rate is wins / (wins + losses)
+/// — expired calls don't count as either since they didn't reach a verdict.
+fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
+    let mut short_calls: Vec<f64> = Vec::new();
+    let mut long_calls: Vec<f64> = Vec::new();
+    let mut all_calls: Vec<f64> = Vec::new();
+    let mut bucket_counts: [(usize, usize, usize, usize); 3] = [(0, 0, 0, 0); 3];
+    // bucket_counts[0]=short, [1]=long, [2]=overall.
+    // Tuple: (count, wins, losses, expired).
+
+    for c in history {
+        let Some(pct) = c.pct_from_call else { continue };
+        let is_long = c.note.contains("horizon=LONG");
+        let bucket_idx = if is_long { 1 } else { 0 };
+        // Update both per-horizon and overall buckets.
+        for &i in &[bucket_idx, 2] {
+            bucket_counts[i].0 += 1;
+            match c.outcome_type.as_str() {
+                "withdrew" => bucket_counts[i].1 += 1,
+                "failed" => bucket_counts[i].2 += 1,
+                "expired" => bucket_counts[i].3 += 1,
+                _ => {}
+            }
+        }
+        if is_long {
+            long_calls.push(pct);
+        } else {
+            short_calls.push(pct);
+        }
+        all_calls.push(pct);
+    }
+
+    let mk = |pcts: &[f64], (count, wins, losses, expired): (usize, usize, usize, usize)| -> CallStatsBucket {
+        let winners: Vec<f64> = pcts.iter().copied().filter(|p| *p > 0.0).collect();
+        let losers: Vec<f64> = pcts.iter().copied().filter(|p| *p < 0.0).collect();
+        let avg = |v: &[f64]| -> f64 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f64>() / v.len() as f64
+            }
+        };
+        let win_rate = if wins + losses > 0 {
+            wins as f64 / (wins + losses) as f64 * 100.0
+        } else {
+            0.0
+        };
+        let best = pcts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let worst = pcts.iter().copied().fold(f64::INFINITY, f64::min);
+        CallStatsBucket {
+            count,
+            wins,
+            losses,
+            expired,
+            win_rate,
+            avg_winner_pct: avg(&winners),
+            avg_loser_pct: avg(&losers),
+            best_pct: if best.is_finite() { best } else { 0.0 },
+            worst_pct: if worst.is_finite() { worst } else { 0.0 },
+        }
+    };
+
+    CallStats {
+        short: mk(&short_calls, bucket_counts[0]),
+        long: mk(&long_calls, bucket_counts[1]),
+        overall: mk(&all_calls, bucket_counts[2]),
     }
 }
 

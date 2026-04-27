@@ -787,10 +787,17 @@ impl Notifier {
                     "notifier",
                 );
                 if let Ok(Some(_)) = inserted {
-                    // Default 14-day window — calls that don't get their
-                    // thesis confirmation in two weeks auto-expire rather
-                    // than haunt the book as zombie "active" rows.
-                    let expires = now + 14 * 86_400;
+                    // Align expires_at with the horizon-based settling window
+                    // (scanner::settle_calls). Without this, the UI badges a
+                    // misleading "13d left" on every call while the settling
+                    // phase actually closes SHORT at 6h. Backstop: 14d for
+                    // unknown horizon (legacy fallback).
+                    let window_secs: i64 = match auto_horizon {
+                        "horizon=SHORT" => 6 * 3600,        // 6h SHORT
+                        "horizon=LONG" => 30 * 86_400,      // 30d LONG
+                        _ => 14 * 86_400,                   // 14d backstop
+                    };
+                    let expires = now + window_secs;
                     let _ = self.db.set_call_expiration(&a.address, Some(expires));
                 }
             }

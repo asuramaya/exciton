@@ -1907,6 +1907,46 @@ impl Db {
         }
     }
 
+    /// Highest and lowest price observed for a token between two timestamps,
+    /// derived from `token_snapshots`. Used by the publisher to enrich each
+    /// call snapshot with peak / trough — the journey, not just entry+exit.
+    /// Returns ((max_price, max_ts), (min_price, min_ts)) or None when no
+    /// price-bearing snapshots exist in the window.
+    pub fn get_price_extremes(
+        &self,
+        address: &str,
+        since_ts: i64,
+        until_ts: i64,
+    ) -> Result<Option<((f64, i64), (f64, i64))>> {
+        let conn = self.conn.lock().unwrap();
+        // Two-row pull. Filtering price > 0 strips snapshots taken before
+        // DexScreener had data (curve-only pump.fun tokens).
+        let high: Option<(f64, i64)> = conn
+            .query_row(
+                "SELECT price_usd, timestamp FROM token_snapshots
+                 WHERE token_address = ?1 AND price_usd > 0
+                   AND timestamp >= ?2 AND timestamp <= ?3
+                 ORDER BY price_usd DESC, timestamp ASC LIMIT 1",
+                params![address, since_ts, until_ts],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let low: Option<(f64, i64)> = conn
+            .query_row(
+                "SELECT price_usd, timestamp FROM token_snapshots
+                 WHERE token_address = ?1 AND price_usd > 0
+                   AND timestamp >= ?2 AND timestamp <= ?3
+                 ORDER BY price_usd ASC, timestamp ASC LIMIT 1",
+                params![address, since_ts, until_ts],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match (high, low) {
+            (Some(h), Some(l)) => Ok(Some((h, l))),
+            _ => Ok(None),
+        }
+    }
+
     /// Latest snapshot (by timestamp) for a token.
     pub fn get_latest_snapshot(&self, address: &str) -> Result<Option<TokenSnapshot>> {
         let conn = self.conn.lock().unwrap();
