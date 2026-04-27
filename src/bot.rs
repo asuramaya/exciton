@@ -1915,18 +1915,18 @@ impl DmBot {
         // close?" without making things up. Mirrors scanner::settle_calls.
         ctx.push_str(
             "SETTLING RULES (the lifecycle, source of truth):\n\
-            \  SHORT horizon (auto-call default for sub-$1M mcap):\n\
-            \    +100% → withdrew · 2x done\n\
-            \    +50%  → withdrew · took the win\n\
-            \    -25% within first 30min → failed · early collapse\n\
-            \    -40% any time → failed · thesis broke\n\
-            \    tx_rate ≤10% of entry across 2 snapshots → withdrew · energy gone\n\
-            \    age ≥6h with none of above → expired · no follow-through\n\
-            \  LONG horizon (auto for ≥$1M mcap, or operator-tagged):\n\
-            \    -70% → failed · thesis broke\n\
-            \    age ≥30d → expired · 30d hold complete\n\
-            \    no auto-take-profit; operator settles via /close_call\n\
-            \  Statuses: active | withdrew (🟢 BANKED) | failed (🔴) | expired (⏰) | voided (⚪ admin cleanup, not a market verdict)\n\n",
+             SHORT horizon (auto-call default for sub-$1M mcap):\n\
+               +100% → withdrew · 2x done\n\
+               +50%  → withdrew · took the win\n\
+               -25% within first 30min → failed · early collapse\n\
+               -40% any time → failed · thesis broke\n\
+               tx_rate ≤10% of entry across 2 snapshots → withdrew · energy gone\n\
+               age ≥6h with none of above → expired · no follow-through\n\
+             LONG horizon (auto for ≥$1M mcap, or operator-tagged):\n\
+               -70% → failed · thesis broke\n\
+               age ≥30d → expired · 30d hold complete\n\
+               no auto-take-profit; operator settles via /close_call\n\
+             Statuses: active | withdrew (🟢 BANKED) | failed (🔴) | expired (⏰) | voided (⚪ admin cleanup, not a market verdict)\n\n",
         );
 
         // Aggregate stats — gives claw a track-record summary without
