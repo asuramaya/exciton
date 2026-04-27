@@ -80,6 +80,30 @@ pub fn parse_with_clean(note: &str) -> (Horizon, String) {
     (h, clean)
 }
 
+/// Extract a `thesis=<filename>` tag from a call note. Convention: the
+/// filename is relative to the public site's `thoughts/` directory
+/// (e.g. `2026-04-22_first-call-psyopanime-one-trader-vs-a-network.md`).
+/// Whitespace / `·` separators delimit the tag from surrounding free-
+/// form text. Returns None when the tag is absent.
+///
+/// Lets long-thesis calls link to their hand-curated markdown so the
+/// site's CALLS row carries a 📖 link without a separate column or
+/// out-of-band convention.
+pub fn parse_thesis(note: &str) -> Option<String> {
+    let key = "thesis=";
+    let pos = note.find(key)?;
+    let after = &note[pos + key.len()..];
+    let end = after
+        .find(|c: char| c.is_whitespace() || c == '·')
+        .unwrap_or(after.len());
+    let filename = after[..end].trim();
+    if filename.is_empty() {
+        None
+    } else {
+        Some(filename.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +135,24 @@ mod tests {
         let (h, clean) = parse_with_clean("a · horizon=LONG · b");
         assert_eq!(h, Horizon::Long);
         assert_eq!(clean, "a · b".trim());
+    }
+
+    #[test]
+    fn thesis_extracts() {
+        assert_eq!(
+            parse_thesis("thesis=2026-04-22_psyopanime.md"),
+            Some("2026-04-22_psyopanime.md".to_string())
+        );
+        assert_eq!(
+            parse_thesis("a thesis=note.md trailing"),
+            Some("note.md".to_string())
+        );
+        assert_eq!(
+            parse_thesis("a · thesis=t.md · horizon=LONG"),
+            Some("t.md".to_string())
+        );
+        assert_eq!(parse_thesis(""), None);
+        assert_eq!(parse_thesis("thesis="), None);
+        assert_eq!(parse_thesis("no tag here"), None);
     }
 }

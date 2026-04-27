@@ -168,6 +168,11 @@ struct CallSnapshot {
     peak_at: Option<i64>,
     trough_pct: Option<f64>,
     trough_at: Option<i64>,
+    /// Site-relative URL of the long-thesis markdown when the call's
+    /// note carries a `thesis=<filename>` tag. Front-end renders a
+    /// 📖 link on rows where this is set. None for short pump.fun
+    /// auto-calls (no thesis to write).
+    thesis_url: Option<String>,
 }
 
 /// Per-horizon aggregate stats for the public ledger. Computed over the
@@ -495,6 +500,12 @@ impl Publisher {
         //     exactly the same top-10 flow we're watching in-session.
         self.publish_whale_snapshots(&calls_file, &data_dir).await;
 
+        // 9d. Per-call detail JSON — full token_snapshots window for any
+        //     call (active + history). Drives the front-end's
+        //     `#call=<mint>` drill-in: classification timeline, journey
+        //     numbers, scout/whales/thesis links in one place.
+        self.publish_call_details(&calls_file, &data_dir).await;
+
         let health = Health {
             wallet: self.wallet.clone(),
             sol_balance,
@@ -771,6 +782,8 @@ impl Publisher {
                 peak_at,
                 trough_pct,
                 trough_at,
+                thesis_url: crate::horizon::parse_thesis(&row.note)
+                    .map(|f| format!("thoughts/{}", f)),
             };
             if is_active {
                 active.push(snap);
@@ -889,6 +902,77 @@ impl Publisher {
                 serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
             ) {
                 tracing::warn!("publisher: write scout snapshot {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    /// Per-call detail page data. For each call (active + history), write
+    /// `data/calls/<mint>.json` containing the full snapshot + the
+    /// token_snapshots window between called_at and (closed_at or now).
+    /// Drives the front-end's `#call=<mint>` drill-in. Active calls
+    /// re-publish each tick (their snapshots advance); closed calls are
+    /// frozen (idempotent skip when latest snapshot is unchanged).
+    async fn publish_call_details(&self, calls: &CallsFile, data_dir: &Path) {
+        if calls.active.is_empty() && calls.history.is_empty() {
+            return;
+        }
+        let calls_dir = data_dir.join("calls");
+        if let Err(e) = std::fs::create_dir_all(&calls_dir) {
+            tracing::warn!("publisher: create calls dir: {}", e);
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        for call in calls.active.iter().chain(calls.history.iter()) {
+            // Window for snapshot lookup. Active = called_at..now,
+            // closed = called_at..closed_at. The DB helper takes a
+            // limit, not a range; we filter post-pull.
+            let window_end = call.closed_at.unwrap_or(now);
+            // Pull up to 200 snapshots — covers a 30d LONG call at 15s
+            // cycles after the watchlist drops to 5min cadence.
+            let snaps = match self.db.get_snapshot_history(&call.mint, 200) {
+                Ok(s) => s,
+                Err(_) => Vec::new(),
+            };
+            // Filter to the window + reverse to chronological. Drop
+            // snapshots before called_at (orphan analyses from when
+            // the token wasn't on the watchlist as a call yet).
+            let mut in_window: Vec<_> = snaps
+                .into_iter()
+                .filter(|s| s.timestamp >= call.called_at && s.timestamp <= window_end)
+                .collect();
+            in_window.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            // Idempotency: when the latest snapshot ts in the file
+            // matches what we'd write, skip. Closed calls converge to
+            // a stable file after one write.
+            let path = calls_dir.join(format!("{}.json", call.mint));
+            let existing: serde_json::Value = read_json(&path).unwrap_or_default();
+            let existing_last_ts = existing
+                .get("last_snapshot_ts")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let new_last_ts = in_window.last().map(|s| s.timestamp).unwrap_or(0);
+            let existing_status = existing
+                .get("call")
+                .and_then(|c| c.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            // Skip when snapshot tip + status are unchanged. Status flip
+            // (active → withdrew) always re-publishes so the verdict
+            // lands.
+            if existing_last_ts == new_last_ts && existing_status == call.status {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "call": call,
+                "snapshots": in_window,
+                "last_snapshot_ts": new_last_ts,
+                "captured_at": now,
+            });
+            if let Err(e) = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
+            ) {
+                tracing::warn!("publisher: write call detail {}: {}", path.display(), e);
             }
         }
     }
