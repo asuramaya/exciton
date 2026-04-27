@@ -131,10 +131,17 @@ async fn main() -> Result<()> {
         config.alerts.confidence_threshold as i32, // alert threshold from config
         config.tracking.max_active_tokens,         // bound the re-analysis shortlist
     );
+    // Shared kick handle: state-changing components (settling phase,
+    // auto-call insert, manual /call + /close_call) signal the publisher
+    // to run an immediate snapshot via this. Always created so notifier
+    // can hold a reference even when no publisher is configured (kick
+    // becomes a no-op).
+    let publish_kick: publisher::PublishKick = Arc::new(tokio::sync::Notify::new());
+
     let mut notifier_arc: Option<Arc<notifier::Notifier>> = None;
     if let Some(tg_cfg) = config.telegram.clone() {
         let cfg = tg_cfg;
-        match notifier::Notifier::new(cfg.clone(), db.clone()) {
+        match notifier::Notifier::new(cfg.clone(), db.clone(), Some(publish_kick.clone())) {
             Ok(n) => {
                 let enabled = cfg.enabled;
                 tracing::info!("Telegram notifier configured (enabled={})", enabled);
@@ -178,7 +185,7 @@ async fn main() -> Result<()> {
                 rpc.clone(),
                 db.clone(),
             ));
-            pub_instance.spawn();
+            pub_instance.spawn(publish_kick.clone());
 
             // Thought-image processor runs beside the publisher. Only starts
             // when a Recraft key is present — no accidental API burn on

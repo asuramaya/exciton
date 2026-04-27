@@ -151,10 +151,19 @@ pub struct Notifier {
     http: reqwest::Client,
     halted: Arc<AtomicBool>,
     signal_threshold_override: Arc<AtomicI32>,
+    /// Optional handle that lets state-changing operations (auto-call
+    /// fire, settle close, manual call/close) kick the publisher to
+    /// run a snapshot now instead of waiting for the next 300s tick.
+    /// `None` when the publisher isn't configured.
+    publish_kick: Option<crate::publisher::PublishKick>,
 }
 
 impl Notifier {
-    pub fn new(cfg: TelegramConfig, db: Arc<Db>) -> Result<Self> {
+    pub fn new(
+        cfg: TelegramConfig,
+        db: Arc<Db>,
+        publish_kick: Option<crate::publisher::PublishKick>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -164,7 +173,17 @@ impl Notifier {
             http,
             halted: Arc::new(AtomicBool::new(false)),
             signal_threshold_override: Arc::new(AtomicI32::new(0)),
+            publish_kick,
         })
+    }
+
+    /// Wake the publisher to run an immediate snapshot. Coalesces with
+    /// any in-flight or near-future tick — multiple kicks during a run
+    /// collapse into one extra cycle. Cheap; safe to call from hot paths.
+    pub fn kick_publisher(&self) {
+        if let Some(k) = &self.publish_kick {
+            k.notify_one();
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -916,6 +935,9 @@ impl Notifier {
                     };
                     let expires = now + window_secs;
                     let _ = self.db.set_call_expiration(&a.address, Some(expires));
+                    // New auto-call landed — wake the publisher so the site
+                    // shows it within ~30s instead of waiting on the 300s tick.
+                    self.kick_publisher();
                 }
             }
             Some(delivery) if delivery.status == "active" => {

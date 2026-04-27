@@ -1044,6 +1044,8 @@ impl DmBot {
             None
         };
         let _ = self.db.set_call_expiration(mint, expires_at);
+        // New manual call — wake publisher for an immediate snapshot.
+        self.notifier.kick_publisher();
 
         // Post the call card to the public channel.
         let notifier = self.notifier.clone();
@@ -1120,6 +1122,8 @@ impl DmBot {
                 .await?;
             return Ok(());
         }
+        // Manual close landed — wake publisher for an immediate snapshot.
+        self.notifier.kick_publisher();
 
         // Update the channel card to show the outcome.
         let notifier = self.notifier.clone();

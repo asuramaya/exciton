@@ -250,6 +250,21 @@ pub fn numbers_block(
             bp = c.top_holder_bonus_pct,
         ));
     }
+    // Velocity = h1 volume / liquidity. Compact "is the token alive"
+    // signal: ≥1.0 means the pool is turning over once per hour;
+    // <0.1 means dead-cat. Skipped when liquidity is zero (curve-only
+    // pump.fun mints with no DexScreener pair).
+    if let Some(m) = meta {
+        if let (Some(vol), Some(liq)) = (m.volume_24h_usd, m.liquidity_usd) {
+            // h24 → h1 estimate: divide by 24. We don't have h1 vol on
+            // TokenMeta directly today; this is the cheap approximation.
+            // When h1 is wired through this becomes vol_h1 / liq directly.
+            if liq > 0.0 {
+                let velocity = (vol / 24.0) / liq;
+                lines.push(format!("velocity {:.2}x · h24 vol/liq {:.1}", velocity, vol / liq));
+            }
+        }
+    }
     if let Some(warn) = token_2022_summary(a) {
         lines.push(warn);
     }

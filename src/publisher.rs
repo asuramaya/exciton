@@ -191,6 +191,12 @@ struct CallStats {
     short: CallStatsBucket,
     long: CallStatsBucket,
     overall: CallStatsBucket,
+    /// Per-source buckets — track whether the bot's auto-calls
+    /// (`source = "notifier"`) outperform operator manual calls
+    /// (`source = "dm"` from /call, `source = "mcp"` from claw).
+    /// Same bucket shape as the horizon axis. Keys present only
+    /// when at least one closed call exists for that source.
+    by_source: std::collections::HashMap<String, CallStatsBucket>,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +205,13 @@ struct CallsFile {
     history: Vec<CallSnapshot>,
     stats: CallStats,
 }
+
+/// Shared signal that any state-changing component (settling phase,
+/// auto-call, manual call/close) fires to ask the publisher to run a
+/// snapshot now. Lets the public site update within ~30s of an event
+/// instead of waiting for the next 300s tick. Coalesces — multiple
+/// notifies during a single publish tick collapse into one extra run.
+pub type PublishKick = Arc<tokio::sync::Notify>;
 
 pub struct Publisher {
     cfg: MadapesConfig,
@@ -217,17 +230,38 @@ impl Publisher {
         }
     }
 
-    pub fn spawn(self: Arc<Self>) {
+    pub fn spawn(self: Arc<Self>, kick: PublishKick) {
         let interval = self.cfg.interval_seconds.max(60);
         tokio::spawn(async move {
             tracing::info!(
-                "MadApes publisher active: pushing to {} every {}s",
+                "MadApes publisher active: pushing to {} (max {}s, push-on-event)",
                 self.cfg.repo_path,
                 interval
             );
             let mut tick = tokio::time::interval(Duration::from_secs(interval));
+            // Skip the immediate first tick (interval fires at t=0 by
+            // default). The container has just started — RPCs aren't
+            // warm and there's nothing new to publish yet.
+            tick.tick().await;
+            // Cooldown between successive runs: even if 5 events kick
+            // back-to-back, give the prior git push room to land. 30s
+            // is comfortably below interesting human-perception
+            // staleness while bounding git/RPC load on bursts.
+            const MIN_INTERVAL: Duration = Duration::from_secs(30);
+            let mut last_run = tokio::time::Instant::now() - MIN_INTERVAL;
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {},
+                    _ = kick.notified() => {},
+                }
+                // Burst-coalesce: if we just ran, sleep the remainder
+                // before honoring this kick. notified-during-sleep
+                // wakes us once for the cumulative event burst.
+                let since = last_run.elapsed();
+                if since < MIN_INTERVAL {
+                    tokio::time::sleep(MIN_INTERVAL - since).await;
+                }
+                last_run = tokio::time::Instant::now();
                 match self.run_once().await {
                     Ok(committed) if committed => {
                         tracing::info!("MadApes publish: data snapshot pushed")
@@ -1072,6 +1106,13 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
     // bucket_counts[0]=short, [1]=long, [2]=overall.
     // Tuple: (count, wins, losses, expired).
 
+    // Per-source accumulator: source string → (pcts, counts). Built up
+    // alongside the horizon axis so we can answer "do operator picks
+    // beat the bot?". `source` is the field set at insert_call time:
+    // `notifier` for auto-call, `dm` for /call, `mcp` for claw.
+    let mut by_source: std::collections::HashMap<String, (Vec<f64>, (usize, usize, usize, usize))> =
+        std::collections::HashMap::new();
+
     for c in history {
         let Some(pct) = c.pct_from_call else { continue };
         let is_long = crate::horizon::parse(&c.note).is_long();
@@ -1092,6 +1133,22 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
             short_calls.push(pct);
         }
         all_calls.push(pct);
+        // Bucket by source. Calls from before the source axis was
+        // recorded land in a `legacy` key.
+        let src_key = if c.source.is_empty() {
+            "legacy".to_string()
+        } else {
+            c.source.clone()
+        };
+        let entry = by_source.entry(src_key).or_default();
+        entry.0.push(pct);
+        entry.1 .0 += 1;
+        match c.outcome_type.as_str() {
+            "withdrew" => entry.1 .1 += 1,
+            "failed" => entry.1 .2 += 1,
+            "expired" => entry.1 .3 += 1,
+            _ => {}
+        }
     }
 
     let mk = |pcts: &[f64], (count, wins, losses, expired): (usize, usize, usize, usize)| -> CallStatsBucket {
@@ -1124,10 +1181,16 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
         }
     };
 
+    let by_source_out: std::collections::HashMap<String, CallStatsBucket> = by_source
+        .into_iter()
+        .map(|(k, (pcts, counts))| (k, mk(&pcts, counts)))
+        .collect();
+
     CallStats {
         short: mk(&short_calls, bucket_counts[0]),
         long: mk(&long_calls, bucket_counts[1]),
         overall: mk(&all_calls, bucket_counts[2]),
+        by_source: by_source_out,
     }
 }
 

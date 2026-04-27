@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         signals_chat_id: "-1003735501034".into(), // Claudeinator channel
         ops_chat_id: "-1003869647282".into(),     // Claudeinator Chat
     };
-    let notifier = Notifier::new(cfg, db.clone())?;
+    let notifier = Notifier::new(cfg, db.clone(), None)?;
 
     println!("== digest render ==\n{}\n", notifier.render_digest_body()?);
     notifier.tick_digest_now().await?;

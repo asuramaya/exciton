@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         signals_chat_id: "-1003735501034".into(),
         ops_chat_id: "-1003869647282".into(),
     };
-    let notifier = Notifier::new(cfg, db.clone())?;
+    let notifier = Notifier::new(cfg, db.clone(), None)?;
 
     let hour_label = chrono::DateTime::from_timestamp(hour_bucket, 0)
         .map(|d| d.format("%H:00 UTC").to_string())

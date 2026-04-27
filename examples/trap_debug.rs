@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
         signals_chat_id: "-1003735501034".into(),
         ops_chat_id: "-1003869647282".into(),
     };
-    let notifier = Notifier::new(cfg, db.clone())?;
+    let notifier = Notifier::new(cfg, db.clone(), None)?;
 
     println!(
         "== hour bucket {} ({}) ==",

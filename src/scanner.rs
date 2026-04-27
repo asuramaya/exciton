@@ -696,6 +696,13 @@ impl BackgroundScanner {
                     continue;
                 }
             }
+            // Kick the publisher so the public ledger reflects the new
+            // outcome within ~30s instead of waiting for the next 300s
+            // tick. Done before the spawned TG-edit task — that task
+            // races independently and shouldn't gate the publish.
+            if let Some(ref n) = self.notifier {
+                n.kick_publisher();
+            }
 
             // Flip the TG channel card to the terminal state. update_call_outcome
             // handles all four canonical outcomes (active/withdrew/failed/expired);
