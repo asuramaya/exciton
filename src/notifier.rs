@@ -107,20 +107,13 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Extract `horizon=SHORT` or `horizon=LONG` tag from a call note.
-/// Returns (Some("SHORT TERM"), cleaned_note_without_tag) or (None, original_note).
+/// Extract horizon display string + cleaned note. Thin wrapper around
+/// the shared `crate::horizon` module — kept here only to preserve the
+/// `(Option<&'static str>, String)` shape the existing call-card
+/// renderer expects.
 fn parse_horizon_from_note(note: &str) -> (Option<&'static str>, String) {
-    let mut clean = note.to_string();
-    let horizon = if let Some(pos) = note.find("horizon=SHORT") {
-        clean = format!("{}{}", note[..pos].trim_end_matches(" · ").trim_end_matches('·').trim(), &note[pos + "horizon=SHORT".len()..]).trim().to_string();
-        Some("SHORT TERM")
-    } else if let Some(pos) = note.find("horizon=LONG") {
-        clean = format!("{}{}", note[..pos].trim_end_matches(" · ").trim_end_matches('·').trim(), &note[pos + "horizon=LONG".len()..]).trim().to_string();
-        Some("LONG TERM")
-    } else {
-        None
-    };
-    (horizon, clean)
+    let (h, clean) = crate::horizon::parse_with_clean(note);
+    (h.display(), clean)
 }
 
 fn compact_usd(v: f64) -> String {
@@ -368,6 +361,50 @@ impl Notifier {
         self.send_message_ex(chat_id, text, None).await
     }
 
+    /// Send a one-line operator-facing notification to every configured
+    /// admin user via the DM bot (Claudeinatorbot). Falls back to the
+    /// channel bot token when no dedicated DM token is set. Used by the
+    /// settling phase to push BANKED/FAILED/EXPIRED outcomes into the
+    /// operator's personal stream — the channel is public, this is for
+    /// the human running the system.
+    pub async fn dm_admins(&self, text: &str) {
+        if !self.cfg.enabled {
+            return;
+        }
+        if self.cfg.admin_user_ids.is_empty() {
+            return;
+        }
+        let token = if self.cfg.dm_bot_token.is_empty() {
+            &self.cfg.bot_token
+        } else {
+            &self.cfg.dm_bot_token
+        };
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        for uid in &self.cfg.admin_user_ids {
+            let form = vec![
+                ("chat_id", uid.to_string()),
+                ("text", text.to_string()),
+                ("parse_mode", "HTML".to_string()),
+                (
+                    "link_preview_options",
+                    r#"{"is_disabled":true}"#.to_string(),
+                ),
+            ];
+            // Best-effort: a failed admin DM (user blocked the bot,
+            // hasn't started a chat with it, etc.) shouldn't propagate
+            // back into the settling phase. Log + continue.
+            match self.http.post(&url).form(&form).send().await {
+                Ok(r) => {
+                    if !r.status().is_success() {
+                        let s = r.text().await.unwrap_or_default();
+                        tracing::warn!("dm_admins: uid {} returned {}", uid, s);
+                    }
+                }
+                Err(e) => tracing::warn!("dm_admins: uid {} send failed: {}", uid, e),
+            }
+        }
+    }
+
     async fn send_message_ex(
         &self,
         chat_id: &str,
@@ -523,6 +560,7 @@ impl Notifier {
             "withdrew" | "closed" => format!("🟢 <b>BANKED</b>{} · {}", term_label, ticker_name),
             "failed"   => format!("🔴 <b>FAILED</b>{} · {}", term_label, ticker_name),
             "expired"  => format!("⏰ <b>EXPIRED</b>{} · {}", term_label, ticker_name),
+            "voided"   => format!("⚪ <b>VOIDED</b>{} · {}", term_label, ticker_name),
             _          => format!("📣 <b>NEW CALL</b>{} · {}", term_label, ticker_name),
         };
         // Lead line. For active calls: operator's clean note (or a default
@@ -614,9 +652,28 @@ impl Notifier {
         Ok(())
     }
 
-    /// Update the call card when a position closes. Outcome: "withdrew" | "failed" | "expired".
-    /// No-op when no active delivery exists for the token.
+    /// Update the call card when a position closes. Outcome: "withdrew" |
+    /// "failed" | "expired" | "voided". No-op when no active delivery
+    /// exists for the token. Used by the settling phase + manual
+    /// /close_call. For terminal deliveries (already demoted), use
+    /// `force_update_card` instead.
     pub async fn update_call_outcome(&self, address: &str, outcome: &str, exit_pct: Option<f64>, exit_note: &str) -> anyhow::Result<()> {
+        self.apply_outcome_card(address, outcome, exit_pct, exit_note, false).await
+    }
+
+    /// Re-render a terminal delivery's card with a fresh outcome. Unlike
+    /// `update_call_outcome`, this works on already-demoted rows — used
+    /// by startup backfill to replay the outcome on cards that were
+    /// edited under the old (pre-rewrite) format or were never given a
+    /// proper verdict (voided cards from the orphan-cleanup migration).
+    /// Idempotent: re-running on a card that already shows the right
+    /// state produces a Telegram "message not modified" 400 which we
+    /// treat as success.
+    pub async fn force_update_card(&self, address: &str, outcome: &str, exit_pct: Option<f64>, exit_note: &str) -> anyhow::Result<()> {
+        self.apply_outcome_card(address, outcome, exit_pct, exit_note, true).await
+    }
+
+    async fn apply_outcome_card(&self, address: &str, outcome: &str, exit_pct: Option<f64>, exit_note: &str, force: bool) -> anyhow::Result<()> {
         if !self.cfg.enabled {
             return Ok(());
         }
@@ -627,7 +684,7 @@ impl Notifier {
         let meta_ref = meta.as_ref();
 
         let d = match self.db.get_active_delivery(address, channel)? {
-            Some(d) if d.status == "active" => d,
+            Some(d) if d.status == "active" || force => d,
             _ => return Ok(()),
         };
 
@@ -636,11 +693,35 @@ impl Notifier {
             let pct = exit_pct.map(|p| format!("{:+.1}% · ", p)).unwrap_or_default();
             format!("{}{}", pct, exit_note)
         };
-        timeline.push(TimelineEntry { ts: now, kind: outcome.to_string(), line });
+        // Don't append a duplicate timeline entry when the last one already
+        // matches — keeps idempotent backfill from growing the timeline on
+        // every restart.
+        let is_dup = timeline
+            .last()
+            .map(|e| e.kind == outcome && e.line == line)
+            .unwrap_or(false);
+        if !is_dup {
+            timeline.push(TimelineEntry { ts: now, kind: outcome.to_string(), line: line.clone() });
+        }
 
         let html = self.render_call_card(address, meta_ref, &timeline, outcome, exit_note);
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
-        self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await?;
+        // Soft-error on edits: when re-running a backfill we may hit
+        // "message is not modified" or "message to edit not found"
+        // (channel scrubbed). Log and continue rather than aborting the
+        // whole pass.
+        if let Err(e) = self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await {
+            let s = format!("{}", e);
+            if s.contains("not modified") {
+                // Already in the right state — continue and persist
+                // the timeline entry if we added one.
+            } else if force && (s.contains("message to edit not found") || s.contains("MESSAGE_ID_INVALID")) {
+                tracing::info!("force_update_card: msg_id {} no longer exists for {}, skipping", d.message_id, address);
+                return Ok(());
+            } else {
+                return Err(e);
+            }
+        }
 
         let timeline_json = serde_json::to_string(&timeline)?;
         let price = meta_ref.and_then(|m| m.price_usd);
@@ -768,10 +849,11 @@ impl Notifier {
                 // can still override via /close_call. The settling phase
                 // reads this tag on every cycle; missing tag = SHORT.
                 let auto_horizon = if mcap >= 1_000_000.0 {
-                    "horizon=LONG"
+                    crate::horizon::Horizon::Long
                 } else {
-                    "horizon=SHORT"
+                    crate::horizon::Horizon::Short
                 };
+                let auto_horizon_tag = auto_horizon.tag().unwrap_or("");
                 let inserted = self.db.insert_call(
                     &a.address,
                     &sym,
@@ -783,19 +865,18 @@ impl Notifier {
                     liq,
                     a.top_holder_pct,
                     &dex,
-                    auto_horizon,
+                    auto_horizon_tag,
                     "notifier",
                 );
                 if let Ok(Some(_)) = inserted {
                     // Align expires_at with the horizon-based settling window
                     // (scanner::settle_calls). Without this, the UI badges a
                     // misleading "13d left" on every call while the settling
-                    // phase actually closes SHORT at 6h. Backstop: 14d for
-                    // unknown horizon (legacy fallback).
+                    // phase actually closes SHORT at 6h.
                     let window_secs: i64 = match auto_horizon {
-                        "horizon=SHORT" => 6 * 3600,        // 6h SHORT
-                        "horizon=LONG" => 30 * 86_400,      // 30d LONG
-                        _ => 14 * 86_400,                   // 14d backstop
+                        crate::horizon::Horizon::Short => 6 * 3600,
+                        crate::horizon::Horizon::Long => 30 * 86_400,
+                        crate::horizon::Horizon::Unknown => 14 * 86_400,
                     };
                     let expires = now + window_secs;
                     let _ = self.db.set_call_expiration(&a.address, Some(expires));

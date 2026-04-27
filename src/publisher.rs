@@ -728,11 +728,17 @@ impl Publisher {
         CallsFile { active, history, stats }
     }
 
-    /// For each active call, emit a one-shot scout receipt that freezes the
-    /// evidence bundle near call-time. Overwrites only when the active call
-    /// row changes, so a reopened mint gets a fresh receipt.
+    /// For every call (active + closed), emit a one-shot scout receipt
+    /// that freezes the evidence bundle as close to call-time as possible.
+    /// Iterating history too lets fast-closed calls (settled before the
+    /// next publisher tick caught them in `active`) still get a scout
+    /// written from current state — better than nothing for the per-call
+    /// detail page. Idempotent via the `call_id` field on the existing
+    /// JSON: same call_id present → skip. Closed-call scouts are
+    /// post-mortem snapshots, not entry-state, so the file's
+    /// `captured_at` timestamp tells the reader when it was taken.
     async fn publish_call_scout_snapshots(&self, calls: &CallsFile, data_dir: &Path) {
-        if calls.active.is_empty() {
+        if calls.active.is_empty() && calls.history.is_empty() {
             return;
         }
         let scouts_dir = data_dir.join("scouts");
@@ -740,7 +746,7 @@ impl Publisher {
             tracing::warn!("publisher: create scouts dir: {}", e);
             return;
         }
-        for call in &calls.active {
+        for call in calls.active.iter().chain(calls.history.iter()) {
             let path = scouts_dir.join(format!("{}.json", call.mint));
             let existing: serde_json::Value = read_json(&path).unwrap_or_default();
             let existing_call_id = existing.get("call_id").and_then(|v| v.as_i64());
@@ -837,7 +843,7 @@ impl Publisher {
     /// trace + LP status. Lets the public verify the thesis in the same
     /// primitives we use in-session. Write to data/whales/<mint>.json.
     async fn publish_whale_snapshots(&self, calls: &CallsFile, data_dir: &Path) {
-        if calls.active.is_empty() {
+        if calls.active.is_empty() && calls.history.is_empty() {
             return;
         }
         let whales_dir = data_dir.join("whales");
@@ -845,7 +851,18 @@ impl Publisher {
             tracing::warn!("publisher: create whales dir: {}", e);
             return;
         }
-        for call in &calls.active {
+        // One-shot receipts, mirror of `publish_call_scout_snapshots`. Walk
+        // active + history. Skip when an existing JSON already records this
+        // call_id — same idempotency contract. Without this, every tick
+        // hammered RPCs for `whale_trace` + `lp_check` per active call,
+        // overwrote the file, and closed calls' snapshots were lost.
+        for call in calls.active.iter().chain(calls.history.iter()) {
+            let path = whales_dir.join(format!("{}.json", call.mint));
+            let existing: serde_json::Value = read_json(&path).unwrap_or_default();
+            let existing_call_id = existing.get("call_id").and_then(|v| v.as_i64());
+            if existing_call_id == Some(call.id) {
+                continue;
+            }
             let whales = crate::scout::whale_trace(&call.mint, &self.rpc)
                 .await
                 .unwrap_or_default();
@@ -866,13 +883,13 @@ impl Publisher {
                 None
             };
             let payload = serde_json::json!({
+                "call_id": call.id,
                 "mint": call.mint,
                 "symbol": call.symbol,
-                "snapshot_ts": chrono::Utc::now().timestamp(),
+                "captured_at": chrono::Utc::now().timestamp(),
                 "whales": whales,
                 "lp": lp,
             });
-            let path = whales_dir.join(format!("{}.json", call.mint));
             if let Err(e) = std::fs::write(
                 &path,
                 serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
@@ -1057,7 +1074,7 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
 
     for c in history {
         let Some(pct) = c.pct_from_call else { continue };
-        let is_long = c.note.contains("horizon=LONG");
+        let is_long = crate::horizon::parse(&c.note).is_long();
         let bucket_idx = if is_long { 1 } else { 0 };
         // Update both per-horizon and overall buckets.
         for &i in &[bucket_idx, 2] {

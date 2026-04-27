@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::discovery;
+use crate::horizon;
 use crate::ingester::RpcRouter;
 use crate::notifier::Notifier;
 use crate::signals;
@@ -96,6 +97,89 @@ impl BackgroundScanner {
         }
     }
 
+    /// One-shot startup pass that re-renders TG cards for terminal calls
+    /// whose deliveries are demoted with stale content. Two cohorts:
+    ///   - Voided calls from the orphan-cleanup migration (header still
+    ///     reads SIGNAL · active or FAILED with no verdict line).
+    ///   - Closed calls from before the caller-voice + settling rewrite
+    ///     (header reads FAILED but with old robot-voice body).
+    /// `force_update_card` is idempotent: when the card already shows
+    /// the right state Telegram returns 400 "message is not modified"
+    /// which the notifier treats as success.
+    async fn backfill_terminal_deliveries(&self) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        let calls = match self.db.list_calls(false, 200) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("backfill: list_calls failed: {}", e);
+                return;
+            }
+        };
+        let mut count = 0usize;
+        for c in calls {
+            // Skip active calls — those cards are managed by the live loop.
+            if c.status == "active" {
+                continue;
+            }
+            // Map to canonical outcome string + a verdict that reads
+            // sensibly even if exit_note is missing or stale.
+            let (outcome, exit_note): (&str, String) = match c.status.as_str() {
+                "withdrew" | "closed" => (
+                    "withdrew",
+                    c.exit_note
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "closed".to_string()),
+                ),
+                "failed" => (
+                    "failed",
+                    c.exit_note
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "thesis broke".to_string()),
+                ),
+                "expired" => (
+                    "expired",
+                    c.exit_note
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "expired".to_string()),
+                ),
+                "voided" => (
+                    "voided",
+                    "administrative cleanup — not a market verdict".to_string(),
+                ),
+                _ => continue,
+            };
+            // Skip when the call has no delivery row at all (manual call
+            // that never reached the channel, or a row pre-dating the
+            // delivery system).
+            let has_delivery = self
+                .db
+                .get_active_delivery(&c.mint, "winners")
+                .map(|o| o.is_some())
+                .unwrap_or(false);
+            if !has_delivery {
+                continue;
+            }
+            match notifier
+                .force_update_card(&c.mint, outcome, None, &exit_note)
+                .await
+            {
+                Ok(_) => count += 1,
+                Err(e) => tracing::warn!("backfill: force_update_card {} failed: {}", c.mint, e),
+            }
+            // Light pacing — Telegram caps at 30 edits/sec/bot. 200ms
+            // keeps us well under, and the backfill only runs once.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if count > 0 {
+            tracing::info!("backfill: re-rendered {} terminal card(s)", count);
+        }
+    }
+
     /// Start the background scan loop. Returns a handle to stop it.
     pub fn start(self) -> ScannerHandle {
         let running = self.running.clone();
@@ -129,6 +213,13 @@ impl BackgroundScanner {
         // restarted after a watchlist deactivation but before the auto-fail
         // hook ran. Without this, they sit open forever.
         self.cleanup_orphaned_calls().await;
+
+        // One-shot card backfill: walk closed calls whose TG delivery never
+        // got a proper outcome edit (voided cards from orphan-cleanup, old
+        // demote/FAILED flips from the should_fail data-glitch era), and
+        // re-render with the current caller-voice format + correct verdict
+        // header. Idempotent — re-runs are no-ops once the channel is clean.
+        self.backfill_terminal_deliveries().await;
 
         let mut cycle = 0u64;
         while self.running.load(AtomicOrdering::SeqCst) {
@@ -529,10 +620,10 @@ impl BackgroundScanner {
         }
         let now = chrono::Utc::now().timestamp();
         for call in active {
-            // Horizon parsing — substring match keeps this independent of
-            // the notifier's parse_horizon_from_note (which also strips the
-            // tag for display, irrelevant here).
-            let is_long = call.note.contains("horizon=LONG");
+            // Horizon parsing via the shared module. Default-on-Unknown
+            // is SHORT (the auto-call default; manual operator calls
+            // always tag explicitly).
+            let is_long = horizon::parse(&call.note).is_long();
             let market = crate::market::get_market(&call.mint).await.ok().flatten();
             let current_price = market.as_ref().map(|m| m.price_usd).unwrap_or(0.0);
             // No reliable price → nothing to settle on. Could happen during
@@ -606,8 +697,12 @@ impl BackgroundScanner {
             // Flip the TG channel card to the terminal state. update_call_outcome
             // handles all four canonical outcomes (active/withdrew/failed/expired);
             // we pass the same status verbatim so the card header matches the DB.
+            // Same task also DMs the operator(s) a one-line notification via
+            // Claudeinatorbot — channel is for the audience, DM is for the human
+            // running the system.
             if let Some(ref n) = self.notifier {
                 let mint = call.mint.clone();
+                let symbol = call.symbol.clone();
                 let n = n.clone();
                 let note = exit_note.clone();
                 let status_owned = status.to_string();
@@ -619,6 +714,25 @@ impl BackgroundScanner {
                     {
                         tracing::warn!("settle: update_call_outcome failed for {}: {}", mint, e);
                     }
+                    let icon = match status_owned.as_str() {
+                        "withdrew" => "🟢",
+                        "failed" => "🔴",
+                        "expired" => "⏰",
+                        _ => "·",
+                    };
+                    let label = match status_owned.as_str() {
+                        "withdrew" => "banked",
+                        "failed" => "failed",
+                        "expired" => "expired",
+                        _ => status_owned.as_str(),
+                    };
+                    let sym_for_dm = if symbol.is_empty() {
+                        format!("{}…{}", &mint[..mint.len().min(4)], &mint[mint.len().saturating_sub(4)..])
+                    } else {
+                        format!("${}", symbol)
+                    };
+                    let dm = format!("{} <b>{}</b> {} {}", icon, sym_for_dm, label, note);
+                    n.dm_admins(&dm).await;
                 });
             }
         }

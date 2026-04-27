@@ -9,6 +9,7 @@ mod db;
 mod discovery;
 mod execution;
 mod forecaster;
+mod horizon;
 mod image_gen;
 mod ingester;
 mod intel;

@@ -1033,12 +1033,10 @@ impl DmBot {
         // Horizon-aware expiry: SHORT calls auto-settle at 6h, LONG at 30d
         // (matches scanner::settle_calls thresholds). Configured
         // `call_expiry_days` is the unknown-horizon backstop only.
-        let window_secs: i64 = if full_note.contains("horizon=SHORT") {
-            6 * 3600
-        } else if full_note.contains("horizon=LONG") {
-            30 * 86_400
-        } else {
-            self.call_expiry_days.max(0) * 86_400
+        let window_secs: i64 = match crate::horizon::parse(&full_note) {
+            crate::horizon::Horizon::Short => 6 * 3600,
+            crate::horizon::Horizon::Long => 30 * 86_400,
+            crate::horizon::Horizon::Unknown => self.call_expiry_days.max(0) * 86_400,
         };
         let expires_at = if window_secs > 0 {
             Some(called_at + window_secs)
@@ -1172,11 +1170,9 @@ impl DmBot {
             };
             let age_h = (now - c.called_at) / 3600;
 
-            // Parse horizon term from stored note ("horizon=SHORT" / "horizon=LONG")
-            let term = if c.note.contains("horizon=LONG") {
-                " LONG"
-            } else {
-                " SHORT"
+            let term = match crate::horizon::parse(&c.note) {
+                crate::horizon::Horizon::Long => " LONG",
+                _ => " SHORT", // Unknown defaults to SHORT (auto-call default)
             };
 
             let pnl_str = if let Some(m) = markets.get(&c.mint) {

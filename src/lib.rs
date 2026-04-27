@@ -4,6 +4,7 @@ pub mod db;
 pub mod discovery;
 pub mod execution;
 pub mod forecaster;
+pub mod horizon;
 pub mod image_gen;
 pub mod ingester;
 pub mod intel;
