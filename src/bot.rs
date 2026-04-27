@@ -1911,6 +1911,51 @@ impl DmBot {
         let now = chrono::Utc::now().timestamp();
         let mut ctx = String::new();
 
+        // Settling rules — embedded so claw can answer "how does a call
+        // close?" without making things up. Mirrors scanner::settle_calls.
+        ctx.push_str(
+            "SETTLING RULES (the lifecycle, source of truth):\n\
+            \  SHORT horizon (auto-call default for sub-$1M mcap):\n\
+            \    +100% → withdrew · 2x done\n\
+            \    +50%  → withdrew · took the win\n\
+            \    -25% within first 30min → failed · early collapse\n\
+            \    -40% any time → failed · thesis broke\n\
+            \    tx_rate ≤10% of entry across 2 snapshots → withdrew · energy gone\n\
+            \    age ≥6h with none of above → expired · no follow-through\n\
+            \  LONG horizon (auto for ≥$1M mcap, or operator-tagged):\n\
+            \    -70% → failed · thesis broke\n\
+            \    age ≥30d → expired · 30d hold complete\n\
+            \    no auto-take-profit; operator settles via /close_call\n\
+            \  Statuses: active | withdrew (🟢 BANKED) | failed (🔴) | expired (⏰) | voided (⚪ admin cleanup, not a market verdict)\n\n",
+        );
+
+        // Aggregate stats — gives claw a track-record summary without
+        // reading every history row.
+        let history_for_stats = self.db.list_calls(false, 200).unwrap_or_default();
+        let closed_with_pct: Vec<_> = history_for_stats
+            .iter()
+            .filter(|c| c.status != "active" && c.status != "voided" && c.entry_price_usd > 0.0 && c.exit_price_usd.unwrap_or(0.0) > 0.0)
+            .collect();
+        if !closed_with_pct.is_empty() {
+            let pcts: Vec<f64> = closed_with_pct
+                .iter()
+                .map(|c| (c.exit_price_usd.unwrap() / c.entry_price_usd - 1.0) * 100.0)
+                .collect();
+            let wins = closed_with_pct.iter().filter(|c| c.status == "withdrew" || c.status == "closed").count();
+            let losses = closed_with_pct.iter().filter(|c| c.status == "failed").count();
+            let win_rate = if wins + losses > 0 {
+                wins as f64 / (wins + losses) as f64 * 100.0
+            } else {
+                0.0
+            };
+            let best = pcts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let worst = pcts.iter().cloned().fold(f64::INFINITY, f64::min);
+            ctx.push_str(&format!(
+                "STATS: {} closed · {} wins / {} losses · {:.0}% win rate · best {:+.1}% · worst {:+.1}%\n\n",
+                closed_with_pct.len(), wins, losses, win_rate, best, worst,
+            ));
+        }
+
         // Active calls
         let calls = self.db.list_calls(true, 10).unwrap_or_default();
         if calls.is_empty() {
@@ -2018,6 +2063,60 @@ impl DmBot {
                 }
                 ctx.push('\n');
             }
+
+            // Call-history context for the referenced mint: have we
+            // ever called it? What's the journey if we did?
+            if let Ok(rows) = self.db.list_calls(false, 200) {
+                let mine: Vec<_> = rows.iter().filter(|c| c.mint == addr).collect();
+                if !mine.is_empty() {
+                    ctx.push_str("CALL HISTORY FOR THIS MINT:\n");
+                    for c in &mine {
+                        let sym = if c.symbol.is_empty() { short_mint(&c.mint) } else { format!("${}", c.symbol) };
+                        let pct = if c.entry_price_usd > 0.0 && c.exit_price_usd.unwrap_or(0.0) > 0.0 {
+                            format!(" pct={:+.1}%", (c.exit_price_usd.unwrap() / c.entry_price_usd - 1.0) * 100.0)
+                        } else {
+                            String::new()
+                        };
+                        ctx.push_str(&format!(
+                            "  {} status={}{}{}\n",
+                            sym, c.status, pct,
+                            c.exit_note.as_deref().map(|s| format!(" exit_note=\"{}\"", s)).unwrap_or_default(),
+                        ));
+                    }
+                    ctx.push('\n');
+                }
+            }
+
+            // Classification trajectory from snapshots — last 6 distinct
+            // class flips. Helps claw read whether the token is in
+            // accumulation, breakdown, or trap territory.
+            if let Ok(snaps) = self.db.get_snapshot_history(&addr, 30) {
+                let mut prev_class: Option<String> = None;
+                let mut flips: Vec<String> = Vec::new();
+                for s in &snaps {
+                    if Some(&s.classification) != prev_class.as_ref() {
+                        flips.push(format!(
+                            "  {} {} (top {:.1}% conf {})",
+                            chrono::DateTime::from_timestamp(s.timestamp, 0)
+                                .map(|d| d.format("%H:%M").to_string())
+                                .unwrap_or_default(),
+                            s.classification, s.top_holder_pct, s.confidence,
+                        ));
+                        prev_class = Some(s.classification.clone());
+                    }
+                    if flips.len() >= 6 {
+                        break;
+                    }
+                }
+                if !flips.is_empty() {
+                    ctx.push_str("CLASSIFICATION TIMELINE (newest first):\n");
+                    for line in &flips {
+                        ctx.push_str(line);
+                        ctx.push('\n');
+                    }
+                    ctx.push('\n');
+                }
+            }
         }
 
         ctx
@@ -2026,21 +2125,32 @@ impl DmBot {
 
 // -- Claw helpers -----------------------------------------------------------
 
+/// System prompt for every claw ask path (zeroclaw, Anthropic, OpenAI).
+/// Teaches the new vocab + lifecycle so claw doesn't explain the system
+/// wrong. The live runtime state (active calls, stats, snapshot timeline,
+/// etc.) gets appended per-call via build_claw_context.
+const CLAW_SYSTEM_PROMPT: &str = "\
+You are the Claw — the AI embedded in MadApe, an autonomous Solana signal system.\n\
+You scan the chain in real time, classify tokens, and manage open positions called calls.\n\
+You operate in the DeFi trenches. Speak directly. No disclaimers, no hedging.\n\
+Give your actual read on the market, positions, or a specific token.\n\
+Keep it tight — 2 to 4 short paragraphs. Plain text only, no markdown, no asterisks.\n\n\
+SYSTEM VOCABULARY (use these terms exactly when discussing the system):\n\
+- A `call` is a public commitment to a token. Each call has a `horizon`: SHORT (memecoin pumps, settles fast) or LONG (slow-burn theses, ~30 day window).\n\
+- Lifecycle outcomes: `active` (live), `withdrew` (🟢 BANKED, took profit), `failed` (🔴 thesis broke), `expired` (⏰ timeout reached), `voided` (⚪ admin cleanup, NOT a market verdict — never blame the market for these).\n\
+- The settling phase auto-closes calls per horizon-aware rules. SHORT triggers: +50% / +100% withdrew, -25% in first 30min OR -40% any time failed, tx_rate ≤10% of entry over 2 snaps `withdrew energy gone`, 6h timeout expired. LONG triggers: -70% failed, 30d timeout expired.\n\
+- Token classifications: STAIRCASE (stair-step accumulation), GRINDER (slow accumulation), SPRING (compression breakout), SURGE (sharp lift), DEVELOPING (early base building), CRASHING (rolling over), DEAD (no flow), ACTIVE_TRAP (distribution collapsed = looks like a trap), UNSAFE:* (on-chain confirmed honeypot — never touch).\n\
+- Auto-call gate floors: liquidity ≥ $20k, 24h volume ≥ $50k, age ≥ 1h, top_holder < 20%, momentum_delta ≥ 0, classification ∈ {STAIRCASE, GRINDER, SPRING}, effective confidence ≥ 75.\n\
+- Auto-call horizon heuristic: entry mcap ≥ $1M tags LONG, otherwise SHORT.\n\
+- Sources: `notifier` = bot auto-call, `dm` = operator /call, `mcp` = claw-issued.";
+
 async fn claw_ask(
     http: &reqwest::Client,
     api_key: &str,
     context: &str,
     question: &str,
 ) -> Result<String> {
-    let system = format!(
-        "You are the Claw — the AI embedded in MadApe, an autonomous Solana signal system.\n\
-         You scan the chain in real time, classify tokens, and manage open positions called calls.\n\
-         You operate in the DeFi trenches. Speak directly. No disclaimers, no hedging.\n\
-         Give your actual read on the market, positions, or a specific token.\n\
-         Keep it tight — 2 to 4 short paragraphs. Plain text only, no markdown, no asterisks.\n\n\
-         Live system state:\n{}",
-        context
-    );
+    let system = format!("{}\n\nLive system state:\n{}", CLAW_SYSTEM_PROMPT, context);
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 600,
@@ -2073,15 +2183,7 @@ async fn claw_ask_openai(
     context: &str,
     question: &str,
 ) -> Result<String> {
-    let system = format!(
-        "You are the Claw — the AI embedded in MadApe, an autonomous Solana signal system.\n\
-         You scan the chain in real time, classify tokens, and manage open positions called calls.\n\
-         You operate in the DeFi trenches. Speak directly. No disclaimers, no hedging.\n\
-         Give your actual read on the market, positions, or a specific token.\n\
-         Keep it tight — 2 to 4 short paragraphs. Plain text only, no markdown, no asterisks.\n\n\
-         Live system state:\n{}",
-        context
-    );
+    let system = format!("{}\n\nLive system state:\n{}", CLAW_SYSTEM_PROMPT, context);
     let body = serde_json::json!({
         "model": "gpt-4o-mini",
         "max_tokens": 600,
@@ -2111,16 +2213,17 @@ async fn claw_ask_openai(
 }
 
 async fn claw_ask_zeroclaw(http: &reqwest::Client, context: &str, question: &str) -> Result<String> {
+    // zeroclaw takes a single message blob (no system role separately).
+    // Pack the canonical CLAW_SYSTEM_PROMPT + live context + question.
     let message = format!(
-        "You are the Claw — the AI embedded in MadApe, an autonomous Solana signal system.\n\
-         You scan the chain in real time, classify tokens, and manage open positions called calls.\n\
-         You operate in the DeFi trenches. Speak directly. No disclaimers, no hedging.\n\
-         Give your actual read on the market, positions, or a specific token.\n\
-         Keep it tight — 2 to 4 short paragraphs. Plain text only, no markdown, no JSON, no asterisks.\n\
+        "{system}\n\
          No tools are available — do NOT generate <tool_call> blocks or any function call syntax.\n\
          Reason from the context below and answer directly in prose.\n\n\
          Live system state:\n{context}\n\
-         Question: {question}"
+         Question: {question}",
+        system = CLAW_SYSTEM_PROMPT,
+        context = context,
+        question = question,
     );
     let body = serde_json::json!({ "message": message });
     let resp = http
@@ -2273,16 +2376,14 @@ pub async fn serve_claw_api(
             };
             let _ = (header_end, content_length); // consumed above
             let first_line = headers_part.lines().next().unwrap_or("");
-            if !first_line.starts_with("POST /api/claw") {
-                let resp = if first_line.starts_with("OPTIONS") {
-                    "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Claw-Secret\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nContent-Length: 0\r\n\r\n"
-                } else {
-                    "HTTP/1.1 404 Not Found\r\n\r\n"
-                };
-                let _ = stream.write_all(resp.as_bytes()).await;
+            // CORS preflight — common to all routes.
+            if first_line.starts_with("OPTIONS") {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, X-Claw-Secret\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Length: 0\r\n\r\n")
+                    .await;
                 return;
             }
-            // Check secret header
+            // Check secret header — applies to all routes.
             let header_secret = headers_part
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("x-claw-secret:"))
@@ -2290,6 +2391,101 @@ pub async fn serve_claw_api(
                 .unwrap_or_default();
             if header_secret != *secret {
                 let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\n\r\n").await;
+                return;
+            }
+            // Read-only state endpoints — let claw + future integrations
+            // query the live runtime without going through the chat path.
+            // Same secret auth as /api/claw.
+            if first_line.starts_with("GET /api/state/") {
+                let route = first_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .split('?')
+                    .next()
+                    .unwrap_or("/");
+                let body: serde_json::Value = match route {
+                    "/api/state/calls/active" => {
+                        let rows = db.list_calls(true, 50).unwrap_or_default();
+                        serde_json::json!({ "calls": rows })
+                    }
+                    "/api/state/stats" => {
+                        // Compute the same horizon/source axis the publisher emits.
+                        let rows = db.list_calls(false, 200).unwrap_or_default();
+                        let closed: Vec<_> = rows
+                            .iter()
+                            .filter(|c| c.status != "active" && c.status != "voided" && c.entry_price_usd > 0.0 && c.exit_price_usd.unwrap_or(0.0) > 0.0)
+                            .collect();
+                        let pcts: Vec<f64> = closed.iter().map(|c| (c.exit_price_usd.unwrap() / c.entry_price_usd - 1.0) * 100.0).collect();
+                        let wins = closed.iter().filter(|c| c.status == "withdrew" || c.status == "closed").count();
+                        let losses = closed.iter().filter(|c| c.status == "failed").count();
+                        let expired = closed.iter().filter(|c| c.status == "expired").count();
+                        let win_rate = if wins + losses > 0 { wins as f64 / (wins + losses) as f64 * 100.0 } else { 0.0 };
+                        let best = pcts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let worst = pcts.iter().cloned().fold(f64::INFINITY, f64::min);
+                        serde_json::json!({
+                            "count": closed.len(),
+                            "wins": wins, "losses": losses, "expired": expired,
+                            "win_rate_pct": win_rate,
+                            "best_pct": if best.is_finite() { best } else { 0.0 },
+                            "worst_pct": if worst.is_finite() { worst } else { 0.0 },
+                        })
+                    }
+                    "/api/state/settle-rules" => {
+                        // Hardcoded mirror of scanner::settle_calls. Static
+                        // until the rules become config-driven.
+                        serde_json::json!({
+                            "short": {
+                                "horizon": "SHORT",
+                                "default_for": "auto-call entries < $1M mcap",
+                                "triggers": [
+                                    { "trigger": "+100%", "outcome": "withdrew", "verdict": "2x done" },
+                                    { "trigger": "+50%",  "outcome": "withdrew", "verdict": "took the win" },
+                                    { "trigger": "-25% within first 30min", "outcome": "failed", "verdict": "early collapse" },
+                                    { "trigger": "-40%", "outcome": "failed", "verdict": "thesis broke" },
+                                    { "trigger": "tx_rate ≤10% of entry, 2 consecutive snapshots", "outcome": "withdrew", "verdict": "energy gone" },
+                                    { "trigger": "age ≥6h", "outcome": "expired", "verdict": "no follow-through" }
+                                ]
+                            },
+                            "long": {
+                                "horizon": "LONG",
+                                "default_for": "auto-call entries ≥ $1M mcap; operator /call <mint> long",
+                                "triggers": [
+                                    { "trigger": "-70%", "outcome": "failed", "verdict": "thesis broke" },
+                                    { "trigger": "age ≥30d", "outcome": "expired", "verdict": "30d hold complete" }
+                                ]
+                            }
+                        })
+                    }
+                    other if other.starts_with("/api/state/calls/") => {
+                        // /api/state/calls/<mint>
+                        let mint = other.trim_start_matches("/api/state/calls/").trim_end_matches('/');
+                        if mint.is_empty() {
+                            serde_json::json!({ "error": "missing mint" })
+                        } else {
+                            let rows = db.list_calls(false, 200).unwrap_or_default();
+                            let row = rows.into_iter().find(|c| c.mint == mint);
+                            match row {
+                                Some(c) => {
+                                    let snaps = db.get_snapshot_history(mint, 50).unwrap_or_default();
+                                    serde_json::json!({ "call": c, "snapshots": snaps })
+                                }
+                                None => serde_json::json!({ "error": "not found" }),
+                            }
+                        }
+                    }
+                    _ => serde_json::json!({ "error": "unknown route" }),
+                };
+                let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                    body_str.len(), body_str
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                return;
+            }
+            if !first_line.starts_with("POST /api/claw") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
                 return;
             }
             // Parse JSON body
