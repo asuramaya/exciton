@@ -107,9 +107,28 @@ struct StreamEvent {
     signature: Option<String>,
 }
 
+/// Per-mint metadata bundle attached to the stream file. The client groups
+/// events by mint and uses this for the token-card header (symbol, current
+/// mcap, 1h change). Avoids per-event duplication and lets the client
+/// fold runs of repetitive same-token alerts (e.g. "DEV SELLING" rolling
+/// updates) under one collapsible card.
+#[derive(Debug, Serialize, Default, Clone)]
+struct StreamTokenInfo {
+    symbol: Option<String>,
+    name: Option<String>,
+    mcap_usd: Option<f64>,
+    price_usd: Option<f64>,
+    price_change_1h: Option<f64>,
+    price_change_24h: Option<f64>,
+    liquidity_usd: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 struct StreamFile {
     events: Vec<StreamEvent>,
+    /// mint → token info, populated for every distinct mint present in
+    /// `events`. Empty map when no mints were referenced.
+    tokens: std::collections::HashMap<String, StreamTokenInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -536,7 +555,38 @@ impl Publisher {
         // Sort newest first, cap at 50.
         events.sort_by(|a, b| b.ts.cmp(&a.ts));
         events.truncate(50);
-        StreamFile { events }
+
+        // Enrich each distinct mint with current market metadata. The
+        // client uses this for the token-card header in the live feed —
+        // symbol, mcap, 1h change. Cached via market::get_market so this
+        // adds at most one DexScreener fetch per distinct mint per tick.
+        let mut tokens: std::collections::HashMap<String, StreamTokenInfo> =
+            std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for ev in &events {
+            if let Some(mint) = &ev.mint {
+                if !seen.insert(mint.clone()) {
+                    continue;
+                }
+                if let Ok(Some(m)) = market::get_market(mint).await {
+                    tokens.insert(
+                        mint.clone(),
+                        StreamTokenInfo {
+                            symbol: Some(m.symbol.clone()).filter(|s| !s.is_empty()),
+                            name: Some(m.name.clone()).filter(|s| !s.is_empty()),
+                            mcap_usd: if m.mcap_usd > 0.0 { Some(m.mcap_usd) } else { None },
+                            price_usd: Some(m.price_usd).filter(|p| *p > 0.0),
+                            price_change_1h: Some(m.price_change_h1).filter(|v| *v != 0.0),
+                            price_change_24h: None,
+                            liquidity_usd: Some(m.liquidity_usd).filter(|v| *v > 0.0),
+                        },
+                    );
+                }
+            }
+        }
+
+        StreamFile { events, tokens }
     }
 
     async fn build_calls_file(&self) -> CallsFile {
