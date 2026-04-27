@@ -405,6 +405,31 @@ impl Db {
             [],
         );
 
+        // Bonding-curve observation snapshots. Pre-graduation pump.fun
+        // tokens have no DexScreener pair, so token_snapshots can't hold
+        // their state. We track them here from chain reads of the curve
+        // PDA. Each row is a 60s-cadence sample of one curve. After the
+        // token graduates the row stream stops; downstream gates fall
+        // back to the existing token_snapshots feed.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS curve_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                virtual_sol REAL NOT NULL,
+                virtual_tok REAL NOT NULL,
+                real_sol REAL NOT NULL,
+                real_tok REAL NOT NULL,
+                price_sol REAL NOT NULL,
+                fill_pct REAL NOT NULL,
+                complete INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_curve_mint_ts
+                ON curve_snapshots(mint, timestamp DESC);
+            ",
+        )?;
+
         Ok(())
     }
 
@@ -846,6 +871,91 @@ impl Db {
     /// haven't had a snapshot in the last `recent_snapshot_cutoff` seconds.
     /// Used by Phase 4 re-ingest to catch tokens that were too young/concentrated
     /// at first sight but may have since matured.
+    /// Mints to poll for bonding-curve state. Pump.fun tokens whose
+    /// first_seen is within `max_age_secs`, that haven't been recorded
+    /// as `complete` yet (`real_sol < graduation_target` AND no row
+    /// with complete=1). Cap at `limit`.
+    pub fn list_curve_observation_candidates(
+        &self,
+        max_age_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let oldest = now - max_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT t.address FROM tokens t
+             WHERE t.first_seen >= ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM curve_snapshots c
+                 WHERE c.mint = t.address AND c.complete = 1
+               )
+             ORDER BY t.first_seen DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![oldest, limit], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Persist one bonding-curve snapshot.
+    pub fn insert_curve_snapshot(
+        &self,
+        mint: &str,
+        ts: i64,
+        virtual_sol: f64,
+        virtual_tok: f64,
+        real_sol: f64,
+        real_tok: f64,
+        price_sol: f64,
+        fill_pct: f64,
+        complete: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO curve_snapshots
+             (mint, timestamp, virtual_sol, virtual_tok, real_sol, real_tok,
+              price_sol, fill_pct, complete)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                mint, ts, virtual_sol, virtual_tok, real_sol, real_tok,
+                price_sol, fill_pct, if complete { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent N curve snapshots for a mint, newest first. Used by
+    /// the curve-stage gate to compute velocity (Δreal_sol / Δt).
+    pub fn get_recent_curve_snapshots(
+        &self,
+        mint: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, f64, f64, f64, bool)>> {
+        // (timestamp, real_sol, price_sol, fill_pct, complete)
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, real_sol, price_sol, fill_pct, complete
+             FROM curve_snapshots
+             WHERE mint = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![mint, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_stale_discovered_candidates(
         &self,
         age_min_secs: i64,

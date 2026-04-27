@@ -3,6 +3,7 @@ use rmcp::ServiceExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod bonding_curve;
 mod bot;
 mod config;
 mod db;

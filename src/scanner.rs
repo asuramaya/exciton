@@ -573,6 +573,14 @@ impl BackgroundScanner {
         // open while mOK's -98% never resolved.
         self.settle_calls().await;
 
+        // Phase 6: Bonding-curve observation. For pump.fun mints in their
+        // first hour of life (pre-graduation), poll the curve PDA, persist
+        // virtual/real reserves to curve_snapshots. Cheap: one batched
+        // getMultipleAccounts call covers up to 50 curves per cycle. Drives
+        // pre-graduation calling that DexScreener can't see (the 0→$1M
+        // ride). Drops out automatically once curve.complete=true.
+        self.observe_bonding_curves().await;
+
         // Tick the hourly digest — notifier dedups by hour bucket internally,
         // so calling once per cycle is safe and self-pacing.
         if let Some(n) = &self.notifier {
@@ -610,6 +618,71 @@ impl BackgroundScanner {
     /// needs the entry tx_rate persisted on the call row, which it isn't
     /// today. The +50% / -40% / 6h envelope already settles the noise; an
     /// explicit velocity rule is a refinement.
+    /// Phase 6: poll bonding-curve PDAs for newly-discovered pump.fun
+    /// tokens. Persists each observation to `curve_snapshots`. The
+    /// candidate query already excludes graduated mints (curve.complete=1),
+    /// so this naturally drops the curve once it bonds out and the
+    /// post-grad pipeline (Phase 1+2b) takes over. Batch-fetches up to
+    /// 50 curves per cycle via getMultipleAccounts — bounded RPC cost.
+    async fn observe_bonding_curves(&self) {
+        // Token must be young enough to plausibly still be on the curve.
+        // 90min is generous; most pump.fun runs graduate within ~30min
+        // when they're going to graduate at all.
+        const MAX_AGE_SECS: i64 = 90 * 60;
+        const PER_CYCLE_LIMIT: usize = 50;
+        let candidates = match self
+            .db
+            .list_curve_observation_candidates(MAX_AGE_SECS, PER_CYCLE_LIMIT)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("curve-observe: list candidates failed: {}", e);
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let states = match crate::bonding_curve::fetch_curves_batch(&candidates, &self.rpc).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("curve-observe: batch fetch failed: {}", e);
+                return;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut written = 0usize;
+        let mut graduated = 0usize;
+        for (mint, state_opt) in candidates.iter().zip(states.iter()) {
+            let Some(state) = state_opt else { continue };
+            if state.complete {
+                graduated += 1;
+            }
+            if let Err(e) = self.db.insert_curve_snapshot(
+                mint,
+                now,
+                state.virtual_sol_reserves,
+                state.virtual_token_reserves,
+                state.real_sol_reserves,
+                state.real_token_reserves,
+                state.price_sol(),
+                state.fill_pct(),
+                state.complete,
+            ) {
+                tracing::warn!("curve-observe: insert {} failed: {}", mint, e);
+                continue;
+            }
+            written += 1;
+        }
+        if written > 0 {
+            tracing::info!(
+                "curve-observe: {} snapshots ({} graduated this batch)",
+                written, graduated
+            );
+        }
+    }
+
     async fn settle_calls(&self) {
         let active = match self.db.list_calls(true, 200) {
             Ok(v) => v,

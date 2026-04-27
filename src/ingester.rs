@@ -523,6 +523,49 @@ impl RpcRouter {
         Ok(all_owners)
     }
 
+    /// Generic batched account-info fetch. Same chunk + failover pattern
+    /// as the SPL-owner specialization, but returns raw Account so callers
+    /// can parse arbitrary on-chain layouts (bonding-curve PDAs, etc.).
+    pub async fn get_multiple_accounts(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<Option<Account>>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pks: Vec<Pubkey> = addresses
+            .iter()
+            .map(|a| Pubkey::from_str(a).context("invalid address"))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut all: Vec<Option<Account>> = Vec::with_capacity(pks.len());
+        for chunk in pks.chunks(100) {
+            let attempts = self.endpoints.len();
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut got: Option<Vec<Option<Account>>> = None;
+            for _ in 0..attempts {
+                let (idx, client) = self.next_client().context("No RPC endpoints available")?;
+                match client.get_multiple_accounts(chunk).await {
+                    Ok(accounts) => {
+                        self.record_result(idx, true);
+                        got = Some(accounts);
+                        break;
+                    }
+                    Err(e) => {
+                        let err = e.to_string();
+                        self.record_failure(idx, &err);
+                        last_err = Some(e.into());
+                    }
+                }
+            }
+            match got {
+                Some(v) => all.extend(v),
+                None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed"))),
+            }
+        }
+        Ok(all)
+    }
+
     async fn resolve_owner_chunk(&self, pks: &[Pubkey]) -> Result<Vec<Option<String>>> {
         let attempts = self.endpoints.len();
         let mut last_err: Option<anyhow::Error> = None;

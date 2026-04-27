@@ -1,3 +1,4 @@
+pub mod bonding_curve;
 pub mod bot;
 pub mod config;
 pub mod db;
