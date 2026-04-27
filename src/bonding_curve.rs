@@ -195,6 +195,77 @@ fn parse_curve_account(mint: Pubkey, curve: Pubkey, data: &[u8]) -> Result<Curve
     })
 }
 
+/// Velocity-based gate signal computed from a curve's recent snapshot
+/// stream. Inputs are tuples (timestamp_secs, real_sol, fill_pct) —
+/// what `db.get_recent_curve_snapshots` returns. Higher score = more
+/// momentum building on the curve. The auto-call gate fires when
+/// `passes_gate(score)` holds and the curve hasn't graduated yet.
+#[derive(Debug, Clone)]
+pub struct CurveMomentum {
+    /// SOL/min inflow over the most-recent observation window.
+    pub velocity_sol_per_min: f64,
+    /// Current fill percent (real_sol / 85 SOL).
+    pub fill_pct: f64,
+    /// Combined gate score, 0.0–100.0. Velocity-weighted, fill-modulated.
+    pub alpha_score: f64,
+    /// Snapshot count used for the calc. 0 means "not enough data".
+    pub samples: usize,
+}
+
+/// Compute momentum from the latest snapshots. `snaps` is newest-first
+/// (matches `db.get_recent_curve_snapshots` ordering). Returns
+/// zero-valued CurveMomentum when there aren't enough samples or the
+/// curve already graduated.
+pub fn compute_momentum(
+    snaps: &[(i64, f64, f64, f64, bool)], // (ts, real_sol, price_sol, fill_pct, complete)
+) -> CurveMomentum {
+    if snaps.len() < 2 {
+        return CurveMomentum {
+            velocity_sol_per_min: 0.0,
+            fill_pct: snaps.first().map(|s| s.3).unwrap_or(0.0),
+            alpha_score: 0.0,
+            samples: snaps.len(),
+        };
+    }
+    let newest = &snaps[0];
+    let oldest = snaps.last().expect("len >= 2");
+    let dt = (newest.0 - oldest.0).max(1) as f64;
+    let dsol = newest.1 - oldest.1;
+    let velocity_sol_per_min = (dsol / dt) * 60.0;
+    let fill_pct = newest.3;
+    // Score: velocity is the primary driver; fill range modulates.
+    // Sweet spot is 5–50% filled (early enough to ride, mature enough
+    // that price action isn't pure noise). Outside the band the score
+    // is dampened.
+    let velocity_component = (velocity_sol_per_min * 20.0).clamp(0.0, 80.0);
+    let fill_band = if (5.0..=50.0).contains(&fill_pct) {
+        20.0
+    } else if (1.0..=70.0).contains(&fill_pct) {
+        10.0
+    } else {
+        0.0
+    };
+    let alpha_score = if newest.4 { 0.0 } else { velocity_component + fill_band };
+    CurveMomentum {
+        velocity_sol_per_min,
+        fill_pct,
+        alpha_score,
+        samples: snaps.len(),
+    }
+}
+
+/// Curve-stage auto-call gate. True iff momentum is strong enough to
+/// commit a SHORT call during the bonding-curve phase. Composed of:
+///   - score ≥ 50.0 (combines velocity ≥ 1.5 SOL/min + fill in band)
+///   - fill_pct in (5%, 50%) — pre-graduation sweet spot
+///   - samples ≥ 3 — evidence the velocity is sustained
+pub fn passes_gate(m: &CurveMomentum) -> bool {
+    m.alpha_score >= 50.0
+        && m.samples >= 3
+        && m.fill_pct > 5.0
+        && m.fill_pct < 50.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

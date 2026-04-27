@@ -674,6 +674,21 @@ impl BackgroundScanner {
                 continue;
             }
             written += 1;
+
+            // 6.4: gate check. If this curve has built enough momentum
+            // and we don't already have an active call, fire one. The
+            // pre-graduation entry mcap is computed from the curve
+            // itself, since DexScreener won't have a pair yet.
+            if !state.complete {
+                self.maybe_fire_curve_call(mint, state).await;
+            } else {
+                // 6.5: graduation handoff. The token just bonded out;
+                // ensure the post-grad pipeline picks it up. If we
+                // have an active call from the curve phase, leave it
+                // active — the watchlist runtime + settling phase
+                // will manage it from here using DexScreener data.
+                self.handle_graduation(mint).await;
+            }
         }
         if written > 0 {
             tracing::info!(
@@ -681,6 +696,105 @@ impl BackgroundScanner {
                 written, graduated
             );
         }
+    }
+
+    /// Fire a SHORT call when the curve momentum gate passes and no
+    /// active call exists for this mint. Entry mcap derived from
+    /// CurveState since pre-grad tokens have no DexScreener pair.
+    async fn maybe_fire_curve_call(&self, mint: &str, state: &crate::bonding_curve::CurveState) {
+        // Skip if we already have a live call (operator-issued or earlier
+        // curve-stage call still pending settling).
+        if self.db.has_active_call(mint).unwrap_or(false) {
+            return;
+        }
+        let snaps = match self.db.get_recent_curve_snapshots(mint, 6) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("curve-call: snapshot read {} failed: {}", mint, e);
+                return;
+            }
+        };
+        let momentum = crate::bonding_curve::compute_momentum(&snaps);
+        if !crate::bonding_curve::passes_gate(&momentum) {
+            return;
+        }
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        // SOL price for mcap quote. We don't have a fresh fetch here,
+        // so fall back to a constant — the scout/whales UI will
+        // refresh with real numbers post-graduation. Skip the call if
+        // we can't even ballpark.
+        let sol_price = 850.0; // approximate — refresh post-grad
+        let mcap_usd = state.mcap_usd(sol_price);
+        let price_usd = state.price_sol() * sol_price;
+        let liq_usd = state.real_sol_reserves * sol_price; // SOL side of curve as liq proxy
+        let now = chrono::Utc::now().timestamp();
+        // Curve calls default SHORT — pump.fun bonding curve ride
+        // resolves in hours either way (graduation or rug). Settling's
+        // 6h timeout is the right backstop.
+        let note = format!(
+            "horizon=SHORT source=curve fill={:.1}% velocity={:.2}sol/min alpha={:.0}",
+            momentum.fill_pct, momentum.velocity_sol_per_min, momentum.alpha_score,
+        );
+        // We don't have a TokenAnalysis here so confidence/classification
+        // come from CurveState reads. Use conservative placeholders the
+        // existing UI handles gracefully.
+        let symbol = String::new(); // metadata::fetch will populate post-call
+        let inserted = self.db.insert_call(
+            mint,
+            &symbol,
+            "CURVE",
+            (momentum.alpha_score as i32).clamp(0, 100),
+            now,
+            mcap_usd,
+            price_usd,
+            liq_usd,
+            0.0, // top_holder unknown pre-graduation
+            "curve",
+            &note,
+            "curve",
+            0.0, // tx_rate unknown pre-graduation
+        );
+        match inserted {
+            Ok(Some(_)) => {
+                let _ = self.db.set_call_expiration(mint, Some(now + 6 * 3600));
+                tracing::info!(
+                    "curve-call: fired {} mcap=${:.0}k fill={:.1}% velocity={:.2}sol/min",
+                    mint, mcap_usd / 1000.0, momentum.fill_pct, momentum.velocity_sol_per_min
+                );
+                // Wake publisher + post the channel card.
+                notifier.kick_publisher();
+                let n = notifier.clone();
+                let mint_owned = mint.to_string();
+                let note_owned = note.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = n.fire_call_card(&mint_owned, &note_owned, mcap_usd).await {
+                        tracing::warn!("curve-call: fire_call_card {} failed: {}", mint_owned, e);
+                    }
+                });
+            }
+            Ok(None) => {} // duplicate active row, normal
+            Err(e) => tracing::warn!("curve-call: insert_call {} failed: {}", mint, e),
+        }
+    }
+
+    /// Graduation handoff. The token just flipped complete=true on its
+    /// bonding curve. If we have an active call from the curve phase,
+    /// add the mint to the watchlist so Phase 1's re-analysis loop
+    /// (DexScreener-driven) takes over the lifecycle. The call row
+    /// stays continuous; only the data source changes from on-chain
+    /// curve reads to off-chain DEX feed.
+    async fn handle_graduation(&self, mint: &str) {
+        if !self.db.has_active_call(mint).unwrap_or(false) {
+            return;
+        }
+        // Best-effort watchlist add. Existing schema uses
+        // (token_address, classification, added_at, last_checked, active).
+        // Use STAIRCASE as a placeholder class — Phase 1 re-analysis
+        // overwrites with real classification on its first read.
+        let _ = self.db.add_to_watchlist(mint, "STAIRCASE");
+        tracing::info!("curve-grad: {} graduated, handed off to watchlist", mint);
     }
 
     async fn settle_calls(&self) {
