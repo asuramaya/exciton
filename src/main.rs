@@ -224,17 +224,85 @@ async fn main() -> Result<()> {
     let disable_mcp = std::env::var("PHOTON_DISABLE_MCP")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
+    // Two-mode runtime:
+    //   stdio  — legacy parent-as-MCP-client (zeroclaw-spawns-photon).
+    //            Foreground; daemon dies. Set via PHOTON_MCP_TRANSPORT=stdio.
+    //   http   — bidirectional MCP over Streamable-HTTP (SSE for server→
+    //            client streams, POST for client→server JSON-RPC). Runs
+    //            alongside the daemon. Default when MCP isn't disabled.
+    //   off    — PHOTON_DISABLE_MCP=1; daemon-only.
+    let mcp_transport = std::env::var("PHOTON_MCP_TRANSPORT")
+        .unwrap_or_else(|_| "http".to_string())
+        .to_lowercase();
+    let mcp_port: u16 = std::env::var("PHOTON_MCP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8082);
 
     if disable_mcp {
         tracing::info!("MCP server disabled by PHOTON_DISABLE_MCP; running daemon-only mode");
         wait_for_shutdown_signal().await?;
-    } else {
-        // Start MCP server
-        let server = PhotonServer::new(db, config, rpc, resolved_endpoints, notifier_arc.clone());
-        tracing::info!("MCP server starting on stdio");
-
+    } else if mcp_transport == "stdio" {
+        // Foreground stdio mode — kept for backward compat with zeroclaw
+        // setups that spawn photon as a child process. NOTE: this exits
+        // the daemon (scanner/settling/publisher all stop the moment
+        // serve_directly takes over). Don't pick this in production.
+        let server = PhotonServer::new(
+            db,
+            config,
+            rpc,
+            resolved_endpoints,
+            notifier_arc.clone(),
+        );
+        tracing::warn!("MCP transport=stdio — daemon will halt; use 'http' for production");
         let service = server.serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;
+    } else {
+        // HTTP mode — runs the MCP server as an axum service on
+        // PHOTON_MCP_PORT (default 8082) at the `/mcp` path. The
+        // daemon (scanner/settling/publisher) keeps running because
+        // we spawn the listener as a background task and then wait
+        // for shutdown signal as before.
+        let server_db = db.clone();
+        let server_config = config.clone();
+        let server_rpc = rpc.clone();
+        let server_endpoints = resolved_endpoints.clone();
+        let server_notifier = notifier_arc.clone();
+        let mcp_service = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
+            move || {
+                Ok(PhotonServer::new(
+                    server_db.clone(),
+                    server_config.clone(),
+                    server_rpc.clone(),
+                    server_endpoints.clone(),
+                    server_notifier.clone(),
+                ))
+            },
+            std::sync::Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default(),
+        );
+
+        let app = axum::Router::new()
+            .nest_service("/mcp", mcp_service)
+            .route(
+                "/health",
+                axum::routing::get(|| async { "ok" }),
+            );
+
+        let bind_addr = format!("0.0.0.0:{}", mcp_port);
+        tracing::info!("MCP server listening on http://{}/mcp (Streamable HTTP)", bind_addr);
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        // axum::serve runs the HTTP server until the future completes.
+        // Spawn so the main task can also wait on the shutdown signal
+        // and the daemon keeps running concurrently.
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("MCP HTTP server exited: {}", e);
+            }
+        });
+        wait_for_shutdown_signal().await?;
     }
 
     // Cleanup

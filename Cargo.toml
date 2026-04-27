@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rmcp = { version = "0.16", features = ["server", "transport-io"] }
+rmcp = { version = "0.16", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+tower = "0.5"
 schemars = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 solana-sdk = "2"
