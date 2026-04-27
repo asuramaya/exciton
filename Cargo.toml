@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 rmcp = { version = "0.16", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"
 tower = "0.5"

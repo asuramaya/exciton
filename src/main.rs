@@ -19,6 +19,7 @@ mod mcp;
 mod metadata;
 mod notifier;
 mod publisher;
+mod pumpportal;
 mod scanner;
 mod scout;
 mod signals;
@@ -171,6 +172,59 @@ async fn main() -> Result<()> {
             Err(e) => tracing::warn!("Telegram notifier init failed: {} — continuing without", e),
         }
     }
+    // PumpPortal client — the missing data source. Replaces RPC-based
+    // sig-walking for new-token discovery + graduation events. Phase 2 / 2b
+    // in the scanner gate on this client's freshness; when stale they fall
+    // back to the existing RPC walks. No feature flag — connectivity is
+    // the gate.
+    let pp_client = pumpportal::spawn(vec![
+        pumpportal::Subscription::NewToken,
+        pumpportal::Subscription::Migration,
+    ]);
+    let pp_health = pp_client.health.clone();
+    scanner = scanner.with_pumpportal_health(pp_health.clone());
+    // Spawn the event sink. New-token events insert into `tokens`
+    // (lightweight — defers full analyze_token to Phase 4 reingest
+    // where DexScreener data is cheaper than per-token RPC reads).
+    // Migration events log raw until 8.4 captures the shape from a
+    // real graduation; until then Phase 2b sig-walk continues to
+    // provide graduation detection.
+    let sink_db = db.clone();
+    tokio::spawn(async move {
+        let mut events = pp_client.events;
+        while let Some(ev) = events.recv().await {
+            match ev {
+                pumpportal::PumpEvent::NewToken(token) => {
+                    // safety_score=0 placeholder — Phase 4 reingest's
+                    // analyze_token overwrites with the real value.
+                    if let Err(e) = sink_db.insert_token(&token.mint, 0) {
+                        tracing::warn!("pumpportal-sink: insert_token {} failed: {}", token.mint, e);
+                    }
+                    let _ = sink_db.audit_log(
+                        "pumpportal",
+                        "new_token",
+                        &format!(
+                            "{} sym={} mcap_sol={:.3}",
+                            token.mint,
+                            token.symbol.as_deref().unwrap_or(""),
+                            token.market_cap_sol.unwrap_or(0.0),
+                        ),
+                    );
+                }
+                pumpportal::PumpEvent::Raw(value) => {
+                    // Until we've captured the migration shape, every
+                    // non-NewToken event lands here. Log at info so the
+                    // raw stream is grep-able from `docker logs` for
+                    // task 8.4. Truncated to keep log volume sane.
+                    let s = value.to_string();
+                    let preview = if s.len() > 240 { &s[..240] } else { &s[..] };
+                    tracing::info!(target: "pumpportal::raw", "{}", preview);
+                }
+            }
+        }
+        tracing::info!("pumpportal-sink: event stream ended");
+    });
+
     let scanner_handle = scanner.start();
     tracing::info!("Background scanner started");
 

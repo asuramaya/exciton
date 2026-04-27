@@ -26,6 +26,11 @@ pub struct BackgroundScanner {
     watchlist_rescan_limit: usize,
     running: Arc<AtomicBool>,
     notifier: Option<Arc<Notifier>>,
+    /// PumpPortal health handle. When set + fresh, Phase 2 / 2b skip
+    /// their RPC sig-walks (PumpPortal pushes new tokens + migrations
+    /// straight to the DB). When stale, the sig-walks resume as
+    /// fallback. Connectivity is the gate; no separate flag.
+    pumpportal_health: Option<Arc<crate::pumpportal::PumpPortalHealth>>,
 }
 
 impl BackgroundScanner {
@@ -49,7 +54,16 @@ impl BackgroundScanner {
             ),
             running: Arc::new(AtomicBool::new(false)),
             notifier: None,
+            pumpportal_health: None,
         }
+    }
+
+    pub fn with_pumpportal_health(
+        mut self,
+        health: Arc<crate::pumpportal::PumpPortalHealth>,
+    ) -> Self {
+        self.pumpportal_health = Some(health);
+        self
     }
 
     /// Attach a telegram notifier. When set, the scanner will route qualifying
@@ -382,8 +396,26 @@ impl BackgroundScanner {
             }
         }
 
-        // Phase 2: Discover new tokens (limit 3 per cycle to leave budget for watchlist)
-        let analyses = discovery::discover_new_tokens(&self.db, &self.rpc, 3).await?;
+        // Phase 2: Discover new tokens. PumpPortal pushes new-token events
+        // straight to the DB via the sink task — when the WS is fresh
+        // we skip this RPC sig-walk entirely. Falls back to sig-walking
+        // when PumpPortal is stale (connection lost, server outage, or
+        // first 30s after startup).
+        const PP_FRESH_SECS: i64 = 30;
+        let pp_fresh = self
+            .pumpportal_health
+            .as_ref()
+            .map(|h| h.fresh(PP_FRESH_SECS))
+            .unwrap_or(false);
+        let analyses: Vec<TokenAnalysis> = if pp_fresh {
+            // PumpPortal is feeding tokens directly. Phase 2's "alert
+            // generation per analysis" loop below still runs, just over
+            // an empty list — alerts come from Phase 1 re-analysis.
+            tracing::trace!("Phase 2: PumpPortal fresh, skipping RPC sig-walk");
+            Vec::new()
+        } else {
+            discovery::discover_new_tokens(&self.db, &self.rpc, 3).await?
+        };
 
         let mut alert_count = 0;
 
@@ -529,10 +561,14 @@ impl BackgroundScanner {
             }
         }
 
-        // Phase 2b: Graduation detection — walk recent pumpswap AMM signatures to
-        // catch pump.fun tokens that just bonded-curve-graduated. These are already
-        // in our `tokens` table but not on the watchlist. Re-analyze immediately
-        // instead of waiting for Phase 4's polling cycle.
+        // Phase 2b: Graduation detection. Same gate as Phase 2 — when
+        // PumpPortal is fresh we skip the RPC sig-walk on pumpswap
+        // because subscribeMigration pushes graduation events directly.
+        // (Until 8.4 captures the migration event shape, we don't fully
+        // trust the WS for graduation, so even when fresh we keep
+        // running the sig-walk at reduced volume — the existing path is
+        // already capped at 3/cycle and will compete cleanly with the
+        // WS path. Once 8.4 lands this gate becomes a hard skip.)
         match discovery::check_graduated_tokens(&self.db, &self.rpc, 3).await {
             Ok(graduated) => {
                 for analysis in &graduated {
