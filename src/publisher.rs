@@ -949,9 +949,9 @@ impl Publisher {
     }
 
     fn commit_and_push(&self, repo: &Path, ts: i64) -> Result<bool> {
+        let repo_arg = repo.to_str().unwrap_or(".");
         let status = Command::new("git")
-            .args(["-C", repo.to_str().unwrap_or(".")])
-            .args(["status", "--porcelain", "--", "data/"])
+            .args(["-C", repo_arg, "status", "--porcelain", "--", "data/"])
             .output()
             .context("git status")?;
         if status.stdout.is_empty() {
@@ -959,15 +959,13 @@ impl Publisher {
         }
 
         Command::new("git")
-            .args(["-C", repo.to_str().unwrap_or(".")])
-            .args(["add", "data/"])
+            .args(["-C", repo_arg, "add", "data/"])
             .output()
             .context("git add")?;
 
         let msg = format!("data: snapshot {}", ts);
         let commit = Command::new("git")
-            .args(["-C", repo.to_str().unwrap_or(".")])
-            .args(["commit", "-m", &msg])
+            .args(["-C", repo_arg, "commit", "-m", &msg])
             .output()
             .context("git commit")?;
         if !commit.status.success() {
@@ -977,13 +975,55 @@ impl Publisher {
             );
         }
 
+        // Try push first (the optimistic path — most ticks have no other
+        // committer racing us). On non-fast-forward (operator pushed source
+        // changes from local), pull --rebase to grab their work, then push
+        // again. Without this, every operator local push leaves the
+        // publisher stuck rejected until someone pulls in-container.
         let push = Command::new("git")
-            .args(["-C", repo.to_str().unwrap_or(".")])
-            .args(["push", "--quiet"])
+            .args(["-C", repo_arg, "push", "--quiet"])
             .output()
             .context("git push")?;
-        if !push.status.success() {
-            anyhow::bail!("git push failed: {}", String::from_utf8_lossy(&push.stderr));
+        if push.status.success() {
+            return Ok(true);
+        }
+
+        // Recoverable rejections: stderr contains "non-fast-forward" or
+        // "fetch first". Anything else (auth failure, network out) we
+        // surface as before.
+        let stderr = String::from_utf8_lossy(&push.stderr).to_string();
+        let recoverable = stderr.contains("non-fast-forward")
+            || stderr.contains("fetch first")
+            || stderr.contains("rejected");
+        if !recoverable {
+            anyhow::bail!("git push failed: {}", stderr);
+        }
+
+        tracing::info!("publisher: push rejected, pulling --rebase and retrying");
+        let pull = Command::new("git")
+            .args(["-C", repo_arg, "pull", "--rebase", "--quiet"])
+            .output()
+            .context("git pull --rebase")?;
+        if !pull.status.success() {
+            // Conflict during rebase. Abort so we leave the tree clean
+            // for the next tick instead of stuck mid-rebase.
+            let _ = Command::new("git")
+                .args(["-C", repo_arg, "rebase", "--abort"])
+                .output();
+            anyhow::bail!(
+                "git pull --rebase failed: {}",
+                String::from_utf8_lossy(&pull.stderr)
+            );
+        }
+        let push2 = Command::new("git")
+            .args(["-C", repo_arg, "push", "--quiet"])
+            .output()
+            .context("git push (retry)")?;
+        if !push2.status.success() {
+            anyhow::bail!(
+                "git push (retry) failed: {}",
+                String::from_utf8_lossy(&push2.stderr)
+            );
         }
         Ok(true)
     }
