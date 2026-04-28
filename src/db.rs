@@ -2089,6 +2089,28 @@ impl Db {
         }
     }
 
+    /// Whether any alert of `alert_type` for this mint exists since `since_ts`.
+    /// Used by the settle phase to detect DEV_SELLING and classification
+    /// regressions on active calls — those should force-close the call rather
+    /// than wait for a price-based stop.
+    pub fn has_recent_alert(
+        &self,
+        mint: &str,
+        alert_type: &str,
+        since_ts: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM alerts \
+             WHERE token_address = ?1 AND alert_type = ?2 AND timestamp >= ?3 LIMIT 1",
+        )?;
+        let exists = stmt
+            .query_row(params![mint, alert_type, since_ts], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
     /// Distinct tokens that fired degradation alerts (concentrating, velocity_crash,
     /// classification_change, crashing) within a time window. Used to seed the
     /// trap-report candidate list.

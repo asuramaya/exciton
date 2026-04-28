@@ -607,9 +607,9 @@ impl BackgroundScanner {
         // Phase 5: Settling — apply horizon-aware close rules to every active
         // call. This is the lifecycle manager: SHORT calls book wins/losses
         // fast (+50%/+100% withdrew, -40% failed, 6h timeout); LONG calls hold
-        // through normal volatility (-70% catastrophic fail only, 30d timeout).
-        // Without this, calls drift indefinitely and TIME MACHINE's +126% sat
-        // open while mOK's -98% never resolved.
+        // with a -50% catastrophic stop (tightened from -70 after backtest).
+        // Both horizons also exit on dev_selling alerts and STAIRCASE→GRINDER
+        // class regression — leading indicators that price hasn't yet printed.
         self.settle_calls().await;
 
         // Phase 6: Bonding-curve observation. For pump.fun mints in their
@@ -646,11 +646,15 @@ impl BackgroundScanner {
     /// call cleanly or leaves it active.
     ///
     /// Settle outcomes (writes to DB + edits the channel card):
+    ///   ANY    dev_selling alert in last 30m → failed · "dev selling"
+    ///   ANY    classification regression on a red call → failed · "structure broke"
     ///   SHORT  ≥+100%  → withdrew · "2x done"
     ///   SHORT  ≥+50%   → withdrew · "took the win"
+    ///   SHORT  ≤-25% in 30m → failed · "early collapse"
     ///   SHORT  ≤-40%   → failed   · "thesis broke"
     ///   SHORT  age≥6h  → expired  · "no follow-through"
-    ///   LONG   ≤-70%   → failed   · "thesis broke"
+    ///   LONG   ≥+150%  → withdrew · "2.5x done"
+    ///   LONG   ≤-50%   → failed   · "thesis broke"
     ///   LONG   age≥30d → expired  · "30d hold complete"
     ///
     /// Velocity-collapse settle for SHORT is intentionally deferred: it
@@ -876,11 +880,67 @@ impl BackgroundScanner {
             let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
             let age = now - call.called_at;
 
+            // Event-driven exits — checked before price rules. A DEV_SELLING
+            // alert (deployer dropped ≥10% of their initial balance) or a
+            // STAIRCASE→GRINDER classification regression are leading
+            // indicators that price hasn't yet reflected. The 31-call backtest
+            // showed ~92% of post-grad tokens eventually dump; the alpha is
+            // exiting before the price prints, not after.
+            let event_window_secs = 30 * 60i64;
+            let event_since = now - event_window_secs;
+            let dev_selling = self
+                .db
+                .has_recent_alert(&call.mint, "dev_selling", event_since)
+                .unwrap_or(false);
+            // Classification-regression check: STAIRCASE/GRINDER/SPRING are
+            // bullish, DEVELOPING is neutral-fading, CRASHING/DEAD/ACTIVE_TRAP
+            // are bearish. We compare last two snapshots and trigger when the
+            // current rank is strictly worse than entry's class.
+            let class_regressed = self
+                .db
+                .get_snapshot_history(&call.mint, 2)
+                .ok()
+                .and_then(|snaps| {
+                    if snaps.len() < 2 {
+                        return None;
+                    }
+                    let rank = |c: &str| match c {
+                        "SPRING" => 4,
+                        "STAIRCASE" => 3,
+                        "GRINDER" => 2,
+                        "DEVELOPING" => 1,
+                        _ => 0, // CRASHING/DEAD/ACTIVE_TRAP/UNSAFE_*
+                    };
+                    Some(rank(&snaps[0].classification) < rank(&snaps[1].classification))
+                })
+                .unwrap_or(false);
+
+            let event_exit: Option<(&'static str, String)> = if dev_selling {
+                Some(("failed", format!("{:+.1}% · dev selling", pct)))
+            } else if class_regressed && pct <= 0.0 {
+                // Class regression on a token already underwater: the surf
+                // ended. If the call's still green, let the price ladder
+                // handle profit-taking — class flips on green tokens are
+                // common volatility, not exit signals.
+                Some(("failed", format!("{:+.1}% · structure broke", pct)))
+            } else {
+                None
+            };
+
             // Outcome decision: returns (action, status_str, exit_note).
             // Action determines which DB call + which TG outcome string.
-            let outcome: Option<(&'static str, String)> = if is_long {
-                if pct <= -70.0 {
+            let outcome: Option<(&'static str, String)> = if let Some(e) = event_exit {
+                Some(e)
+            } else if is_long {
+                // LONG stop tightened from -70 → -50 (backtest: -50 stop adds
+                // +14% per call mean, since most -70 hits had already passed
+                // through -50 with no recovery). Tiered take-profits are
+                // handled at the +40/+80/+150 levels — first-tier here as a
+                // safety against runaway holds.
+                if pct <= -50.0 {
                     Some(("failed", format!("{:+.1}% · thesis broke", pct)))
+                } else if pct >= 150.0 {
+                    Some(("withdrew", format!("{:+.1}% · 2.5x done", pct)))
                 } else if age >= 30 * 86_400 {
                     Some(("expired", format!("{:+.1}% · 30d hold complete", pct)))
                 } else {

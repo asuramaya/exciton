@@ -50,16 +50,40 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // Every one of these gates must hold to open a signal.
 // =============================================================================
 
-pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 75;
-pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 20.0;
+// Gates calibrated against the 31-call closed-call backtest (2026-04-22..28).
+// Confidence: conf=75 calls returned -9.2% mean / 25% win, conf 76-77 returned
+// +9.7% mean / 57% win. The 75 floor is noise; 76 is signal.
+pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 76;
+// Top-holder gate: top1 < 6% AND liq >= $100k yielded 7/8 wins (+9.2% mean,
+// +73% sum). Industry-corroborated (DeFade rug-pull guide: any single holder
+// >5% in early stage is a red flag).
+pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 6.0;
+// Top-10 gate: catches insider networks that fragment 30-40% of supply
+// across 20+ wallets to look diversified. RugCheck threshold: top10 >35%
+// is a dump-risk indicator. Combined with top1<6, single addresses can't
+// alone exceed this.
+pub const SIGNAL_MAX_TOP10_PCT: f64 = 35.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 pub const SIGNAL_DEDUP_HOURS: i64 = 6;
-// Liquidity floor — calls on a $4k pool catch a -98% mOK-class loss when
-// any holder dumps. Real exits need real depth.
-pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 20_000.0;
+// Liquidity floor: in the backtest, calls below $100k liquidity won 6/22
+// (27%) at -4% mean. Above $100k won 7/8 (88%) at +9.2% mean. Real exits
+// need real depth.
+pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 100_000.0;
 // 24h volume floor — proves the token is actually trading, not a dead curve
 // with a stale top_holder reading.
 pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
+// Mcap floor — 8/8 sub-$150k mcap calls returned -5% mean / 25% win in the
+// backtest. The "shallow rug" bucket needs the separate event-driven scalp
+// strategy, not the SHORT ladder. Above $500k: 13/14 mean +5% / 57% win.
+pub const SIGNAL_MIN_MCAP_USD: f64 = 500_000.0;
+// Velocity gate (arxiv 2602.14860 Feb-2026: trading velocity is the dominant
+// graduation predictor). Tx_rate is per-minute; require ≥5 to filter out
+// dead post-grad books that look fine on holders but have no real flow.
+pub const SIGNAL_MIN_TX_RATE_PER_MIN: f64 = 5.0;
+// Holder-growth velocity gate: ≥50 new holders/hour scaled from the
+// "500+ holders in first hour = green flag" industry signal. Computed from
+// delta.holder_count_delta over delta.time_elapsed_seconds.
+pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 50.0;
 // Token must be at least this old to auto-call. Fresh-deploy dumpsters that
 // pump for 5 minutes off creator buying then bleed back to zero are the
 // majority of -90% calls. One hour gives the holder base time to validate.
@@ -299,6 +323,9 @@ impl Notifier {
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
         let conf_ok = effective_conf >= self.signal_threshold();
         let holder_ok = a.top_holder_pct < SIGNAL_MAX_TOP_HOLDER_PCT;
+        // Insider-network gate: even when top1 looks fine, bundlers that
+        // split 30-40% across 20+ wallets show up in top10 aggregate.
+        let top10_ok = a.top10_pct < SIGNAL_MAX_TOP10_PCT;
         // momentum_delta ≥ 0 means not fading. Missing delta (first-sight tokens)
         // counts as neutral — allowed through.
         let momentum_ok = a.delta.as_ref().map_or(true, |d| d.momentum_delta >= 0);
@@ -306,14 +333,29 @@ impl Notifier {
         let history_ok = a.delta.is_some();
         // Market-data floors: prove the token has tradeable depth and is
         // actually trading. Missing meta (DexScreener fetch failed) means
-        // the token isn't on any DEX — block. mOK-class -98% calls came
-        // from auto-calling tokens with $4k liquidity and no real volume.
+        // the token isn't on any DEX — block.
         let liq_ok = meta
             .and_then(|m| m.liquidity_usd)
             .map_or(false, |v| v >= SIGNAL_MIN_LIQUIDITY_USD);
         let vol_ok = meta
             .and_then(|m| m.volume_24h_usd)
             .map_or(false, |v| v >= SIGNAL_MIN_VOLUME_24H_USD);
+        let mcap_ok = meta
+            .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+            .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD);
+        // Velocity gate: trading-velocity is the dominant graduation predictor
+        // (arxiv 2602.14860). Post-grad we use it to filter dead books.
+        let tx_rate_ok = a.tx_rate >= SIGNAL_MIN_TX_RATE_PER_MIN;
+        // Holder growth: convert delta over elapsed seconds → holders/hour.
+        let holder_growth_ok = a.delta.as_ref().map_or(false, |d| {
+            if d.time_elapsed_seconds <= 0 {
+                false
+            } else {
+                let per_hour =
+                    d.holder_count_delta as f64 * 3600.0 / d.time_elapsed_seconds as f64;
+                per_hour >= SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR
+            }
+        });
         // Age floor: token must have existed long enough that the holder
         // base reflects organic distribution, not creator + initial 5
         // bonding-curve buyers.
@@ -322,10 +364,14 @@ impl Notifier {
         class_ok
             && conf_ok
             && holder_ok
+            && top10_ok
             && momentum_ok
             && history_ok
             && liq_ok
             && vol_ok
+            && mcap_ok
+            && tx_rate_ok
+            && holder_growth_ok
             && age_ok
     }
 

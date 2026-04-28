@@ -320,7 +320,7 @@ mod tests {
                 assert_eq!(e.tx_type.as_deref(), Some("create"));
                 assert_eq!(e.symbol.as_deref(), Some("TEST"));
             }
-            PumpEvent::Raw(_) => panic!("expected NewToken"),
+            other => panic!("expected NewToken, got {:?}", other),
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
         let raw = r#"{"someField": "value", "txType": "buy"}"#;
         match parse_event(raw) {
             PumpEvent::Raw(_) => {}
-            PumpEvent::NewToken(_) => panic!("buy event should not parse as NewToken"),
+            other => panic!("expected Raw, got {:?}", other),
         }
     }
 
