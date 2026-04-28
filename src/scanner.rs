@@ -711,20 +711,33 @@ impl BackgroundScanner {
             }
             written += 1;
 
-            // 6.4: gate check. If this curve has built enough momentum
-            // and we don't already have an active call, fire one. The
-            // pre-graduation entry mcap is computed from the curve
-            // itself, since DexScreener won't have a pair yet.
-            if !state.complete {
-                self.maybe_fire_curve_call(mint, state).await;
-            } else {
-                // 6.5: graduation handoff. The token just bonded out;
-                // ensure the post-grad pipeline picks it up. If we
-                // have an active call from the curve phase, leave it
-                // active — the watchlist runtime + settling phase
-                // will manage it from here using DexScreener data.
+            // 6.4: curve-stage auto-call DISABLED.
+            //
+            // The original design fired calls during the bonding-curve
+            // phase using `virtual_sol_reserves * total_supply * sol_price`
+            // as entry mcap. That number doesn't compare meaningfully to
+            // post-graduation DexScreener prices — the AMM that gets
+            // created at graduation has only ~$12k of injected liquidity,
+            // so the realized AMM price is typically an order of magnitude
+            // below the virtual curve price. Result: every curve call was
+            // guaranteed to settle ~-90% the moment DexScreener got a
+            // post-grad pair price, regardless of what the token was
+            // actually doing on chain.
+            //
+            // Symptom in production: 19 CURVE-source calls fired and
+            // were "early-collapsed" within 1-3 minutes each, all in the
+            // -85% to -99% band. That's the math, not the market.
+            //
+            // The right call-trigger is post-graduation, against real
+            // DexScreener pricing — the existing watchlist + settling
+            // path. We still OBSERVE curves (snapshots persist for
+            // analysis + future research), and we still hand off on
+            // graduation so the post-grad pipeline picks up the mint.
+            if state.complete {
                 self.handle_graduation(mint).await;
             }
+            // Intentionally not calling maybe_fire_curve_call() —
+            // keep the observation track without the broken auto-call.
         }
         if written > 0 {
             tracing::info!(
