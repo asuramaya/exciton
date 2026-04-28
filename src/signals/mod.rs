@@ -359,6 +359,9 @@ pub struct TokenAnalysis {
     pub bundle_pct: f64,
     pub sniper_pct: f64,
     pub insider_pct: f64,
+    /// Smart-money proxy: count of top-20 holders that hold at least one
+    /// operator-curated reference mint. Zero when no refs are seeded.
+    pub smart_money_count: i32,
 }
 
 /// Run all signal layers against a live token, store snapshot, compute delta
@@ -811,12 +814,12 @@ pub async fn analyze_token(
 
         // Launch forensics refresh — fire-and-forget background task. Cached
         // on the snapshot row; only rerun if the persisted stamp is older than
-        // 1 hour. Bounded ~25 RPC calls per token; spawned async so it
+        // 1 hour. Bounded ~25-45 RPC calls per token; spawned async so it
         // never gates the analyze() return.
         let now = chrono::Utc::now().timestamp();
         let (.., forensics_age) = db
             .get_latest_forensics(mint_address)
-            .unwrap_or((0.0, 0.0, 0.0, 0));
+            .unwrap_or((0.0, 0.0, 0.0, 0, 0));
         if now - forensics_age >= 3600 {
             let mint_owned = mint_address.to_string();
             let db_clone = db.clone();
@@ -844,13 +847,14 @@ pub async fn analyze_token(
                     f.bundle_pct,
                     f.sniper_pct,
                     f.insider_pct,
+                    f.smart_money_count,
                     stamp,
                 ) {
                     tracing::warn!("launch_forensics: persist {} failed: {}", mint_owned, e);
                 } else {
                     tracing::debug!(
-                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}%",
-                        mint_owned, f.bundle_pct, f.sniper_pct, f.insider_pct
+                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}% smart_money={}",
+                        mint_owned, f.bundle_pct, f.sniper_pct, f.insider_pct, f.smart_money_count
                     );
                 }
             });
@@ -864,9 +868,11 @@ pub async fn analyze_token(
     // Read previously-persisted forensics. The async refresh spawned above
     // populates these on its own cadence; reading here lets should_signal
     // gate against them without waiting for compute() to finish.
-    let (bundle_pct, sniper_pct, insider_pct, _) = match db {
-        Some(d) => d.get_latest_forensics(mint_address).unwrap_or((0.0, 0.0, 0.0, 0)),
-        None => (0.0, 0.0, 0.0, 0),
+    let (bundle_pct, sniper_pct, insider_pct, smart_money_count, _) = match db {
+        Some(d) => d
+            .get_latest_forensics(mint_address)
+            .unwrap_or((0.0, 0.0, 0.0, 0, 0)),
+        None => (0.0, 0.0, 0.0, 0, 0),
     };
 
     Ok(TokenAnalysis {
@@ -889,5 +895,6 @@ pub async fn analyze_token(
         bundle_pct,
         sniper_pct,
         insider_pct,
+        smart_money_count,
     })
 }

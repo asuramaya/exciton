@@ -31,6 +31,11 @@ pub struct LaunchForensics {
     pub bundle_pct: f64,
     pub sniper_pct: f64,
     pub insider_pct: f64,
+    /// Count of top-20 holders that ALSO hold at least one operator-curated
+    /// "reference mint" (per `reference_mints` table). Free smart-money proxy
+    /// — wallets that habitually hold known-good tokens are more likely to
+    /// be informed buyers than random snipers. Zero when no refs curated.
+    pub smart_money_count: i32,
 }
 
 /// Compute all three metrics in one pass. Errors are absorbed per-metric so
@@ -85,11 +90,15 @@ pub async fn compute(
     let insider_pct = compute_insider_pct(supply_ui, &top_owners_in_order, &owner_balances, rpc)
         .await
         .unwrap_or(0.0);
+    let smart_money_count = compute_smart_money_count(&top_owners_in_order, db, rpc)
+        .await
+        .unwrap_or(0);
 
     Ok(LaunchForensics {
         bundle_pct,
         sniper_pct,
         insider_pct,
+        smart_money_count,
     })
 }
 
@@ -166,6 +175,32 @@ async fn compute_bundle_pct(
         .map(|(_, b)| *b)
         .sum();
     Ok((held / supply_ui * 100.0).min(100.0))
+}
+
+/// Count of top-20 holders that hold at least one operator-curated
+/// reference mint. Per-holder cost: one `getTokenAccountsByOwner` call.
+/// Zero when no reference mints are curated (gate is permissive in that
+/// case — operator hasn't seeded the smart-money set yet).
+async fn compute_smart_money_count(
+    top_owners: &[String],
+    db: &Arc<Db>,
+    rpc: &Arc<RpcRouter>,
+) -> Result<i32> {
+    let refs: HashSet<String> = db.list_reference_mints()?.into_iter().collect();
+    if refs.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0i32;
+    for owner in top_owners.iter().take(20) {
+        let holdings = match rpc.get_wallet_token_holdings(owner).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if holdings.iter().any(|(mint, _)| refs.contains(mint)) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// % of supply held by the largest cluster of top-20 holders that share

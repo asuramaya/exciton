@@ -346,6 +346,13 @@ impl Db {
             "ALTER TABLE token_snapshots ADD COLUMN forensics_computed_at INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Smart-money proxy: count of top-20 holders that also hold an
+        // operator-curated reference mint. Computed alongside the forensics
+        // triple, free (no external API).
+        let _ = conn.execute(
+            "ALTER TABLE token_snapshots ADD COLUMN smart_money_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         // Sniper cohort — the wallets that bought in the first window of
         // a token's life. Captured once per token at discovery.
@@ -1415,36 +1422,39 @@ impl Db {
         Ok(rows)
     }
 
-    /// Persist the launch-forensics triple (bundle/sniper/insider %) onto
-    /// the most recent snapshot for this mint. Stamped with `computed_at` so
-    /// the caller can decide whether to refresh on the next analysis cycle.
+    /// Persist the launch-forensics quad (bundle/sniper/insider/smart-money)
+    /// onto the most recent snapshot for this mint. Stamped with `computed_at`
+    /// so the caller can decide whether to refresh on the next analysis cycle.
     pub fn update_launch_forensics(
         &self,
         mint: &str,
         bundle_pct: f64,
         sniper_pct: f64,
         insider_pct: f64,
+        smart_money_count: i32,
         computed_at: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE token_snapshots
-             SET bundle_pct = ?1, sniper_pct = ?2, insider_pct = ?3, forensics_computed_at = ?4
+             SET bundle_pct = ?1, sniper_pct = ?2, insider_pct = ?3,
+                 smart_money_count = ?4, forensics_computed_at = ?5
              WHERE id = (SELECT id FROM token_snapshots
-                         WHERE token_address = ?5 ORDER BY timestamp DESC LIMIT 1)",
-            params![bundle_pct, sniper_pct, insider_pct, computed_at, mint],
+                         WHERE token_address = ?6 ORDER BY timestamp DESC LIMIT 1)",
+            params![bundle_pct, sniper_pct, insider_pct, smart_money_count, computed_at, mint],
         )?;
         Ok(())
     }
 
-    /// Read latest forensics + age. Returns `(bundle_pct, sniper_pct,
-    /// insider_pct, computed_at)`. If no snapshot exists or forensics never
-    /// ran, all values are 0.
-    pub fn get_latest_forensics(&self, mint: &str) -> Result<(f64, f64, f64, i64)> {
+    /// Read latest forensics + smart-money + age. Returns
+    /// `(bundle_pct, sniper_pct, insider_pct, smart_money_count, computed_at)`.
+    /// All zero when no snapshot exists or forensics never ran.
+    pub fn get_latest_forensics(&self, mint: &str) -> Result<(f64, f64, f64, i32, i64)> {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT bundle_pct, sniper_pct, insider_pct, forensics_computed_at
+                "SELECT bundle_pct, sniper_pct, insider_pct, smart_money_count,
+                        forensics_computed_at
                  FROM token_snapshots WHERE token_address = ?1
                  ORDER BY timestamp DESC LIMIT 1",
                 params![mint],
@@ -1453,12 +1463,13 @@ impl Db {
                         r.get::<_, f64>(0)?,
                         r.get::<_, f64>(1)?,
                         r.get::<_, f64>(2)?,
-                        r.get::<_, i64>(3)?,
+                        r.get::<_, i32>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.unwrap_or((0.0, 0.0, 0.0, 0)))
+        Ok(row.unwrap_or((0.0, 0.0, 0.0, 0, 0)))
     }
 
     /// Replace the stored top-holders JSON for the most recent snapshot of
