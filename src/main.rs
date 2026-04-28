@@ -211,11 +211,36 @@ async fn main() -> Result<()> {
                         ),
                     );
                 }
+                pumpportal::PumpEvent::Migration(m) => {
+                    // The token just graduated to an AMM (pump-amm or
+                    // raydium). Add it to the watchlist so Phase 1's
+                    // re-analysis loop picks it up immediately with
+                    // post-graduation DexScreener pricing — no need
+                    // to wait for Phase 4 reingest's stale-discovered
+                    // poll. STAIRCASE is a placeholder; Phase 1's
+                    // first read overwrites with the real class.
+                    let pool = m.pool.as_deref().unwrap_or("?");
+                    if let Err(e) = sink_db.add_to_watchlist(&m.mint, "STAIRCASE") {
+                        tracing::warn!(
+                            "pumpportal-sink: add_to_watchlist {} failed: {}",
+                            m.mint, e
+                        );
+                    }
+                    let _ = sink_db.audit_log(
+                        "pumpportal",
+                        "migration",
+                        &format!("{} pool={}", m.mint, pool),
+                    );
+                    tracing::info!(
+                        "pumpportal: migration {} → {} (sig {})",
+                        m.mint,
+                        pool,
+                        m.signature.as_deref().unwrap_or("?")
+                    );
+                }
                 pumpportal::PumpEvent::Raw(value) => {
-                    // Until we've captured the migration shape, every
-                    // non-NewToken event lands here. Log at info so the
-                    // raw stream is grep-able from `docker logs` for
-                    // task 8.4. Truncated to keep log volume sane.
+                    // Unknown event shape — surface loudly so we notice
+                    // schema drift and add typed handling.
                     let s = value.to_string();
                     let preview = if s.len() > 240 { &s[..240] } else { &s[..] };
                     tracing::info!(target: "pumpportal::raw", "{}", preview);

@@ -561,32 +561,35 @@ impl BackgroundScanner {
             }
         }
 
-        // Phase 2b: Graduation detection. Same gate as Phase 2 — when
-        // PumpPortal is fresh we skip the RPC sig-walk on pumpswap
-        // because subscribeMigration pushes graduation events directly.
-        // (Until 8.4 captures the migration event shape, we don't fully
-        // trust the WS for graduation, so even when fresh we keep
-        // running the sig-walk at reduced volume — the existing path is
-        // already capped at 3/cycle and will compete cleanly with the
-        // WS path. Once 8.4 lands this gate becomes a hard skip.)
-        match discovery::check_graduated_tokens(&self.db, &self.rpc, 3).await {
-            Ok(graduated) => {
-                for analysis in &graduated {
-                    if should_track_on_watchlist(analysis, self.alert_threshold) {
-                        let _ = self
-                            .db
-                            .add_to_watchlist(&analysis.address, &analysis.confidence.classification);
-                        tracing::info!(
-                            "graduation: watchlisted {} ({})",
-                            analysis.address,
-                            analysis.confidence.classification
-                        );
+        // Phase 2b: Graduation detection. PumpPortal's subscribeMigration
+        // confirmed working (see docs/pumpportal_migration_shape.md) —
+        // events arrive within seconds of the on-chain migration tx,
+        // and the sink already adds graduated mints to the watchlist
+        // directly. Skip the RPC sig-walk when the WS is fresh; fall
+        // back to walking when the WS is stale (disconnected or the
+        // server stops pushing).
+        if !pp_fresh {
+            match discovery::check_graduated_tokens(&self.db, &self.rpc, 3).await {
+                Ok(graduated) => {
+                    for analysis in &graduated {
+                        if should_track_on_watchlist(analysis, self.alert_threshold) {
+                            let _ = self
+                                .db
+                                .add_to_watchlist(&analysis.address, &analysis.confidence.classification);
+                            tracing::info!(
+                                "graduation: watchlisted {} ({})",
+                                analysis.address,
+                                analysis.confidence.classification
+                            );
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!("check_graduated_tokens failed: {}", e);
+                }
             }
-            Err(e) => {
-                tracing::warn!("check_graduated_tokens failed: {}", e);
-            }
+        } else {
+            tracing::trace!("Phase 2b: PumpPortal fresh, skipping pumpswap sig-walk");
         }
 
         // Phase 3: Smart-wallet tracker — for each user-curated wallet, diff

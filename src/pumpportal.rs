@@ -58,16 +58,44 @@ impl Subscription {
     }
 }
 
-/// Parsed event types. We deserialize the well-documented `subscribeNewToken`
-/// shape into a struct; everything else (migrations, unknown events) ships
-/// as `Raw(serde_json::Value)` until we've captured a real sample of the
-/// shape and added a typed variant. The sink can match on the `txType`
-/// field on Raw events to detect migrations even before the parser is
-/// firmed up.
+/// Parsed event types. The two streams we subscribe to today
+/// (`subscribeNewToken`, `subscribeMigration`) get typed variants;
+/// anything unknown lands as `Raw` so the sink can still see it for
+/// debugging and we surface schema changes loudly instead of silently.
 #[derive(Debug, Clone)]
 pub enum PumpEvent {
     NewToken(NewTokenEvent),
+    Migration(MigrationEvent),
     Raw(serde_json::Value),
+}
+
+/// `subscribeMigration` event payload. Captured from a real production
+/// sample on 2026-04-28 — undocumented field shape but consistent across
+/// every event observed:
+///
+///   {
+///     "signature": "...",
+///     "mint": "...",
+///     "txType": "migrate",
+///     "pool": "pump-amm"   // or "raydium" historically
+///   }
+///
+/// Pushed when a pump.fun token completes its bonding curve and gets
+/// migrated to an AMM. Replaces the `discovery::check_graduated_tokens`
+/// RPC sig-walking path, which used to walk pumpswap signatures every
+/// 15s burning ~50 RPC calls/min.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MigrationEvent {
+    pub mint: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(rename = "txType", default)]
+    pub tx_type: Option<String>,
+    /// AMM destination — usually `"pump-amm"` post-March-2025; `"raydium"`
+    /// for the older migration path. Shown in TG cards as a transparency
+    /// signal of where the token's now trading.
+    #[serde(default)]
+    pub pool: Option<String>,
 }
 
 /// `subscribeNewToken` event payload, fields per PumpPortal docs +
@@ -240,24 +268,28 @@ async fn connect_and_listen(
     anyhow::bail!("stream ended without close frame")
 }
 
-/// Try to deserialize as NewTokenEvent first; fall back to Raw when
-/// the shape doesn't match. We pick NewToken by presence of a `mint`
-/// field AND a `txType == "create"` so trade events on tokens we
-/// happen to subscribe to don't get mis-routed once we add trade subs.
+/// Route by `txType` — currently `"create"` (new token) and `"migrate"`
+/// (graduation). Anything else falls through to Raw so unknown events
+/// surface in logs rather than getting silently parsed as the wrong
+/// thing.
 fn parse_event(text: &str) -> PumpEvent {
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return PumpEvent::Raw(serde_json::Value::String(text.to_string())),
     };
-    let is_create = value
-        .get("txType")
-        .and_then(|v| v.as_str())
-        .map(|s| s == "create")
-        .unwrap_or(false);
-    if is_create {
-        if let Ok(evt) = serde_json::from_value::<NewTokenEvent>(value.clone()) {
-            return PumpEvent::NewToken(evt);
+    let tx_type = value.get("txType").and_then(|v| v.as_str());
+    match tx_type {
+        Some("create") => {
+            if let Ok(evt) = serde_json::from_value::<NewTokenEvent>(value.clone()) {
+                return PumpEvent::NewToken(evt);
+            }
         }
+        Some("migrate") => {
+            if let Ok(evt) = serde_json::from_value::<MigrationEvent>(value.clone()) {
+                return PumpEvent::Migration(evt);
+            }
+        }
+        _ => {}
     }
     PumpEvent::Raw(value)
 }
