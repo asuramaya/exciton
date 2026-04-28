@@ -328,6 +328,24 @@ impl Db {
             "ALTER TABLE token_snapshots ADD COLUMN top_holders_json TEXT NOT NULL DEFAULT '[]'",
             [],
         );
+        // Launch forensics — persisted on the latest snapshot so should_signal
+        // can read without a separate join. Refreshed hourly per mint.
+        let _ = conn.execute(
+            "ALTER TABLE token_snapshots ADD COLUMN bundle_pct REAL NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE token_snapshots ADD COLUMN sniper_pct REAL NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE token_snapshots ADD COLUMN insider_pct REAL NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE token_snapshots ADD COLUMN forensics_computed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         // Sniper cohort — the wallets that bought in the first window of
         // a token's life. Captured once per token at discovery.
@@ -1395,6 +1413,52 @@ impl Db {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Persist the launch-forensics triple (bundle/sniper/insider %) onto
+    /// the most recent snapshot for this mint. Stamped with `computed_at` so
+    /// the caller can decide whether to refresh on the next analysis cycle.
+    pub fn update_launch_forensics(
+        &self,
+        mint: &str,
+        bundle_pct: f64,
+        sniper_pct: f64,
+        insider_pct: f64,
+        computed_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE token_snapshots
+             SET bundle_pct = ?1, sniper_pct = ?2, insider_pct = ?3, forensics_computed_at = ?4
+             WHERE id = (SELECT id FROM token_snapshots
+                         WHERE token_address = ?5 ORDER BY timestamp DESC LIMIT 1)",
+            params![bundle_pct, sniper_pct, insider_pct, computed_at, mint],
+        )?;
+        Ok(())
+    }
+
+    /// Read latest forensics + age. Returns `(bundle_pct, sniper_pct,
+    /// insider_pct, computed_at)`. If no snapshot exists or forensics never
+    /// ran, all values are 0.
+    pub fn get_latest_forensics(&self, mint: &str) -> Result<(f64, f64, f64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT bundle_pct, sniper_pct, insider_pct, forensics_computed_at
+                 FROM token_snapshots WHERE token_address = ?1
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![mint],
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.unwrap_or((0.0, 0.0, 0.0, 0)))
     }
 
     /// Replace the stored top-holders JSON for the most recent snapshot of

@@ -9,6 +9,7 @@ pub mod horizon;
 pub mod image_gen;
 pub mod ingester;
 pub mod intel;
+pub mod launch_forensics;
 pub mod market;
 pub mod mcp;
 pub mod metadata;

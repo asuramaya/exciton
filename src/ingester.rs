@@ -774,9 +774,11 @@ impl RpcRouter {
                         }
                         token_deltas.push((mint, delta));
                     }
+                    let fee_payer = account_keys.first().cloned().unwrap_or_default();
                     return Ok(WalletTxSummary {
                         sol_delta_ui,
                         token_deltas,
+                        fee_payer,
                     });
                 }
                 Err(e) => {
@@ -859,6 +861,10 @@ pub struct TokenSupplyInfo {
 pub struct WalletTxSummary {
     pub sol_delta_ui: f64,
     pub token_deltas: Vec<(String, f64)>,
+    /// First account key of the transaction — by SVM convention this is the
+    /// fee payer. For a fresh wallet's oldest tx (account creation), this is
+    /// the wallet that funded it. Used by `launch_forensics::compute_insider_pct`.
+    pub fee_payer: String,
 }
 
 /// A single (owner, mint) balance delta inside a transaction — the raw

@@ -84,6 +84,14 @@ pub const SIGNAL_MIN_TX_RATE_PER_MIN: f64 = 5.0;
 // "500+ holders in first hour = green flag" industry signal. Computed from
 // delta.holder_count_delta over delta.time_elapsed_seconds.
 pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 50.0;
+// Launch-forensics ceilings — block calls when the measured concentration
+// signals a bundle / sniper-cohort / insider-network risk. Each metric is
+// 0.0 when unmeasured (fresh token), so the gate only fires above the
+// threshold; absence of data does NOT block (the auto-refresh will catch
+// up on the next analysis cycle).
+pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
+pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
+pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 // Token must be at least this old to auto-call. Fresh-deploy dumpsters that
 // pump for 5 minutes off creator buying then bleed back to zero are the
 // majority of -90% calls. One hour gives the holder base time to validate.
@@ -356,6 +364,12 @@ impl Notifier {
                 per_hour >= SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR
             }
         });
+        // Launch-forensics ceilings: blocked when measured > threshold. A
+        // zero value means "not yet computed" — those pass through and the
+        // hourly background refresh will tighten the gate retroactively.
+        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Age floor: token must have existed long enough that the holder
         // base reflects organic distribution, not creator + initial 5
         // bonding-curve buyers.
@@ -373,6 +387,9 @@ impl Notifier {
             && tx_rate_ok
             && holder_growth_ok
             && age_ok
+            && bundle_ok
+            && sniper_ok
+            && insider_ok
     }
 
     /// Decides when an open signal's verdict has collapsed.

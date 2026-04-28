@@ -14,6 +14,7 @@ mod horizon;
 mod image_gen;
 mod ingester;
 mod intel;
+mod launch_forensics;
 mod market;
 mod mcp;
 mod metadata;

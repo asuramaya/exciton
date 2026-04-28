@@ -353,6 +353,12 @@ pub struct TokenAnalysis {
     pub scores: Vec<SignalScore>,
     pub confidence: Confidence,
     pub delta: Option<crate::db::TokenDelta>,
+    /// Launch forensics, populated from the latest snapshot row. Computed
+    /// asynchronously and refreshed hourly per mint, so values may lag the
+    /// rest of the analysis by up to 1h. Zero when never computed (fresh token).
+    pub bundle_pct: f64,
+    pub sniper_pct: f64,
+    pub insider_pct: f64,
 }
 
 /// Run all signal layers against a live token, store snapshot, compute delta
@@ -803,9 +809,64 @@ pub async fn analyze_token(
             }
         }
 
+        // Launch forensics refresh — fire-and-forget background task. Cached
+        // on the snapshot row; only rerun if the persisted stamp is older than
+        // 1 hour. Bounded ~25 RPC calls per token; spawned async so it
+        // never gates the analyze() return.
+        let now = chrono::Utc::now().timestamp();
+        let (.., forensics_age) = db
+            .get_latest_forensics(mint_address)
+            .unwrap_or((0.0, 0.0, 0.0, 0));
+        if now - forensics_age >= 3600 {
+            let mint_owned = mint_address.to_string();
+            let db_clone = db.clone();
+            let rpc_clone = rpc.clone();
+            tokio::spawn(async move {
+                let f = match crate::launch_forensics::compute(
+                    &mint_owned,
+                    &db_clone,
+                    &rpc_clone,
+                )
+                .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::debug!(
+                            "launch_forensics: {} compute failed: {}",
+                            mint_owned, e
+                        );
+                        return;
+                    }
+                };
+                let stamp = chrono::Utc::now().timestamp();
+                if let Err(e) = db_clone.update_launch_forensics(
+                    &mint_owned,
+                    f.bundle_pct,
+                    f.sniper_pct,
+                    f.insider_pct,
+                    stamp,
+                ) {
+                    tracing::warn!("launch_forensics: persist {} failed: {}", mint_owned, e);
+                } else {
+                    tracing::debug!(
+                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}%",
+                        mint_owned, f.bundle_pct, f.sniper_pct, f.insider_pct
+                    );
+                }
+            });
+        }
+
         d
     } else {
         None
+    };
+
+    // Read previously-persisted forensics. The async refresh spawned above
+    // populates these on its own cadence; reading here lets should_signal
+    // gate against them without waiting for compute() to finish.
+    let (bundle_pct, sniper_pct, insider_pct, _) = match db {
+        Some(d) => d.get_latest_forensics(mint_address).unwrap_or((0.0, 0.0, 0.0, 0)),
+        None => (0.0, 0.0, 0.0, 0),
     };
 
     Ok(TokenAnalysis {
@@ -825,5 +886,8 @@ pub async fn analyze_token(
         scores: all_scores,
         confidence,
         delta,
+        bundle_pct,
+        sniper_pct,
+        insider_pct,
     })
 }
