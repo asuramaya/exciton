@@ -1046,6 +1046,7 @@ impl DmBot {
         // (matches scanner::settle_calls thresholds). Configured
         // `call_expiry_days` is the unknown-horizon backstop only.
         let window_secs: i64 = match crate::horizon::parse(&full_note) {
+            crate::horizon::Horizon::Scalp => 4 * 3600,
             crate::horizon::Horizon::Short => 6 * 3600,
             crate::horizon::Horizon::Long => 30 * 86_400,
             crate::horizon::Horizon::Unknown => self.call_expiry_days.max(0) * 86_400,

@@ -92,6 +92,21 @@ pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 50.0;
 pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
+
+// =============================================================================
+// SCALP GATES — separate, looser bucket for sub-$250k mcap tokens that just
+// printed a 1h+ move. The thesis: catch the rip, exit on dev_selling /
+// classification regression, accept that 92% of these eventually rug.
+// Forensics gates STILL apply — we don't scalp pure bot rugs.
+// =============================================================================
+pub const SCALP_MIN_MCAP_USD: f64 = 20_000.0;
+pub const SCALP_MAX_MCAP_USD: f64 = 250_000.0;
+pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 50.0;
+pub const SCALP_MAX_AGE_SECS: i64 = 4 * 3600;
+// Higher tx_rate floor than SHORT — SCALP requires the token is actively
+// running, not just a stale shallow pump that printed +50% an hour ago.
+pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 10.0;
+pub const SCALP_MIN_HOLDER_COUNT: i32 = 50;
 // Token must be at least this old to auto-call. Fresh-deploy dumpsters that
 // pump for 5 minutes off creator buying then bleed back to zero are the
 // majority of -90% calls. One hour gives the holder base time to validate.
@@ -387,6 +402,61 @@ impl Notifier {
             && tx_rate_ok
             && holder_growth_ok
             && age_ok
+            && bundle_ok
+            && sniper_ok
+            && insider_ok
+    }
+
+    /// Scalp gate — fires on shallow-mcap tokens that just printed a 1h+
+    /// move. Looser mcap/age/holder bars than `should_signal`, but inherits
+    /// the same forensics gates (bundle/sniper/insider) since we don't
+    /// scalp pure bot rugs. The settle ladder for SCALP calls is tighter:
+    /// +30/+60 take, -30 hard stop, 4h timeout. DEV_SELLING and class
+    /// regression are the primary exits, handled by the global event-exit
+    /// path in scanner::settle_calls.
+    pub fn should_scalp_signal(
+        &self,
+        a: &TokenAnalysis,
+        meta: Option<&TokenMeta>,
+        first_seen: Option<i64>,
+    ) -> bool {
+        if self.halted() {
+            return false;
+        }
+        // Still require a known classification — we don't scalp DEAD/UNSAFE.
+        let class = a.confidence.classification.as_str();
+        let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
+        // Mcap window — explicitly the shallow zone the SHORT/LONG bucket excludes.
+        let mcap_val = meta
+            .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+            .unwrap_or(0.0);
+        let mcap_ok = mcap_val >= SCALP_MIN_MCAP_USD && mcap_val < SCALP_MAX_MCAP_USD;
+        // Recent run — token must be moving NOW, not stale.
+        let pc1h = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
+        let pc_ok = pc1h >= SCALP_MIN_PRICE_CHANGE_1H_PCT;
+        // Velocity — must be live, not just printing a high 1h on stale data.
+        let tx_rate_ok = a.tx_rate >= SCALP_MIN_TX_RATE_PER_MIN;
+        let holders_ok = (a.holder_count as i32) >= SCALP_MIN_HOLDER_COUNT;
+        // Age cap — only fresh-grad tokens; a 6-day-old shallow pump that
+        // just printed +50% is a dead-cat bounce, not a scalp setup.
+        let now = chrono::Utc::now().timestamp();
+        let age_ok = first_seen.map_or(false, |fs| now - fs <= SCALP_MAX_AGE_SECS);
+        // Liquidity — looser than SHORT but still real.
+        let liq_ok = meta
+            .and_then(|m| m.liquidity_usd)
+            .map_or(false, |v| v >= 15_000.0);
+        // Forensics ceilings — same as SHORT. Bot rugs don't pass.
+        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+
+        class_ok
+            && mcap_ok
+            && pc_ok
+            && tx_rate_ok
+            && holders_ok
+            && age_ok
+            && liq_ok
             && bundle_ok
             && sniper_ok
             && insider_ok
@@ -884,9 +954,14 @@ impl Notifier {
 
         match existing {
             None => {
-                // No existing card — check if this token qualifies for a new signal.
-                // If not, check for a near-miss and log it for truth-telling.
-                if !self.should_signal(a, effective_conf, meta.as_ref(), first_seen) {
+                // Two-tier gate: prefer the SHORT/LONG bucket (deeper, higher
+                // win rate), fall back to SCALP for shallow tokens that just
+                // printed a 1h+ move. Either passing fires a call; the chosen
+                // horizon flows into settle_calls via the note tag.
+                let standard_pass = self.should_signal(a, effective_conf, meta.as_ref(), first_seen);
+                let scalp_pass = !standard_pass
+                    && self.should_scalp_signal(a, meta.as_ref(), first_seen);
+                if !standard_pass && !scalp_pass {
                     if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf) {
                         let mom_delta = a.delta.as_ref().map(|d| d.momentum_delta);
                         let _ = self.db.insert_near_miss(
@@ -959,14 +1034,15 @@ impl Notifier {
                     .as_ref()
                     .and_then(|m| m.dex_id.clone())
                     .unwrap_or_default();
-                // Auto-call horizon heuristic: pump.fun memecoins live and die
-                // in hours, but anything entering at >= $1M mcap is past the
-                // bonding-curve life cycle — those are sit-on-it positions,
-                // not 6h swings. Without this tag, settle_calls() would
-                // expire ROTUS-class entries on its 6h SHORT timeout. Operator
-                // can still override via /close_call. The settling phase
-                // reads this tag on every cycle; missing tag = SHORT.
-                let auto_horizon = if mcap >= 1_000_000.0 {
+                // Auto-call horizon heuristic. SCALP is its own bucket (set
+                // by which gate fired). For standard signals, anything entering
+                // at >= $1M mcap is past the bonding-curve life cycle — those
+                // are sit-on-it positions, not 6h swings. Without this tag,
+                // settle_calls() would expire ROTUS-class entries on its 6h
+                // SHORT timeout.
+                let auto_horizon = if scalp_pass {
+                    crate::horizon::Horizon::Scalp
+                } else if mcap >= 1_000_000.0 {
                     crate::horizon::Horizon::Long
                 } else {
                     crate::horizon::Horizon::Short
@@ -993,6 +1069,7 @@ impl Notifier {
                     // misleading "13d left" on every call while the settling
                     // phase actually closes SHORT at 6h.
                     let window_secs: i64 = match auto_horizon {
+                        crate::horizon::Horizon::Scalp => 4 * 3600,
                         crate::horizon::Horizon::Short => 6 * 3600,
                         crate::horizon::Horizon::Long => 30 * 86_400,
                         crate::horizon::Horizon::Unknown => 14 * 86_400,

@@ -869,7 +869,9 @@ impl BackgroundScanner {
             // Horizon parsing via the shared module. Default-on-Unknown
             // is SHORT (the auto-call default; manual operator calls
             // always tag explicitly).
-            let is_long = horizon::parse(&call.note).is_long();
+            let h = horizon::parse(&call.note);
+            let is_long = h.is_long();
+            let is_scalp = h.is_scalp();
             let market = crate::market::get_market(&call.mint).await.ok().flatten();
             let current_price = market.as_ref().map(|m| m.price_usd).unwrap_or(0.0);
             // No reliable price → nothing to settle on. Could happen during
@@ -931,6 +933,21 @@ impl BackgroundScanner {
             // Action determines which DB call + which TG outcome string.
             let outcome: Option<(&'static str, String)> = if let Some(e) = event_exit {
                 Some(e)
+            } else if is_scalp {
+                // SCALP bucket: tighter ladder. Primary exits are the event-
+                // driven path above (dev_selling / class regression); these
+                // price-based rules are the safety net.
+                if pct >= 60.0 {
+                    Some(("withdrew", format!("{:+.1}% · scalp 1.6x", pct)))
+                } else if pct >= 30.0 {
+                    Some(("withdrew", format!("{:+.1}% · scalp +30 done", pct)))
+                } else if pct <= -30.0 {
+                    Some(("failed", format!("{:+.1}% · scalp stop", pct)))
+                } else if age >= 4 * 3600 {
+                    Some(("expired", format!("{:+.1}% · scalp timeout", pct)))
+                } else {
+                    None
+                }
             } else if is_long {
                 // LONG stop tightened from -70 → -50 (backtest: -50 stop adds
                 // +14% per call mean, since most -70 hits had already passed
@@ -987,15 +1004,22 @@ impl BackgroundScanner {
                 "expired" => self.db.expire_call(&call.mint, current_price, &exit_note),
                 _ => Ok(false),
             };
+            let horizon_label = if is_scalp {
+                "SCALP"
+            } else if is_long {
+                "LONG"
+            } else {
+                "SHORT"
+            };
             match db_ok {
                 Ok(true) => tracing::info!(
                     "settle: {} {} ({}={:+.1}%, age={}m, horizon={})",
                     status,
                     call.symbol,
-                    if is_long { "long" } else { "short" },
+                    horizon_label.to_lowercase(),
                     pct,
                     age / 60,
-                    if is_long { "LONG" } else { "SHORT" }
+                    horizon_label
                 ),
                 Ok(false) => continue,
                 Err(e) => {

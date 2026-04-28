@@ -12,8 +12,13 @@
 /// Canonical horizon classification. `Unknown` is the fallback when the
 /// tag is missing or malformed — callers decide their own default
 /// (settling treats Unknown as Short; UI treats it as no badge).
+///
+/// Scalp is a separate ultra-short bucket for shallow-mcap tokens that just
+/// printed a 1h+ move. Different gates (lower mcap floor) and different
+/// settle ladder (+30/+60/-30, 4h timeout) than Short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Horizon {
+    Scalp,
     Short,
     Long,
     Unknown,
@@ -26,9 +31,14 @@ impl Horizon {
         matches!(self, Horizon::Long)
     }
 
+    pub fn is_scalp(self) -> bool {
+        matches!(self, Horizon::Scalp)
+    }
+
     /// Display string for TG card headers. None means no badge shown.
     pub fn display(self) -> Option<&'static str> {
         match self {
+            Horizon::Scalp => Some("SCALP"),
             Horizon::Short => Some("SHORT TERM"),
             Horizon::Long => Some("LONG TERM"),
             Horizon::Unknown => None,
@@ -39,6 +49,7 @@ impl Horizon {
     /// the note. `Unknown` doesn't write — there's nothing to tag.
     pub fn tag(self) -> Option<&'static str> {
         match self {
+            Horizon::Scalp => Some("horizon=SCALP"),
             Horizon::Short => Some("horizon=SHORT"),
             Horizon::Long => Some("horizon=LONG"),
             Horizon::Unknown => None,
@@ -50,7 +61,9 @@ impl Horizon {
 /// `horizon=SHORT` / `horizon=LONG` pattern — freeform mentions of
 /// "long" or "horizon" without the tag map to Unknown.
 pub fn parse(note: &str) -> Horizon {
-    if note.contains("horizon=LONG") {
+    if note.contains("horizon=SCALP") {
+        Horizon::Scalp
+    } else if note.contains("horizon=LONG") {
         Horizon::Long
     } else if note.contains("horizon=SHORT") {
         Horizon::Short
