@@ -2072,6 +2072,25 @@ impl Db {
         Ok(())
     }
 
+    /// Highest observed price-pct vs `entry` since `since_ts`, in percent.
+    /// Used by SCALP "no-pump" settle to distinguish a token that briefly
+    /// ran but is now red (let it run, may recover) from one that never
+    /// went green (exit, structural failure).
+    pub fn get_peak_pct_since(&self, address: &str, since_ts: i64, entry: f64) -> Result<f64> {
+        if entry <= 0.0 {
+            return Ok(0.0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT MAX(price_usd) FROM token_snapshots
+             WHERE token_address = ?1 AND timestamp >= ?2 AND price_usd > 0",
+        )?;
+        let max_price: Option<f64> = stmt
+            .query_row(params![address, since_ts], |row| row.get(0))
+            .ok();
+        Ok(max_price.map(|p| (p / entry - 1.0) * 100.0).unwrap_or(0.0))
+    }
+
     /// Peak snapshot by confidence within a time window — used to measure
     /// collapse severity against a token's best state in recent memory.
     pub fn get_peak_snapshot(&self, address: &str, since_ts: i64) -> Result<Option<TokenSnapshot>> {

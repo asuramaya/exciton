@@ -857,15 +857,36 @@ impl BackgroundScanner {
             let outcome: Option<(&'static str, String)> = if let Some(e) = event_exit {
                 Some(e)
             } else if is_scalp {
-                // SCALP bucket: tighter ladder. Primary exits are the event-
-                // driven path above (dev_selling / class regression); these
-                // price-based rules are the safety net.
-                if pct >= 60.0 {
-                    Some(("withdrew", format!("{:+.1}% · scalp 1.6x", pct)))
+                // SCALP bucket exit ladder. Recalibrated 2026-04-29 against
+                // the 15-call cohort screenshot:
+                //   - +60 take never fired (MINIBELKA peaked +85 but settle
+                //     captured at +51.9 → +30 rule fired). Lowered to +50 so
+                //     SIR-style flash peaks (peak +63.8 → settle missed +60)
+                //     would have caught at +50 → exit ~+50 vs realized -75.7.
+                //   - Added "stale-no-pump": if held >= 30min AND never reached
+                //     +15% AND currently red, exit. NICETRUMP (held 39min,
+                //     never +20, exited -97.6) was the textbook miss.
+                if pct >= 50.0 {
+                    Some(("withdrew", format!("{:+.1}% · scalp 1.5x", pct)))
                 } else if pct >= 30.0 {
                     Some(("withdrew", format!("{:+.1}% · scalp +30 done", pct)))
                 } else if pct <= -30.0 {
                     Some(("failed", format!("{:+.1}% · scalp stop", pct)))
+                } else if age >= 30 * 60 && pct < 0.0 {
+                    // No pump after 30min — most losers (NICETRUMP, wiffy,
+                    // HSBC) bleed slowly past the -30 stop while never going
+                    // green. The peak observation lets us spare runners that
+                    // briefly went green: only fire if max-observed peak
+                    // <= +15.
+                    let peaked = self
+                        .db
+                        .get_peak_pct_since(&call.mint, call.called_at, call.entry_price_usd)
+                        .unwrap_or(pct);
+                    if peaked <= 15.0 {
+                        Some(("failed", format!("{:+.1}% · scalp no-pump", pct)))
+                    } else {
+                        None
+                    }
                 } else if age >= 4 * 3600 {
                     Some(("expired", format!("{:+.1}% · scalp timeout", pct)))
                 } else {
