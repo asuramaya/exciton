@@ -836,8 +836,15 @@ pub async fn analyze_token(
                     &db_clone,
                     &rpc_clone,
                 );
+                // 180s ceiling. Even with the parallelized fan-out, the
+                // pre-fanout serial chain (get_token_supply → largest_accounts
+                // → owner_resolution) is 3 × up-to-30s = 90s worst case
+                // before the parallel block runs. Add the parallel max of
+                // 30-60s, total can hit 120-150s during RPC-degraded periods
+                // (429s + endpoint sidelining cascade). 180s gives headroom
+                // without unbounding the task.
                 let f = match tokio::time::timeout(
-                    std::time::Duration::from_secs(90),
+                    std::time::Duration::from_secs(180),
                     compute_fut,
                 )
                 .await
@@ -852,7 +859,7 @@ pub async fn analyze_token(
                     }
                     Err(_) => {
                         tracing::warn!(
-                            "launch_forensics: {} compute timed out after 90s",
+                            "launch_forensics: {} compute timed out after 180s",
                             mint_owned
                         );
                         return;
