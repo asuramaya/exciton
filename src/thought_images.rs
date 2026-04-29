@@ -17,7 +17,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// Async git ops with hard 60s timeout per command — same fix as
+// publisher::commit_and_push. A hung `git push` could otherwise
+// freeze the image processor for many cycles (observed staleness
+// of 45 minutes vs 15-minute interval).
+use tokio::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,36 +148,33 @@ impl ThoughtImageProcessor {
         }
 
         save_manifest(&manifest_path, &manifest)?;
-        self.commit_and_push()?;
+        self.commit_and_push().await?;
         Ok(generated)
     }
 
-    fn commit_and_push(&self) -> Result<()> {
+    async fn commit_and_push(&self) -> Result<()> {
         let repo = self.repo_path.to_str().unwrap_or(".");
         // Only stage the generated artifacts + manifest. The publisher's
         // data/ changes are a separate concern.
-        Command::new("git")
-            .args(["-C", repo, "add", "assets/", "thoughts/assets.json"])
-            .output()
+        run_git(&["-C", repo, "add", "assets/", "thoughts/assets.json"])
+            .await
             .context("git add")?;
-        let status = Command::new("git")
-            .args([
-                "-C",
-                repo,
-                "status",
-                "--porcelain",
-                "--",
-                "assets/",
-                "thoughts/assets.json",
-            ])
-            .output()
-            .context("git status")?;
+        let status = run_git(&[
+            "-C",
+            repo,
+            "status",
+            "--porcelain",
+            "--",
+            "assets/",
+            "thoughts/assets.json",
+        ])
+        .await
+        .context("git status")?;
         if status.stdout.is_empty() {
             return Ok(());
         }
-        let commit = Command::new("git")
-            .args(["-C", repo, "commit", "-m", "assets: thought-image render"])
-            .output()
+        let commit = run_git(&["-C", repo, "commit", "-m", "assets: thought-image render"])
+            .await
             .context("git commit")?;
         if !commit.status.success() {
             anyhow::bail!(
@@ -181,14 +182,25 @@ impl ThoughtImageProcessor {
                 String::from_utf8_lossy(&commit.stderr)
             );
         }
-        let push = Command::new("git")
-            .args(["-C", repo, "push", "--quiet"])
-            .output()
+        let push = run_git(&["-C", repo, "push", "--quiet"])
+            .await
             .context("git push")?;
         if !push.status.success() {
             anyhow::bail!("git push failed: {}", String::from_utf8_lossy(&push.stderr));
         }
         Ok(())
+    }
+}
+
+async fn run_git(args: &[&str]) -> Result<std::process::Output> {
+    use std::time::Duration;
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    let fut = cmd.output();
+    match tokio::time::timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(anyhow::anyhow!("git spawn: {}", e)),
+        Err(_) => anyhow::bail!("git {} timed out after 60s", args.join(" ")),
     }
 }
 

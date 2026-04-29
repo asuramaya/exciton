@@ -19,7 +19,13 @@ use crate::market;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// Async git ops with hard timeouts. The previous sync std::process::Command
+// path could hang indefinitely on a stalled `git push` (slow network /
+// GitHub blip), blocking a tokio worker thread for the duration. The
+// publisher would freeze with no log lines until the underlying socket
+// timed out (often >2 minutes). Using tokio::process + timeout caps each
+// git op at 60s.
+use tokio::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -527,7 +533,7 @@ impl Publisher {
         write_json(&data_dir.join("calls.json"), &calls_file)?;
         write_json(&data_dir.join("stream.json"), &stream)?;
 
-        self.commit_and_push(&repo, now)
+        self.commit_and_push(&repo, now).await
     }
 
     async fn build_stream_file(&self) -> StreamFile {
@@ -1103,25 +1109,22 @@ impl Publisher {
         }
     }
 
-    fn commit_and_push(&self, repo: &Path, ts: i64) -> Result<bool> {
+    async fn commit_and_push(&self, repo: &Path, ts: i64) -> Result<bool> {
         let repo_arg = repo.to_str().unwrap_or(".");
-        let status = Command::new("git")
-            .args(["-C", repo_arg, "status", "--porcelain", "--", "data/"])
-            .output()
+        let status = run_git(&["-C", repo_arg, "status", "--porcelain", "--", "data/"])
+            .await
             .context("git status")?;
         if status.stdout.is_empty() {
             return Ok(false);
         }
 
-        Command::new("git")
-            .args(["-C", repo_arg, "add", "data/"])
-            .output()
+        run_git(&["-C", repo_arg, "add", "data/"])
+            .await
             .context("git add")?;
 
         let msg = format!("data: snapshot {}", ts);
-        let commit = Command::new("git")
-            .args(["-C", repo_arg, "commit", "-m", &msg])
-            .output()
+        let commit = run_git(&["-C", repo_arg, "commit", "-m", &msg])
+            .await
             .context("git commit")?;
         if !commit.status.success() {
             anyhow::bail!(
@@ -1135,9 +1138,8 @@ impl Publisher {
         // changes from local), pull --rebase to grab their work, then push
         // again. Without this, every operator local push leaves the
         // publisher stuck rejected until someone pulls in-container.
-        let push = Command::new("git")
-            .args(["-C", repo_arg, "push", "--quiet"])
-            .output()
+        let push = run_git(&["-C", repo_arg, "push", "--quiet"])
+            .await
             .context("git push")?;
         if push.status.success() {
             return Ok(true);
@@ -1155,24 +1157,20 @@ impl Publisher {
         }
 
         tracing::info!("publisher: push rejected, pulling --rebase and retrying");
-        let pull = Command::new("git")
-            .args(["-C", repo_arg, "pull", "--rebase", "--quiet"])
-            .output()
+        let pull = run_git(&["-C", repo_arg, "pull", "--rebase", "--quiet"])
+            .await
             .context("git pull --rebase")?;
         if !pull.status.success() {
             // Conflict during rebase. Abort so we leave the tree clean
             // for the next tick instead of stuck mid-rebase.
-            let _ = Command::new("git")
-                .args(["-C", repo_arg, "rebase", "--abort"])
-                .output();
+            let _ = run_git(&["-C", repo_arg, "rebase", "--abort"]).await;
             anyhow::bail!(
                 "git pull --rebase failed: {}",
                 String::from_utf8_lossy(&pull.stderr)
             );
         }
-        let push2 = Command::new("git")
-            .args(["-C", repo_arg, "push", "--quiet"])
-            .output()
+        let push2 = run_git(&["-C", repo_arg, "push", "--quiet"])
+            .await
             .context("git push (retry)")?;
         if !push2.status.success() {
             anyhow::bail!(
@@ -1181,6 +1179,22 @@ impl Publisher {
             );
         }
         Ok(true)
+    }
+}
+
+/// Run a git subcommand with a hard 60s timeout. Returns the same Output
+/// shape as Command::output() but kills the child if the call doesn't
+/// return within the window — preventing hung git push from freezing
+/// the publisher loop.
+async fn run_git(args: &[&str]) -> Result<std::process::Output> {
+    use std::time::Duration;
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    let fut = cmd.output();
+    match tokio::time::timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(anyhow::anyhow!("git spawn: {}", e)),
+        Err(_) => anyhow::bail!("git {} timed out after 60s", args.join(" ")),
     }
 }
 
