@@ -3,6 +3,7 @@ pub mod bot;
 pub mod config;
 pub mod db;
 pub mod discovery;
+pub mod discovery_pollers;
 pub mod execution;
 pub mod forecaster;
 pub mod horizon;

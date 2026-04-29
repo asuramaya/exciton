@@ -8,6 +8,7 @@ mod bot;
 mod config;
 mod db;
 mod discovery;
+mod discovery_pollers;
 mod execution;
 mod forecaster;
 mod horizon;
@@ -253,6 +254,13 @@ async fn main() -> Result<()> {
 
     let scanner_handle = scanner.start();
     tracing::info!("Background scanner started");
+
+    // Free-tier discovery pollers — broadens coverage beyond PumpPortal
+    // (pump.fun-only). DexScreener round-robin across token-profiles +
+    // token-boosts catches non-pump.fun launchpads (Raydium-direct,
+    // Moonshot, Believe) and any pump.fun events PumpPortal dropped.
+    // 3 HTTPS calls/min total, no auth, no key.
+    discovery_pollers::DiscoveryPoller::new(db.clone()).spawn();
 
     // MadApes.ai publisher — pushes data/*.json snapshots to the public repo
     // on a fixed interval. Notes under thoughts/ are left alone (append-only,

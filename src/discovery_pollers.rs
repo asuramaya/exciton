@@ -1,0 +1,144 @@
+//! Free-tier discovery pollers — supplements PumpPortal WS by rotating
+//! through public DexScreener endpoints to catch tokens the WS feed
+//! missed (lossy events) and tokens from non-pump.fun launchpads
+//! (Raydium-direct, Moonshot, etc.) that PumpPortal doesn't cover at all.
+//!
+//! Three endpoints, round-robin one per 60s tick. All free, no auth,
+//! no key. DexScreener's documented public API:
+//!   - /token-profiles/latest/v1   — recently profiled tokens
+//!   - /token-boosts/latest/v1     — recently boosted (paid promos)
+//!   - /token-boosts/top/v1        — top boosted right now
+//!
+//! Each tick fetches one source, filters to chainId="solana", and adds
+//! any mint not already in `tokens` to the watchlist. The downstream
+//! pipeline (analyze_token + gates) decides what to do with them.
+//!
+//! Cost: 3 HTTPS calls per minute total, ~5 MB/day of bandwidth.
+
+use crate::db::Db;
+use anyhow::Result;
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+
+const ENDPOINTS: &[&str] = &[
+    "https://api.dexscreener.com/token-profiles/latest/v1",
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
+];
+
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+
+pub struct DiscoveryPoller {
+    db: Arc<Db>,
+    http: reqwest::Client,
+}
+
+impl DiscoveryPoller {
+    pub fn new(db: Arc<Db>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent("photon/0.1 (free-tier discovery poller)")
+            .build()
+            .expect("reqwest client init");
+        Self { db, http }
+    }
+
+    pub fn spawn(self) {
+        tokio::spawn(async move {
+            // Skip the immediate first tick — let the rest of the
+            // pipeline warm up before we start adding fresh discovery
+            // load on top.
+            let mut tick = tokio::time::interval(POLL_INTERVAL);
+            tick.tick().await;
+            tracing::info!(
+                "discovery pollers started ({} sources, {}s round-robin)",
+                ENDPOINTS.len(),
+                POLL_INTERVAL.as_secs()
+            );
+            let mut idx = 0usize;
+            loop {
+                tick.tick().await;
+                let url = ENDPOINTS[idx % ENDPOINTS.len()];
+                idx = idx.wrapping_add(1);
+                match self.poll_one(url).await {
+                    Ok(added) => {
+                        if added > 0 {
+                            tracing::info!(
+                                "discovery poll: {} new mints from {}",
+                                added,
+                                short_url(url)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("discovery poll {} failed: {}", short_url(url), e);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn poll_one(&self, url: &str) -> Result<usize> {
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("status {}", resp.status());
+        }
+        let items: Vec<DsTokenRef> = resp.json().await?;
+        let mut added = 0;
+        for item in items {
+            if item.chain_id.as_deref() != Some("solana") {
+                continue;
+            }
+            let Some(mint) = item.token_address else {
+                continue;
+            };
+            // Already known — leave it alone. The watchlist scanner
+            // owns reanalysis cadence; we only seed new mints.
+            if self
+                .db
+                .get_token(&mint)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            if let Err(e) = self.db.insert_token(&mint, 0) {
+                tracing::debug!("discovery poll: insert_token {} failed: {}", mint, e);
+                continue;
+            }
+            // Seed with a placeholder classification — analyze_token
+            // overwrites with real reading on the first scan.
+            if let Err(e) = self.db.add_to_watchlist(&mint, "DEVELOPING") {
+                tracing::debug!("discovery poll: add_to_watchlist {} failed: {}", mint, e);
+                continue;
+            }
+            added += 1;
+        }
+        Ok(added)
+    }
+}
+
+#[derive(Deserialize)]
+struct DsTokenRef {
+    #[serde(rename = "chainId")]
+    chain_id: Option<String>,
+    #[serde(rename = "tokenAddress")]
+    token_address: Option<String>,
+}
+
+fn short_url(u: &str) -> &str {
+    u.rsplit_once('/').map(|(_, t)| t).unwrap_or(u);
+    // The endpoints all share the /v1 suffix; pick a more useful slice.
+    if u.contains("token-profiles") {
+        "ds:profiles"
+    } else if u.contains("token-boosts/latest") {
+        "ds:boosts-latest"
+    } else if u.contains("token-boosts/top") {
+        "ds:boosts-top"
+    } else {
+        "ds:?"
+    }
+}
