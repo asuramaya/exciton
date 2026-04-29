@@ -17,6 +17,7 @@ const WATCHLIST_MIN_RESCAN_BATCH: usize = 6;
 const SIGNAL_MIN_WATCHLIST_AGE_SECONDS: i64 = 120;
 
 /// Background scanner that continuously discovers and analyzes tokens
+#[derive(Clone)]
 pub struct BackgroundScanner {
     db: Arc<Db>,
     rpc: Arc<RpcRouter>,
@@ -225,18 +226,19 @@ impl BackgroundScanner {
             .db
             .audit_log("scanner", "start", "Background scanner started");
 
-        // One-time startup cleanup: auto-fail any active call whose watchlist
-        // entry is already inactive. These orphans arise when the service
-        // restarted after a watchlist deactivation but before the auto-fail
-        // hook ran. Without this, they sit open forever.
-        self.cleanup_orphaned_calls().await;
-
-        // One-shot card backfill: walk closed calls whose TG delivery never
-        // got a proper outcome edit (voided cards from orphan-cleanup, old
-        // demote/FAILED flips from the should_fail data-glitch era), and
-        // re-render with the current caller-voice format + correct verdict
-        // header. Idempotent — re-runs are no-ops once the channel is clean.
-        self.backfill_terminal_deliveries().await;
+        // One-time startup cleanup + card backfill — spawned as a sibling
+        // task so the main scan loop can begin immediately. Backfill walks
+        // up to 200 closed calls editing TG cards at 2s/card pacing (~6+
+        // minutes) — used to block the scan loop on every restart, blanking
+        // the live ledger for 6 min just to re-render history that's already
+        // correct. Now both run concurrently with scanning.
+        {
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.cleanup_orphaned_calls().await;
+                me.backfill_terminal_deliveries().await;
+            });
+        }
 
         let mut cycle = 0u64;
         while self.running.load(AtomicOrdering::SeqCst) {
