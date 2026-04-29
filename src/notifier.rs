@@ -99,7 +99,11 @@ pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 // effectively disabled (RPC-capped at 20). Forensics gates retained — same
 // thresholds as SHORT — to filter pure bot rugs.
 // =============================================================================
-pub const SCALP_MIN_MCAP_USD: f64 = 80_000.0;
+// Floor at $60k after observing 7G1JZK87EbvZ (mcap $73k, conf 71 STAIRCASE,
+// txr 375/min, pc1h +55.8%, all forensics 0) — a textbook SCALP candidate
+// that was being blocked by the $80k floor by just $7k. BLIMP historical
+// winner was at $82k mcap; lowering opens up the immediately-adjacent zone.
+pub const SCALP_MIN_MCAP_USD: f64 = 60_000.0;
 pub const SCALP_MAX_MCAP_USD: f64 = 500_000.0;
 pub const SCALP_MAX_TOP_HOLDER_PCT: f64 = 14.0;
 pub const SCALP_MAX_TOP10_PCT: f64 = 40.0;
