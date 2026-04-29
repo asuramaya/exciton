@@ -10,6 +10,13 @@ use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::UiTransactionEncoding;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Per-RPC-call HTTP timeout. Without this, a stalled provider can hang the
+/// whole publisher loop indefinitely (observed 2026-04-29: publisher froze
+/// for 1+ hour with zero log lines after a cascade of 429/403s left every
+/// RPC call awaiting a response that never came).
+const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single RPC endpoint with health tracking
 struct Endpoint {
@@ -22,7 +29,11 @@ struct Endpoint {
 
 impl Endpoint {
     fn new(url: &str) -> Self {
-        let client = RpcClient::new_with_commitment(url.to_string(), CommitmentConfig::confirmed());
+        let client = RpcClient::new_with_timeout_and_commitment(
+            url.to_string(),
+            RPC_CALL_TIMEOUT,
+            CommitmentConfig::confirmed(),
+        );
         Self {
             url: url.to_string(),
             client,

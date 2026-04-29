@@ -776,19 +776,23 @@ pub async fn analyze_token(
             let _ = db.update_latest_top_holders_json(mint_address, &json);
         }
 
-        // Dev-wallet sell detector: compare current deployer balance against
-        // the recorded "initial" balance from discovery time. A drop of ≥10%
-        // in their holding is a classic rug-in-progress signal.
+        // Dev-wallet sell detector. Threshold raised from 10% → 30% based on
+        // mining of 1717 dev_selling alerts over 7d (2026-04-29 session):
+        // 30m_mean post-alert was +10.5% (BULLISH on average), with 35%
+        // gaining >15% vs 36% dropping >15% — i.e., light dev-selling is
+        // noise. Only severe exits (>=30% drop) carry directional weight.
+        // The settle phase already filters with `has_recent_severe_alert`
+        // (conf >= 90, drop >= 40); raising the insert threshold prevents
+        // the alerts table from filling with non-predictive 10-20% drops.
         if let Ok(Some((dep_addr, initial_bal))) = db.get_deployer(mint_address) {
             if !dep_addr.is_empty() && initial_bal > 0.0 {
-                // Current balance: find the deployer in the fresh holder list.
                 let current_bal = holders
                     .iter()
                     .find(|h| h.address == dep_addr)
                     .map(|h| h.ui_amount)
                     .unwrap_or(0.0);
                 let drop_pct = (1.0 - current_bal / initial_bal) * 100.0;
-                if drop_pct >= 10.0 {
+                if drop_pct >= 30.0 {
                     let _ = db.insert_alert(
                         "dev_selling",
                         Some(mint_address),

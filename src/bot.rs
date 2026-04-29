@@ -2429,27 +2429,47 @@ pub async fn serve_claw_api(
                         })
                     }
                     "/api/state/settle-rules" => {
-                        // Hardcoded mirror of scanner::settle_calls. Static
-                        // until the rules become config-driven.
+                        // Hardcoded mirror of scanner::settle_calls + the
+                        // global event-driven exit path. Refreshed 2026-04-29
+                        // after the b/s gate and SCALP horizon shipped.
+                        // Source-of-truth: src/scanner.rs::settle_calls.
                         serde_json::json!({
+                            "event_exits": {
+                                "default_for": "all horizons — checked before price ladder",
+                                "triggers": [
+                                    { "trigger": "dev_selling alert in last 30m with confidence >=90 (deployer drop >=40%)", "outcome": "failed", "verdict": "severe dev exit" },
+                                    { "trigger": "current snapshot classification in {ACTIVE_TRAP, CRASHING, DEAD, UNSAFE_*}", "outcome": "failed", "verdict": "structural collapse" }
+                                ]
+                            },
+                            "scalp": {
+                                "horizon": "SCALP",
+                                "default_for": "shallow-mcap auto-calls ($60k-$500k mcap, 1h+50% momentum)",
+                                "triggers": [
+                                    { "trigger": "+60%", "outcome": "withdrew", "verdict": "scalp 1.6x" },
+                                    { "trigger": "+30%", "outcome": "withdrew", "verdict": "scalp +30 done" },
+                                    { "trigger": "-30%", "outcome": "failed", "verdict": "scalp stop" },
+                                    { "trigger": "age >=4h", "outcome": "expired", "verdict": "scalp timeout" }
+                                ]
+                            },
                             "short": {
                                 "horizon": "SHORT",
-                                "default_for": "auto-call entries < $1M mcap",
+                                "default_for": "deep-market auto-calls (>=$500k mcap, < $1M)",
                                 "triggers": [
                                     { "trigger": "+100%", "outcome": "withdrew", "verdict": "2x done" },
                                     { "trigger": "+50%",  "outcome": "withdrew", "verdict": "took the win" },
                                     { "trigger": "-25% within first 30min", "outcome": "failed", "verdict": "early collapse" },
                                     { "trigger": "-40%", "outcome": "failed", "verdict": "thesis broke" },
-                                    { "trigger": "tx_rate ≤10% of entry, 2 consecutive snapshots", "outcome": "withdrew", "verdict": "energy gone" },
-                                    { "trigger": "age ≥6h", "outcome": "expired", "verdict": "no follow-through" }
+                                    { "trigger": "tx_rate <=10% of entry on 2 consecutive snapshots", "outcome": "withdrew", "verdict": "energy gone" },
+                                    { "trigger": "age >=6h", "outcome": "expired", "verdict": "no follow-through" }
                                 ]
                             },
                             "long": {
                                 "horizon": "LONG",
-                                "default_for": "auto-call entries ≥ $1M mcap; operator /call <mint> long",
+                                "default_for": "auto-call entries >= $1M mcap; operator /call <mint> long",
                                 "triggers": [
-                                    { "trigger": "-70%", "outcome": "failed", "verdict": "thesis broke" },
-                                    { "trigger": "age ≥30d", "outcome": "expired", "verdict": "30d hold complete" }
+                                    { "trigger": "+150%", "outcome": "withdrew", "verdict": "2.5x done" },
+                                    { "trigger": "-50%", "outcome": "failed", "verdict": "thesis broke" },
+                                    { "trigger": "age >=30d", "outcome": "expired", "verdict": "30d hold complete" }
                                 ]
                             }
                         })

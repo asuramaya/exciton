@@ -1955,6 +1955,19 @@ impl Db {
         Ok(())
     }
 
+    /// Bump only `last_checked` without touching classification. Used by the
+    /// scanner when an analysis fails — moves the failing token to the back
+    /// of the queue so subsequent items get a turn.
+    pub fn update_watchlist_last_checked_only(&self, address: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE watchlist SET last_checked = ?1 WHERE token_address = ?2",
+            params![now, address],
+        )?;
+        Ok(())
+    }
+
     pub fn deactivate_watchlist(&self, address: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

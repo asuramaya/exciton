@@ -392,6 +392,14 @@ impl BackgroundScanner {
                 }
                 Err(e) => {
                     tracing::warn!("Watchlist re-analysis failed for {}: {}", addr, e);
+                    // Update last_checked even on failure so a persistently-
+                    // failing token (e.g. all RPCs returning errors) doesn't
+                    // block the queue. Without this, the same token gets
+                    // retried every cycle, starving newer items in the
+                    // backlog.
+                    let _ = self
+                        .db
+                        .update_watchlist_last_checked_only(addr);
                 }
             }
         }
