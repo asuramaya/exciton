@@ -882,28 +882,43 @@ impl BackgroundScanner {
             let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
             let age = now - call.called_at;
 
-            // Event-driven exits — REVISED 2026-04-29 after mining 1700+
-            // dev_selling alerts and 1200+ class_regression alerts against
-            // subsequent 30-min price action. KEY FINDING: these alerts are
-            // NOT bearish on average — dev_selling 30m_mean +10.5%,
-            // class_regression +7.4%, concentrating +31.1%. The original
-            // event-exit code was force-closing calls into rallies (matches
-            // the SCAMC/$RESET screenshots showing tokens up +87% while
-            // DEV_SELLING fires).
+            // Event-driven exits — final calibration after live observation
+            // 2026-04-29:
+            //   - dev_selling base rate is +10.5% / 30min (NOT bearish)
+            //   - class_regression (soft, e.g. STAIRCASE→GRINDER) is +7.4%
+            //     (NOT bearish either)
+            //   - BUT chadhouse (call 52, -45% loss) went STAIRCASE→ACTIVE_TRAP
+            //     in 11min, a structural collapse not captured by soft-
+            //     regression analysis. Terminal classifications (ACTIVE_TRAP,
+            //     CRASHING, DEAD, UNSAFE_*) are categorically different.
             //
-            // Conservative fix: only act on SEVERE dev-selling (alert
-            // confidence >= 90, which corresponds to deployer drop >= 40%
-            // per signals/mod.rs scoring). Class regression no longer a
-            // close trigger at all. The price-based ladder (TP/SL) handles
-            // the actual outcome correctly.
+            // Three-trigger event exit: severe dev exit (alert conf >= 90,
+            // deployer drop >= 40%), terminal classification, OR multiple
+            // adverse signals firing within the same 30min window.
             let event_window_secs = 30 * 60i64;
             let event_since = now - event_window_secs;
             let severe_dev_selling = self
                 .db
                 .has_recent_severe_alert(&call.mint, "dev_selling", event_since, 90)
                 .unwrap_or(false);
+            let terminal_class = self
+                .db
+                .get_latest_snapshot(&call.mint)
+                .ok()
+                .flatten()
+                .map(|s| {
+                    let c = s.classification.as_str();
+                    c == "ACTIVE_TRAP"
+                        || c == "CRASHING"
+                        || c == "DEAD"
+                        || c.starts_with("UNSAFE")
+                })
+                .unwrap_or(false);
+
             let event_exit: Option<(&'static str, String)> = if severe_dev_selling {
                 Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
+            } else if terminal_class {
+                Some(("failed", format!("{:+.1}% · structural collapse", pct)))
             } else {
                 None
             };
