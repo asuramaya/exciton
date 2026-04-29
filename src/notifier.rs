@@ -452,12 +452,17 @@ impl Notifier {
                 per_hour >= SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR
             }
         });
-        // Launch-forensics ceilings: blocked when measured > threshold. A
-        // zero value means "not yet computed" — those pass through and the
-        // hourly background refresh will tighten the gate retroactively.
-        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
-        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Launch-forensics: blocked when measured > threshold OR when never
+        // measured. Audit 2026-04-29 found 11/15 calls fired with
+        // forensics_computed_at=0 — bundle/sniper/insider all defaulted to 0
+        // and silently passed every gate. Now: require forensics_computed_at
+        // > 0 (i.e. the async refresh has populated at least once for this
+        // mint). New tokens skip their first-fire window; second analysis
+        // cycle (~5min later) reads fresh data and can fire.
+        let forensics_measured = a.forensics_computed_at > 0;
+        let bundle_ok = forensics_measured && a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = forensics_measured && a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = forensics_measured && a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate: organic accumulation lives in 0.9-1.6.
         // Below = already dumping. Above = late-stage FOMO peak.
         let total_txns = a.buys_h1 + a.sells_h1;
@@ -536,10 +541,13 @@ impl Notifier {
         // ranged 9.3-13.4% top1, 28.7-36.1% top10.
         let top1_ok = a.top_holder_pct < SCALP_MAX_TOP_HOLDER_PCT;
         let top10_ok = a.top10_pct < SCALP_MAX_TOP10_PCT;
-        // Forensics ceilings — same as SHORT. Bot rugs don't pass.
-        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
-        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Forensics ceilings — same as SHORT. Bot rugs don't pass. Required
+        // measurement: a token with forensics_computed_at=0 (never measured)
+        // fails all three gates, deferring fire until next analysis cycle.
+        let forensics_measured = a.forensics_computed_at > 0;
+        let bundle_ok = forensics_measured && a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = forensics_measured && a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = forensics_measured && a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate — the strongest single signal in the
         // 11-call live SCALP backtest. Inherited from SHORT.
         let total_txns = a.buys_h1 + a.sells_h1;

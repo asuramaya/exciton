@@ -348,6 +348,11 @@ pub struct TokenAnalysis {
     /// Smart-money proxy: count of top-20 holders that hold at least one
     /// operator-curated reference mint. Zero when no refs are seeded.
     pub smart_money_count: i32,
+    /// When forensics last computed (unix seconds). 0 = never measured —
+    /// gates treat 0 as "data unavailable, do not fire" so calls never go
+    /// out on tokens whose bundle/sniper/insider have defaulted-to-zero
+    /// rather than been measured.
+    pub forensics_computed_at: i64,
     /// Trailing 1h buy count (DexScreener `txns.h1.buys`).
     pub buys_h1: i32,
     /// Trailing 1h sell count.
@@ -819,18 +824,34 @@ pub async fn analyze_token(
             let db_clone = db.clone();
             let rpc_clone = rpc.clone();
             tokio::spawn(async move {
-                let f = match crate::launch_forensics::compute(
+                // Hard cap: each compute() does up to ~45 RPC calls. With
+                // 30s per-call timeouts that could in principle take 20+
+                // minutes if every call retries through every endpoint.
+                // 90s ceiling keeps the spawned task bounded so it doesn't
+                // stack up across many tokens during an RPC degraded period.
+                let compute_fut = crate::launch_forensics::compute(
                     &mint_owned,
                     &db_clone,
                     &rpc_clone,
+                );
+                let f = match tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    compute_fut,
                 )
                 .await
                 {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::debug!(
-                            "launch_forensics: {} compute failed: {}",
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "launch_forensics: {} compute err: {}",
                             mint_owned, e
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "launch_forensics: {} compute timed out after 90s",
+                            mint_owned
                         );
                         return;
                     }
@@ -846,9 +867,12 @@ pub async fn analyze_token(
                 ) {
                     tracing::warn!("launch_forensics: persist {} failed: {}", mint_owned, e);
                 } else {
-                    tracing::debug!(
-                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}% smart_money={}",
-                        mint_owned, f.bundle_pct, f.sniper_pct, f.insider_pct, f.smart_money_count
+                    // Elevated debug→info so we can see the cadence in logs
+                    // without enabling debug-level globally.
+                    tracing::info!(
+                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}% smart={}",
+                        &mint_owned[..mint_owned.len().min(12)],
+                        f.bundle_pct, f.sniper_pct, f.insider_pct, f.smart_money_count
                     );
                 }
             });
@@ -862,12 +886,13 @@ pub async fn analyze_token(
     // Read previously-persisted forensics. The async refresh spawned above
     // populates these on its own cadence; reading here lets should_signal
     // gate against them without waiting for compute() to finish.
-    let (bundle_pct, sniper_pct, insider_pct, smart_money_count, _) = match db {
-        Some(d) => d
-            .get_latest_forensics(mint_address)
-            .unwrap_or((0.0, 0.0, 0.0, 0, 0)),
-        None => (0.0, 0.0, 0.0, 0, 0),
-    };
+    let (bundle_pct, sniper_pct, insider_pct, smart_money_count, forensics_computed_at) =
+        match db {
+            Some(d) => d
+                .get_latest_forensics(mint_address)
+                .unwrap_or((0.0, 0.0, 0.0, 0, 0)),
+            None => (0.0, 0.0, 0.0, 0, 0),
+        };
 
     Ok(TokenAnalysis {
         address: mint_address.to_string(),
@@ -890,6 +915,7 @@ pub async fn analyze_token(
         sniper_pct,
         insider_pct,
         smart_money_count,
+        forensics_computed_at,
         buys_h1: market.as_ref().map(|m| m.buys_h1).unwrap_or(0),
         sells_h1: market.as_ref().map(|m| m.sells_h1).unwrap_or(0),
     })
