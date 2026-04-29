@@ -1273,11 +1273,17 @@ fn has_favorable_watchlist_profile(candidate: &crate::db::WatchlistCandidate) ->
     let momentum = candidate.snapshot_momentum.unwrap_or(0);
     let distribution = candidate.snapshot_distribution.unwrap_or(0);
 
+    // Holder thresholds dropped 30 → 15: getTokenLargestAccounts caps the
+    // holder count at 20 in our sampling, so 30 was unreachable. Result:
+    // every token that drifted to DEVELOPING got evicted at 1h regardless
+    // of structural quality. NOHOUSE (call 64) was the canonical loss —
+    // entered SCALP at GRINDER, drifted to DEVELOPING, evicted before
+    // recovering. 15 is the realistic ceiling under RPC cap.
     matches!(class, "STAIRCASE" | "GRINDER" | "SPRING")
-        || (class == "SURGE" && confidence >= 80 && holders >= 30 && top_holder_pct <= 22.0)
+        || (class == "SURGE" && confidence >= 80 && holders >= 15 && top_holder_pct <= 22.0)
         || (class == "DEVELOPING"
             && confidence >= 70
-            && holders >= 30
+            && holders >= 15
             && top_holder_pct <= 25.0
             && momentum >= 50
             && distribution >= 60)
@@ -1291,7 +1297,12 @@ fn should_evict_watchlist_candidate(candidate: &crate::db::WatchlistCandidate, n
     if matches!(class, "DEAD" | "CRASHING" | "ACTIVE_TRAP") || class.starts_with("UNSAFE") {
         return true;
     }
-    if holders > 0 && holders < 25 && top_holder_pct >= 33.0 {
+    // Parallel concentration trigger to should_remove_from_watchlist.
+    // top1>=50 is the unambiguous "one whale owns it all" cut. The earlier
+    // (holders<25 && top1>=33) was permanently-true on the first leg
+    // because RPC caps holder count at 20.
+    let _ = holders; // retained for future use; not gating today
+    if top_holder_pct >= 50.0 {
         return true;
     }
     now - candidate.added_at > WATCHLIST_STALE_SECONDS
@@ -1427,10 +1438,14 @@ fn should_remove_from_watchlist(analysis: &TokenAnalysis) -> bool {
         .scores
         .iter()
         .any(|s| s.signal_type == "liquidity_depth");
+    // Concentration trigger: rather than holders<25, use top1>=50%. The
+    // holder count is RPC-capped at 20; a 25-floor was always-true and the
+    // top-holder threshold was the real signal anyway. Tokens with one
+    // wallet holding >=50% are unambiguously concentrated.
     (class == "DEAD" && has_market_signal)
         || matches!(class, "CRASHING" | "ACTIVE_TRAP")
         || class.starts_with("UNSAFE")
-        || (analysis.holder_count < 25 && analysis.top_holder_pct >= 33.0)
+        || analysis.top_holder_pct >= 50.0
 }
 
 // Only auto-close a public call for on-chain confirmed safety violations.
@@ -1486,7 +1501,9 @@ mod tests {
             snapshot_classification: Some("DEVELOPING".into()),
             snapshot_confidence: Some(59),
             snapshot_holder_count: Some(20),
-            snapshot_top_holder_pct: Some(37.0),
+            // top1 raised to 55 to trigger the concentration eviction
+            // (>=50 cut after the 2026-04-29 watchlist tuning).
+            snapshot_top_holder_pct: Some(55.0),
             snapshot_momentum: Some(54),
             snapshot_distribution: Some(48),
             snapshot_timestamp: Some(now - 120),

@@ -998,7 +998,7 @@ impl PhotonServer {
     /// picks up any `<div class="img-placeholder">[IMAGE: ...]</div>` blocks
     /// on its next 15-minute tick (no action needed here).
     #[tool]
-    fn post_note(&self, Parameters(params): Parameters<PostNoteParams>) -> String {
+    async fn post_note(&self, Parameters(params): Parameters<PostNoteParams>) -> String {
         let _ = self.db.audit_log("claude", "post_note", &params.title);
         let Some(mp) = self.config.madapes.clone() else {
             return "{\"error\":\"madapes config missing\"}".to_string();
@@ -1042,20 +1042,17 @@ impl PhotonServer {
             serde_json::to_string_pretty(&index_val).unwrap_or_default(),
         );
 
-        // git add + commit + push with the `note:` prefix.
+        // git add + commit + push with the `note:` prefix. Each git op
+        // capped at 60s via tokio::process + timeout — same pattern as
+        // publisher::run_git, prevents hung pushes from blocking the
+        // MCP tool indefinitely (and stealing a tokio worker thread).
         let repo = &mp.repo_path;
         let msg = format!("note: {}", params.title);
-        let _ = std::process::Command::new("git")
-            .args(["-C", repo, "add", "thoughts/"])
-            .output();
-        let commit = std::process::Command::new("git")
-            .args(["-C", repo, "commit", "-m", &msg])
-            .output();
+        let _ = run_git_with_timeout(&["-C", repo, "add", "thoughts/"]).await;
+        let commit = run_git_with_timeout(&["-C", repo, "commit", "-m", &msg]).await;
         let committed = commit.as_ref().map(|o| o.status.success()).unwrap_or(false);
         if committed {
-            let _ = std::process::Command::new("git")
-                .args(["-C", repo, "push", "--quiet"])
-                .output();
+            let _ = run_git_with_timeout(&["-C", repo, "push", "--quiet"]).await;
         }
 
         serde_json::json!({
@@ -1632,5 +1629,20 @@ impl ServerHandler for PhotonServer {
                     .to_string(),
             ),
         }
+    }
+}
+
+/// Async git invocation with a hard 60s timeout. Mirrors the helper in
+/// publisher.rs / thought_images.rs — keeps a stalled `git push` from
+/// blocking an MCP tool call (and the underlying tokio worker thread).
+async fn run_git_with_timeout(args: &[&str]) -> Result<std::process::Output, anyhow::Error> {
+    use std::time::Duration;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args);
+    let fut = cmd.output();
+    match tokio::time::timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(anyhow::anyhow!("git spawn: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("git {} timed out after 60s", args.join(" "))),
     }
 }
