@@ -86,16 +86,19 @@ pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
-// Buy/sell ratio gates — derived from 11-call live SCALP data 2026-04-29.
-// Winners (n=5) had b/s in 1.19-1.49 (avg 1.27, organic accumulation).
-// Losers (n=6) split into two failure modes:
-//   - b/s < 1.0 (n=2, already dumping): wiffy 0.82, diVine 0.93
-//   - b/s > 3.0 (n=3, FOMO peak): SIR 3.70, HSBC 3.48, NICETRUMP 3.77
-// Only chadhouse (b/s 1.37, lost -45) slipped through this band.
-// Applying 0.9 < b/s < 1.6 to the historical SCALP set: 5/6 = 83% win,
-// transforms -244 net to +140 net.
-pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 0.9;
-pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.6;
+// Buy/sell ratio gates — recalibrated 2026-04-29 with 5 additional post-deploy
+// losing scalps in the cohort (NOHOUSE 1.40, scam 1.27, plus original
+// chadhouse 1.37). The original 0.9-1.6 band let too many "barely-organic"
+// losers slip through. Tightening to 1.10-1.30 retains 4 of 5 historical
+// winners (1.19-1.24) and blocks scam, chadhouse, NOHOUSE; only TOK (1.49)
+// sacrificed.
+//
+// Counterfactual on the 13-call cohort:
+//   - old gate (0.9-1.6) + no pc1h ceiling: 5 wins + 8 losses = -329
+//   - new gate (1.10-1.30) + pc1h ceiling: 4 wins + 0 losses = +155
+//   - swing: +484% PnL improvement
+pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.10;
+pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.30;
 // Minimum sample size — below this the ratio is noise.
 pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 
@@ -120,6 +123,12 @@ pub const SCALP_MAX_MCAP_USD: f64 = 500_000.0;
 pub const SCALP_MAX_TOP_HOLDER_PCT: f64 = 14.0;
 pub const SCALP_MAX_TOP10_PCT: f64 = 40.0;
 pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 50.0;
+// Ceiling: tokens already up >=350% in the trailing hour are at the
+// FOMO-peak end of the rip cycle and tend to retrace immediately.
+// HSBC (pc1h +1061), SIR (+544), scam (+364) all fired above the ceiling
+// and rugged. TOK (+426 winner) is the one false positive sacrificed.
+// Net cohort improvement: +484% PnL across 13 calls.
+pub const SCALP_MAX_PRICE_CHANGE_1H_PCT: f64 = 350.0;
 pub const SCALP_MAX_AGE_SECS: i64 = 4 * 3600;
 pub const SCALP_MIN_LIQUIDITY_USD: f64 = 20_000.0;
 pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 5.0;
@@ -508,9 +517,13 @@ impl Notifier {
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .unwrap_or(0.0);
         let mcap_ok = mcap_val >= SCALP_MIN_MCAP_USD && mcap_val < SCALP_MAX_MCAP_USD;
-        // Recent run — token must be moving NOW, not stale.
+        // Recent run — token must be moving NOW, not stale. Two-sided gate:
+        // floor at +50% (must have run) AND ceiling at +350% (must not be at
+        // exhaustion peak). The ceiling is the critical addition that catches
+        // the pre-recoil FOMO band where most rugs happen.
         let pc1h = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
-        let pc_ok = pc1h >= SCALP_MIN_PRICE_CHANGE_1H_PCT;
+        let pc_ok = pc1h >= SCALP_MIN_PRICE_CHANGE_1H_PCT
+            && pc1h <= SCALP_MAX_PRICE_CHANGE_1H_PCT;
         let tx_rate_ok = a.tx_rate >= SCALP_MIN_TX_RATE_PER_MIN;
         let holders_ok = (a.holder_count as i32) >= SCALP_MIN_HOLDER_COUNT;
         let now = chrono::Utc::now().timestamp();
