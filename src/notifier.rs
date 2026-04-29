@@ -87,6 +87,19 @@ pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
+// Buy/sell ratio gates — derived from 11-call live SCALP data 2026-04-29.
+// Winners (n=5) had b/s in 1.19-1.49 (avg 1.27, organic accumulation).
+// Losers (n=6) split into two failure modes:
+//   - b/s < 1.0 (n=2, already dumping): wiffy 0.82, diVine 0.93
+//   - b/s > 3.0 (n=3, FOMO peak): SIR 3.70, HSBC 3.48, NICETRUMP 3.77
+// Only chadhouse (b/s 1.37, lost -45) slipped through this band.
+// Applying 0.9 < b/s < 1.6 to the historical SCALP set: 5/6 = 83% win,
+// transforms -244 net to +140 net.
+pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 0.9;
+pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.6;
+// Minimum sample size — below this the ratio is noise.
+pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
+
 // =============================================================================
 // SCALP GATES — looser bucket for shallow tokens that just printed a 1h+ move.
 // Recalibrated 2026-04-29 from the 31-call backtest. Trump (+45.1, mcap 371k,
@@ -359,6 +372,20 @@ impl Notifier {
         if a.insider_pct >= SIGNAL_MAX_INSIDER_PCT {
             return Some(("insider", format!("insider {:.1}% >= {:.1}%", a.insider_pct, SIGNAL_MAX_INSIDER_PCT)));
         }
+        let total_h1 = a.buys_h1 + a.sells_h1;
+        if total_h1 >= SIGNAL_MIN_HOUR_TXNS {
+            let bsr = if a.sells_h1 > 0 {
+                a.buys_h1 as f64 / a.sells_h1 as f64
+            } else {
+                1.2
+            };
+            if bsr < SIGNAL_MIN_BUY_SELL_RATIO {
+                return Some(("buy_sell_low", format!("b/s {:.2} < {:.2} (dumping)", bsr, SIGNAL_MIN_BUY_SELL_RATIO)));
+            }
+            if bsr > SIGNAL_MAX_BUY_SELL_RATIO {
+                return Some(("buy_sell_high", format!("b/s {:.2} > {:.2} (FOMO peak)", bsr, SIGNAL_MAX_BUY_SELL_RATIO)));
+            }
+        }
         if a.delta.as_ref().map_or(true, |d| d.momentum_delta < 0) {
             if let Some(d) = a.delta.as_ref() {
                 return Some((
@@ -427,6 +454,19 @@ impl Notifier {
         let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
         let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
         let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Buy/sell pressure gate: organic accumulation lives in 0.9-1.6.
+        // Below = already dumping. Above = late-stage FOMO peak.
+        let total_txns = a.buys_h1 + a.sells_h1;
+        let bs_ratio = if a.sells_h1 > 0 {
+            a.buys_h1 as f64 / a.sells_h1 as f64
+        } else {
+            // No sells = pure buying = either real signal or measurement
+            // gap. Permissive: pass through and let other gates filter.
+            1.2
+        };
+        let bs_ok = total_txns < SIGNAL_MIN_HOUR_TXNS  // sample too small to gate
+            || (bs_ratio >= SIGNAL_MIN_BUY_SELL_RATIO
+                && bs_ratio <= SIGNAL_MAX_BUY_SELL_RATIO);
         // Age floor: token must have existed long enough that the holder
         // base reflects organic distribution, not creator + initial 5
         // bonding-curve buyers.
@@ -447,6 +487,7 @@ impl Notifier {
             && bundle_ok
             && sniper_ok
             && insider_ok
+            && bs_ok
     }
 
     /// Scalp gate — fires on shallow-mcap tokens that just printed a 1h+
@@ -491,6 +532,17 @@ impl Notifier {
         let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
         let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
         let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Buy/sell pressure gate — the strongest single signal in the
+        // 11-call live SCALP backtest. Inherited from SHORT.
+        let total_txns = a.buys_h1 + a.sells_h1;
+        let bs_ratio = if a.sells_h1 > 0 {
+            a.buys_h1 as f64 / a.sells_h1 as f64
+        } else {
+            1.2
+        };
+        let bs_ok = total_txns < SIGNAL_MIN_HOUR_TXNS
+            || (bs_ratio >= SIGNAL_MIN_BUY_SELL_RATIO
+                && bs_ratio <= SIGNAL_MAX_BUY_SELL_RATIO);
 
         class_ok
             && mcap_ok
@@ -504,6 +556,7 @@ impl Notifier {
             && bundle_ok
             && sniper_ok
             && insider_ok
+            && bs_ok
     }
 
     /// Decides when an open signal's verdict has collapsed.

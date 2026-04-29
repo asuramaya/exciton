@@ -362,6 +362,10 @@ pub struct TokenAnalysis {
     /// Smart-money proxy: count of top-20 holders that hold at least one
     /// operator-curated reference mint. Zero when no refs are seeded.
     pub smart_money_count: i32,
+    /// Trailing 1h buy count (DexScreener `txns.h1.buys`).
+    pub buys_h1: i32,
+    /// Trailing 1h sell count.
+    pub sells_h1: i32,
 }
 
 /// Run all signal layers against a live token, store snapshot, compute delta
@@ -896,5 +900,7 @@ pub async fn analyze_token(
         sniper_pct,
         insider_pct,
         smart_money_count,
+        buys_h1: market.as_ref().map(|m| m.buys_h1).unwrap_or(0),
+        sells_h1: market.as_ref().map(|m| m.sells_h1).unwrap_or(0),
     })
 }
