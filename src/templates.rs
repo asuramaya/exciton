@@ -208,6 +208,34 @@ pub fn numbers_block(
         s = c.spring,
         tx = a.tx_rate,
     ));
+    // Forensics line — surfaces bundle / sniper / insider concentration
+    // and smart-money holder count alongside the basic distribution.
+    // Skip when forensics never measured (forensics_computed_at=0) so we
+    // don't show 0%-on-everything for tokens without coverage yet.
+    if a.forensics_computed_at > 0 {
+        lines.push(format!(
+            "bundle {b:.0}% · sniper {s:.0}% · insider {i:.0}% · smart-money holders {sm}",
+            b = a.bundle_pct,
+            s = a.sniper_pct,
+            i = a.insider_pct,
+            sm = a.smart_money_count,
+        ));
+    }
+    // 1h tape: buys/sells + ratio. Lets the reader see if the token is
+    // organic (~1.2 ratio) vs FOMO (>3) vs already-dumping (<1).
+    if a.buys_h1 + a.sells_h1 > 0 {
+        let ratio = if a.sells_h1 > 0 {
+            a.buys_h1 as f64 / a.sells_h1 as f64
+        } else {
+            f64::INFINITY
+        };
+        lines.push(format!(
+            "1h tape: {b} buys / {s} sells · ratio {r}",
+            b = a.buys_h1,
+            s = a.sells_h1,
+            r = if ratio.is_finite() { format!("{:.2}", ratio) } else { "∞".to_string() },
+        ));
+    }
     if c.top_holder_bonus_pct > 0 {
         lines.push(format!(
             "score = base {b} · +{bp}% dist bonus",
