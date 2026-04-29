@@ -824,6 +824,8 @@ pub async fn analyze_token(
             let db_clone = db.clone();
             let rpc_clone = rpc.clone();
             tokio::spawn(async move {
+                let mint_short = &mint_owned[..mint_owned.len().min(12)];
+                tracing::info!("launch_forensics: {} starting compute", mint_short);
                 // Hard cap: each compute() does up to ~45 RPC calls. With
                 // 30s per-call timeouts that could in principle take 20+
                 // minutes if every call retries through every endpoint.
