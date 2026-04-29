@@ -2171,10 +2171,14 @@ async fn claw_ask(
         return Err(anyhow::anyhow!("Anthropic {} — {}", status, &text[..text.len().min(200)]));
     }
     let data: serde_json::Value = resp.json().await?;
-    let text = data["content"][0]["text"]
+    let raw = data["content"][0]["text"]
         .as_str()
-        .unwrap_or("(no response)")
+        .unwrap_or("")
         .to_string();
+    let text = strip_tool_blocks(&raw);
+    if text.is_empty() {
+        return Err(anyhow::anyhow!("anthropic returned only tool calls, no prose"));
+    }
     Ok(text)
 }
 
@@ -2206,11 +2210,15 @@ async fn claw_ask_openai(
         return Err(anyhow::anyhow!("OpenAI {} — {}", status, &text[..text.len().min(200)]));
     }
     let data: serde_json::Value = resp.json().await?;
-    let text = data["choices"][0]["message"]["content"]
+    let raw = data["choices"][0]["message"]["content"]
         .as_str()
-        .unwrap_or("(no response)")
+        .unwrap_or("")
         .to_string();
-    Ok(text.trim().to_string())
+    let text = strip_tool_blocks(&raw);
+    if text.is_empty() {
+        return Err(anyhow::anyhow!("openai returned only tool calls, no prose"));
+    }
+    Ok(text)
 }
 
 async fn claw_ask_zeroclaw(http: &reqwest::Client, context: &str, question: &str) -> Result<String> {
@@ -2251,32 +2259,142 @@ async fn claw_ask_zeroclaw(http: &reqwest::Client, context: &str, question: &str
     Ok(text)
 }
 
-/// Strip spontaneous <tool_call>/<tool_result> blocks that gpt-5.4-mini generates
-/// even when tools=None — the Codex fine-tune has strong tool-call priors.
+/// Sanitize an LLM response for Telegram display. Handles:
+///   - balanced <tool_call>/<tool_result>/<function_calls> blocks
+///   - UNBALANCED tag-leak (just an opening tag + JSON dump, no close)
+///   - bare MCP-style transcript dumps after a tool tag
+///
+/// For each opening tag, removes the tag + the immediately-following
+/// balanced JSON object/array, then any matching close tag if present.
+/// Robust to the GPT-5.4-mini / zeroclaw pattern of emitting tool-call
+/// scaffolding even when tools=None — and to claw fallback paths
+/// (Anthropic / OpenAI direct) where the model may still emit them.
 fn strip_tool_blocks(text: &str) -> String {
-    let tags = [
-        ("<tool_call>", "</tool_call>"),
-        ("<tool-call>", "</tool-call>"),
-        ("<function_calls>", "</function_calls>"),
-        ("<tool_result>", "</tool_result>"),
+    const OPEN_TAGS: &[&str] = &[
+        "<tool_call>",
+        "<tool-call>",
+        "<tool_result>",
+        "<tool-result>",
+        "<function_calls>",
+        "<function_call>",
     ];
-    let mut s = text.trim().to_string();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (open, close) in &tags {
-            if let Some(start) = s.find(open) {
-                changed = true;
-                if let Some(rel) = s[start..].find(close) {
-                    let end = start + rel + close.len();
-                    s = format!("{}{}", s[..start].trim_end(), s[end..].trim_start());
-                } else {
-                    s = s[..start].trim_end().to_string();
+    const CLOSE_TAGS: &[&str] = &[
+        "</tool_call>",
+        "</tool-call>",
+        "</tool_result>",
+        "</tool-result>",
+        "</function_calls>",
+        "</function_call>",
+    ];
+
+    let mut s = text.to_string();
+    loop {
+        // Find the leftmost opening tag.
+        let mut earliest: Option<(usize, &str)> = None;
+        for tag in OPEN_TAGS {
+            if let Some(pos) = s.find(tag) {
+                if earliest.map_or(true, |(p, _)| pos < p) {
+                    earliest = Some((pos, tag));
                 }
             }
         }
+        let Some((start, open)) = earliest else { break };
+        let after_tag = start + open.len();
+        // Skip the immediately-following balanced JSON object/array. Walk
+        // brace depth from the first { or [ we see, terminating when depth
+        // returns to 0.
+        let bytes = s.as_bytes();
+        let mut end = after_tag;
+        let mut depth: i32 = 0;
+        let mut entered = false;
+        let mut i = after_tag;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if !entered {
+                // Skip whitespace before the JSON starts.
+                if c == b'{' || c == b'[' {
+                    entered = true;
+                    depth = 1;
+                } else if !c.is_ascii_whitespace() {
+                    // Non-JSON content directly after the tag — nothing
+                    // structured to skip; just remove the tag itself.
+                    break;
+                }
+            } else {
+                match c {
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if !entered {
+            // Tag with no JSON payload — strip just the tag.
+            end = after_tag;
+        }
+        // Consume any matching close tag immediately after (with optional
+        // whitespace). Helps catch balanced <tool_result>...</tool_result>.
+        let trail = s[end..].trim_start();
+        for close in CLOSE_TAGS {
+            if trail.starts_with(close) {
+                let trail_start = end + (s[end..].len() - trail.len());
+                end = trail_start + close.len();
+                break;
+            }
+        }
+        s.replace_range(start..end, "");
+    }
+    // Collapse runs of >=3 newlines to 2 — readability after stripped blocks.
+    while s.contains("\n\n\n") {
+        s = s.replace("\n\n\n", "\n\n");
     }
     s.trim().to_string()
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_tool_blocks;
+
+    #[test]
+    fn balanced_block_removed() {
+        let input = "before <tool_result>{\"x\":1}</tool_result> after";
+        assert_eq!(strip_tool_blocks(input), "before  after");
+    }
+
+    #[test]
+    fn unbalanced_tag_with_json_removed() {
+        let input = "<tool_result>\n{\"tools\":[{\"name\":\"x\"}]}\nThe answer is 42.";
+        let out = strip_tool_blocks(input);
+        assert!(out.contains("The answer is 42"));
+        assert!(!out.contains("tool_result"));
+        assert!(!out.contains("\"tools\""));
+    }
+
+    #[test]
+    fn multiple_consecutive_blocks() {
+        let input = "<tool_result>{\"a\":1}<tool_result>{\"b\":2}prose here.";
+        let out = strip_tool_blocks(input);
+        assert_eq!(out, "prose here.");
+    }
+
+    #[test]
+    fn nested_json_handled() {
+        let input = "<tool_result>{\"a\":{\"b\":[1,2]}}prose.";
+        assert_eq!(strip_tool_blocks(input), "prose.");
+    }
+
+    #[test]
+    fn no_tags_passthrough() {
+        let input = "Just plain prose.";
+        assert_eq!(strip_tool_blocks(input), "Just plain prose.");
+    }
 }
 
 fn extract_solana_address(text: &str) -> Option<String> {
