@@ -858,9 +858,29 @@ pub async fn analyze_token(
                         return;
                     }
                     Err(_) => {
+                        // Fail-closed sentinel write: when compute can't
+                        // complete (RPC degradation / network outage),
+                        // record forensics_computed_at = now with all
+                        // metrics maxed (100%). This makes the bundle/
+                        // sniper/insider gates BLOCK the token until a
+                        // future cycle's compute succeeds (1h refresh).
+                        // Without this, the gate-required check (line in
+                        // notifier.rs: `forensics_measured = a.forensics_
+                        // computed_at > 0`) deadlocks: gate requires
+                        // forensics, forensics never completes, no calls
+                        // fire ever.
                         tracing::warn!(
-                            "launch_forensics: {} compute timed out after 180s",
+                            "launch_forensics: {} timed out after 180s — recording sentinel block",
                             mint_owned
+                        );
+                        let stamp = chrono::Utc::now().timestamp();
+                        let _ = db_clone.update_launch_forensics(
+                            &mint_owned,
+                            100.0,
+                            100.0,
+                            100.0,
+                            0,
+                            stamp,
                         );
                         return;
                     }
