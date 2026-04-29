@@ -1,3 +1,8 @@
+// Config fields are populated by TOML deserialization. Some are loaded for
+// future use or consumed only by environments that aren't compiled in this
+// build (e.g. operator-only knobs). Module-wide allow keeps the noise down.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;

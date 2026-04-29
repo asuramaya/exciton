@@ -233,30 +233,6 @@ impl RpcRouter {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
     }
 
-    /// Get token account balance
-    pub async fn get_token_account_balance(&self, token_account: &str) -> Result<u64> {
-        let pk = Pubkey::from_str(token_account).context("Invalid token account")?;
-        let attempts = self.endpoints.len();
-        let mut last_err: Option<anyhow::Error> = None;
-
-        for _ in 0..attempts {
-            let (idx, client) = self.next_client().context("No RPC endpoints available")?;
-            match client.get_token_account_balance(&pk).await {
-                Ok(balance) => {
-                    self.record_result(idx, true);
-                    let amount = balance.amount.parse::<u64>().unwrap_or(0);
-                    return Ok(amount);
-                }
-                Err(e) => {
-                    let err = e.to_string();
-                    self.record_failure(idx, &err);
-                    last_err = Some(e.into());
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")))
-    }
-
     /// Get raw account info for a mint address — used to read authorities and extensions
     pub async fn get_account_info(&self, address: &str) -> Result<Option<Account>> {
         let pk = Pubkey::from_str(address).context("Invalid address")?;

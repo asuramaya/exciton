@@ -119,41 +119,6 @@ fn momentum_dir(a: &TokenAnalysis) -> &'static str {
         .unwrap_or("─")
 }
 
-/// Render the "why this fired" line — required per style guide (line 2 of every
-/// signal card must state which criteria triggered, with concrete numbers).
-pub fn why_line_for_signal(a: &TokenAnalysis, effective_conf: i32) -> String {
-    let dir = match a.delta.as_ref().map(|d| d.momentum_delta) {
-        Some(d) if d > 3 => "rising",
-        Some(d) if d < -3 => "falling",
-        Some(_) => "neutral",
-        None => "first-seen",
-    };
-    format!(
-        "<i>Triggered by: {cls} · conf {conf} · top {top:.2}% · momentum {dir}</i>",
-        cls = a.confidence.classification,
-        conf = effective_conf,
-        top = a.top_holder_pct,
-        dir = dir,
-    )
-}
-
-pub fn why_line_for_fail(a: &TokenAnalysis, effective_conf: i32, prev_class: &str) -> String {
-    let cls_part = if prev_class != a.confidence.classification {
-        format!("{} → {}", prev_class, a.confidence.classification)
-    } else {
-        format!(
-            "{} · conf dropped to {}",
-            a.confidence.classification, effective_conf
-        )
-    };
-    let top_part = if a.top_holder_pct >= 20.0 {
-        format!(" · top jumped to {:.2}%", a.top_holder_pct)
-    } else {
-        String::new()
-    };
-    format!("<i>Triggered by: {}{}</i>", cls_part, top_part)
-}
-
 /// Caller voice — a single natural-language paragraph the operator would
 /// speak when fronting this call. Names the structural read in trader
 /// language ("stair-stepping with steady accumulation", "compressing with
@@ -270,55 +235,6 @@ pub fn numbers_block(
     }
     let body = lines.join("\n");
     format!("<blockquote expandable>▾ numbers\n{}</blockquote>", body)
-}
-
-/// Render the compact body of a token card — metrics only, no header, no
-/// timeline, no links. Notifier composes the header/timeline/keyboard around
-/// this per the style guide.
-///
-/// Precision note: top_holder percentages use 2 decimals because thresholds
-/// like the 20% signal gate are decided at that precision — rounding to 1 dp
-/// can hide near-misses.
-pub fn render_card_body(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
-    let c = &a.confidence;
-    let mut lines = Vec::new();
-
-    if let Some(p) = price_line(meta) {
-        lines.push(p);
-    }
-    if let Some(m) = market_line(meta) {
-        lines.push(m);
-    }
-    lines.push(format!(
-        "<b>top</b> {top:.2}% / {t5:.2}% / {t10:.2}% · <b>holders</b> {h}",
-        top = a.top_holder_pct,
-        t5 = a.top5_pct,
-        t10 = a.top10_pct,
-        h = a.holder_count,
-    ));
-    lines.push(format!(
-        "<b>mom</b> {m}{dir} · <b>dist</b> {d} · <b>spring</b> {s} · <b>tpm</b> {tx:.1}",
-        m = c.momentum,
-        dir = momentum_dir(a),
-        d = c.distribution,
-        s = c.spring,
-        tx = a.tx_rate,
-    ));
-    // Confidence breakdown — expose the formula that produced the total.
-    if c.top_holder_bonus_pct > 0 {
-        lines.push(format!(
-            "<b>conf</b> {t} = base {b} · +{bp}% dist bonus",
-            t = c.total,
-            b = c.base_total,
-            bp = c.top_holder_bonus_pct,
-        ));
-    } else {
-        lines.push(format!("<b>conf</b> {t}", t = c.total));
-    }
-    if let Some(warn) = token_2022_summary(a) {
-        lines.push(warn);
-    }
-    lines.join("\n")
 }
 
 fn ticker_line(meta: Option<&TokenMeta>) -> Option<String> {

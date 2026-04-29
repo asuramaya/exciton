@@ -9,7 +9,7 @@ impl OnChainAnalyzer {
     }
 
     /// Analyze on-chain supply characteristics
-    pub fn analyze_supply(&self, supply: &TokenSupplyInfo, mint: &MintInfo) -> Vec<SignalScore> {
+    pub fn analyze_supply(&self, supply: &TokenSupplyInfo, _mint: &MintInfo) -> Vec<SignalScore> {
         let mut scores = Vec::new();
 
         // Decimals check — standard is 6 or 9 for Solana tokens

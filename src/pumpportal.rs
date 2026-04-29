@@ -149,12 +149,6 @@ impl PumpPortalHealth {
         chrono::Utc::now().timestamp() - last < max_age_secs
     }
 
-    pub fn snapshot(&self) -> (bool, i64) {
-        (
-            self.is_connected.load(Ordering::Relaxed),
-            self.last_event_at.load(Ordering::Relaxed),
-        )
-    }
 }
 
 /// Public handle to the running client. Drop to stop (mpsc closes,

@@ -1,4 +1,3 @@
-use crate::signals::{Confidence, SignalScore};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,10 +27,6 @@ impl Forecaster {
         Self
     }
 
-    pub fn aggregate(&self, scores: &[SignalScore]) -> Confidence {
-        Confidence::from_scores(scores)
-    }
-
     /// Returns recommended position size as percentage of portfolio
     pub fn position_pct(&self, confidence: i32, coverage: usize) -> f64 {
         let base = match confidence {
@@ -43,23 +38,5 @@ impl Forecaster {
         };
         let coverage_factor = coverage as f64 / 4.0;
         base * coverage_factor
-    }
-
-    /// Classify current market regime based on aggregate metrics
-    pub fn classify_regime(
-        &self,
-        volume_rate: f64,
-        new_token_count: usize,
-        buy_sell_ratio: f64,
-    ) -> Regime {
-        if volume_rate > 100.0 && new_token_count > 20 && buy_sell_ratio > 2.0 {
-            Regime::LaunchFrenzy
-        } else if buy_sell_ratio < 0.5 && volume_rate > 50.0 {
-            Regime::DumpCascade
-        } else if volume_rate > 50.0 && buy_sell_ratio > 1.5 {
-            Regime::WhaleAccumulation
-        } else {
-            Regime::LowActivityGrind
-        }
     }
 }

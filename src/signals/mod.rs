@@ -27,14 +27,6 @@ impl SignalLayer {
         ]
     }
 
-    pub fn weight(&self) -> f64 {
-        match self {
-            SignalLayer::Safety => 0.30,
-            SignalLayer::OnChain => 0.25,
-            SignalLayer::Microstructure => 0.25,
-            SignalLayer::SmartMoney => 0.20,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,19 +84,13 @@ impl Confidence {
         let mut distribution_sum = 0.0;
         let mut distribution_count = 0;
 
-        // Extract specific signal scores for pattern detection
-        let mut velocity_score = 50i32;
-        let mut holder_count_score = 20i32;
+        // Extract top_holder score for the distribution-bonus pattern check
+        // below. Other per-signal scores (velocity, tx_rate) are re-derived
+        // later in this function from the scores Vec where they're needed.
         let mut top_holder_score = 5i32;
-        let mut tx_rate_score = 15i32;
-
         for s in scores {
-            match s.signal_type.as_str() {
-                "velocity" => velocity_score = s.score,
-                "holder_count" => holder_count_score = s.score,
-                "top_holder" => top_holder_score = s.score,
-                "tx_rate" => tx_rate_score = s.score,
-                _ => {}
+            if s.signal_type == "top_holder" {
+                top_holder_score = s.score;
             }
         }
 

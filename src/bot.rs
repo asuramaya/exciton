@@ -2334,8 +2334,6 @@ pub async fn serve_claw_api(
             // We read until we have "\r\n\r\n" and then the advertised body.
             let mut raw_bytes: Vec<u8> = Vec::with_capacity(4096);
             let mut tmp = vec![0u8; 4096];
-            let mut content_length: usize = 0;
-            let mut header_end: usize = 0;
             loop {
                 let n = match stream.read(&mut tmp).await {
                     Ok(0) | Err(_) => return,
@@ -2346,12 +2344,12 @@ pub async fn serve_claw_api(
                     let _ = stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\n\r\n").await;
                     return;
                 }
-                // Find header/body boundary
+                // Find header/body boundary; once found, parse Content-Length
+                // and break only when we've buffered the full body.
                 if let Some(pos) = raw_bytes
                     .windows(4)
                     .position(|w| w == b"\r\n\r\n")
                 {
-                    header_end = pos;
                     let cl = raw_bytes[..pos]
                         .split(|&b| b == b'\n')
                         .find(|l| l.to_ascii_lowercase().starts_with(b"content-length:"))
@@ -2359,8 +2357,7 @@ pub async fn serve_claw_api(
                         .and_then(|l| l.splitn(2, ':').nth(1))
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
-                    content_length = cl;
-                    if raw_bytes.len() >= pos + 4 + content_length {
+                    if raw_bytes.len() >= pos + 4 + cl {
                         break;
                     }
                 }
@@ -2375,7 +2372,6 @@ pub async fn serve_claw_api(
                     return;
                 }
             };
-            let _ = (header_end, content_length); // consumed above
             let first_line = headers_part.lines().next().unwrap_or("");
             // CORS preflight — common to all routes.
             if first_line.starts_with("OPTIONS") {

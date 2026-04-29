@@ -2,6 +2,10 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+// `solana_sdk::system_instruction` is deprecated in favour of the
+// `solana_system_interface` crate; migration would require adding that
+// dependency. Scoped allow until the SDK upgrade lands as one PR.
+#[allow(deprecated)]
 use solana_sdk::{
     hash::Hash,
     message::Message,
@@ -45,7 +49,7 @@ pub fn load_keypair() -> Result<Keypair> {
     let bytes = bs58::decode(raw.trim())
         .into_vec()
         .context("PHOTON_PRIVATE_KEY: not valid base58")?;
-    Keypair::from_bytes(&bytes)
+    Keypair::try_from(bytes.as_slice())
         .context("PHOTON_PRIVATE_KEY: invalid keypair — expected 64-byte secret key")
 }
 

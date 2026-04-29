@@ -10,6 +10,9 @@ use std::collections::HashMap;
 
 /// Normalized market snapshot returned to the signal pipeline. Zero-initialized
 /// fields mean "not reported by DexScreener"; callers decide how to treat that.
+/// Some fields (fdv_usd, labels, websites, socials, pair_address) are kept
+/// for parsing fidelity even though only specific gates read them today.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct MarketData {
     pub price_usd: f64,
@@ -44,11 +47,6 @@ impl MarketData {
     /// inflection in a Pump.fun token's life.
     pub fn is_graduated(&self) -> bool {
         matches!(self.pair_dex.as_str(), "raydium" | "meteora" | "orca")
-    }
-
-    /// True when the pair is still reported as Pump.fun's native venue.
-    pub fn is_pumpfun(&self) -> bool {
-        matches!(self.pair_dex.as_str(), "pumpswap" | "pumpfun")
     }
 
     /// Buy/sell ratio over the last hour. Returns 1.0 when no trades happened.

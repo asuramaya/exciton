@@ -1,3 +1,8 @@
+// DB layer: many helpers exist as operator-API surface (MCP tools, manual
+// queries) without compile-time callers. Allowing dead_code module-wide
+// keeps the warnings noise-free without sprinkling per-method attributes.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -729,12 +734,6 @@ impl Db {
         Ok(tables)
     }
 
-    pub fn journal_mode(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        Ok(mode)
-    }
-
     pub fn insert_token(&self, address: &str, safety_score: i32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -949,36 +948,6 @@ impl Db {
             ],
         )?;
         Ok(())
-    }
-
-    /// Most recent N curve snapshots for a mint, newest first. Used by
-    /// the curve-stage gate to compute velocity (Δreal_sol / Δt).
-    pub fn get_recent_curve_snapshots(
-        &self,
-        mint: &str,
-        limit: usize,
-    ) -> Result<Vec<(i64, f64, f64, f64, bool)>> {
-        // (timestamp, real_sol, price_sol, fill_pct, complete)
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT timestamp, real_sol, price_sol, fill_pct, complete
-             FROM curve_snapshots
-             WHERE mint = ?1
-             ORDER BY timestamp DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![mint, limit], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
     }
 
     pub fn list_stale_discovered_candidates(

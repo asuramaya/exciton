@@ -65,7 +65,6 @@ pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 6.0;
 // Losers reached 22-29. 30 is a clean separator at the deep-market band.
 pub const SIGNAL_MAX_TOP10_PCT: f64 = 30.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
-pub const SIGNAL_DEDUP_HOURS: i64 = 6;
 // Liquidity floor relaxed from $100k → $50k. Sweep showed BELKA ($75k liq),
 // HENRY ($110k), Dunald ($52k), Trump ($51k) all in winner cohort. The $100k
 // floor was excluding 50%+ of true SHORT-bucket winners.
@@ -250,10 +249,6 @@ impl Notifier {
         if let Some(k) = &self.publish_kick {
             k.notify_one();
         }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.cfg.enabled
     }
 
     pub fn halted(&self) -> bool {

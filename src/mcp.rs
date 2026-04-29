@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::db::Db;
-use crate::discovery;
 use crate::execution;
 use crate::forecaster::{Forecaster, Regime};
 use crate::ingester::RpcRouter;
@@ -21,6 +20,9 @@ pub struct PhotonServer {
     db: Arc<Db>,
     config: Config,
     rpc: Arc<RpcRouter>,
+    /// Captured at construction for future diagnostic tools (status, MCP
+    /// debug). Not currently surfaced; retain to avoid recomputing.
+    #[allow(dead_code)]
     resolved_endpoints: Vec<String>,
     forecaster: Forecaster,
     http: reqwest::Client,
