@@ -177,10 +177,10 @@ async fn compute_bundle_pct(
     Ok((held / supply_ui * 100.0).min(100.0))
 }
 
-/// Count of top-20 holders that hold at least one operator-curated
-/// reference mint. Per-holder cost: one `getTokenAccountsByOwner` call.
-/// Zero when no reference mints are curated (gate is permissive in that
-/// case — operator hasn't seeded the smart-money set yet).
+/// Count of top-N holders that hold at least one operator-curated
+/// reference mint. Per-holder cost: one `getTokenAccountsByOwner` call,
+/// run concurrently across all owners. Bounds compute time to ~max(single
+/// RPC) instead of (N × single RPC).
 async fn compute_smart_money_count(
     top_owners: &[String],
     db: &Arc<Db>,
@@ -190,14 +190,21 @@ async fn compute_smart_money_count(
     if refs.is_empty() {
         return Ok(0);
     }
+    let scope: Vec<&String> = top_owners.iter().take(20).collect();
+    let futures = scope.iter().map(|owner| {
+        let owner = (*owner).clone();
+        let rpc = rpc.clone();
+        async move {
+            rpc.get_wallet_token_holdings(&owner).await.ok()
+        }
+    });
+    let results = futures_util::future::join_all(futures).await;
     let mut count = 0i32;
-    for owner in top_owners.iter().take(20) {
-        let holdings = match rpc.get_wallet_token_holdings(owner).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if holdings.iter().any(|(mint, _)| refs.contains(mint)) {
-            count += 1;
+    for r in results {
+        if let Some(holdings) = r {
+            if holdings.iter().any(|(mint, _)| refs.contains(mint)) {
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -220,37 +227,31 @@ async fn compute_insider_pct(
     if top_owners.is_empty() {
         return Ok(0.0);
     }
-    // Limit to top 20 to bound the RPC budget.
-    let scope: Vec<&String> = top_owners.iter().take(20).collect();
-    // Funder per owner. Owners whose funder we can't determine are
-    // simply excluded — they sit in their own singleton clusters and
-    // don't pollute the largest-cluster computation.
-    let mut funder_of: HashMap<String, String> = HashMap::new();
-    for owner in &scope {
-        let sigs = match rpc.get_recent_signatures(owner, 1000).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let oldest_sig = match sigs.last() {
-            Some(s) if !s.err => s.signature.clone(),
-            _ => continue,
-        };
-        // Use the tx's first non-err signer as the funder. Most account-
-        // creation txs are signed by the funder + the new account itself;
-        // the funder is the one with non-zero SOL pre-balance.
-        let summary = rpc.get_tx_wallet_summary(&oldest_sig, owner).await.ok();
-        if let Some(s) = summary {
-            // The funder is whoever sent SOL TO this owner in their
-            // first observed tx — for account-creation txs the system
-            // program transfers from the funder. We approximate using
-            // the tx's "fee_payer" surfaced in the wallet summary, which
-            // is the first signer. If the owner IS the fee payer, we
-            // can't tell who funded them from this data; skip.
-            if !s.fee_payer.is_empty() && s.fee_payer != **owner {
-                funder_of.insert((*owner).clone(), s.fee_payer);
+    // Top 10 (was 20) — halves RPC cost while still catching the biggest
+    // insider clusters. The bottom-10 of the top-20 are usually small
+    // enough that even if they share a funder, the cluster's % of supply
+    // is below the gate threshold anyway.
+    let scope: Vec<&String> = top_owners.iter().take(10).collect();
+    // Resolve funder per owner concurrently. Two RPC calls per owner
+    // (recent_signatures + tx_wallet_summary). Total wall-time bounded
+    // by the slowest of 10 (vs sum of 40 in the previous serial form).
+    let funder_results = futures_util::future::join_all(scope.iter().map(|owner| {
+        let owner = (*owner).clone();
+        let rpc = rpc.clone();
+        async move {
+            let sigs = rpc.get_recent_signatures(&owner, 1000).await.ok()?;
+            let oldest = sigs.last().filter(|s| !s.err).map(|s| s.signature.clone())?;
+            let summary = rpc.get_tx_wallet_summary(&oldest, &owner).await.ok()?;
+            if !summary.fee_payer.is_empty() && summary.fee_payer != owner {
+                Some((owner, summary.fee_payer))
+            } else {
+                None
             }
         }
-    }
+    }))
+    .await;
+    let funder_of: HashMap<String, String> =
+        funder_results.into_iter().flatten().collect();
     if funder_of.is_empty() {
         return Ok(0.0);
     }
