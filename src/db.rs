@@ -2166,8 +2166,7 @@ impl Db {
 
     /// Whether any alert of `alert_type` for this mint exists since `since_ts`.
     /// Used by the settle phase to detect DEV_SELLING and classification
-    /// regressions on active calls — those should force-close the call rather
-    /// than wait for a price-based stop.
+    /// regressions on active calls.
     pub fn has_recent_alert(
         &self,
         mint: &str,
@@ -2181,6 +2180,32 @@ impl Db {
         )?;
         let exists = stmt
             .query_row(params![mint, alert_type, since_ts], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    /// Whether any alert of `alert_type` with confidence >= `min_conf` for
+    /// this mint exists since `since_ts`. Used by the settle phase to filter
+    /// dev_selling alerts — only severe drops (deployer down ≥40%, encoded as
+    /// confidence ≥90) close calls. Mining of 1700+ dev_selling alerts (see
+    /// 2026-04-29 mining session) showed light dev_selling is bullish on
+    /// average; only severe exits predict downside.
+    pub fn has_recent_severe_alert(
+        &self,
+        mint: &str,
+        alert_type: &str,
+        since_ts: i64,
+        min_conf: i32,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM alerts \
+             WHERE token_address = ?1 AND alert_type = ?2 \
+               AND timestamp >= ?3 AND confidence >= ?4 LIMIT 1",
+        )?;
+        let exists = stmt
+            .query_row(params![mint, alert_type, since_ts, min_conf], |_| Ok(()))
             .optional()?
             .is_some();
         Ok(exists)

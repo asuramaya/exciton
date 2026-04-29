@@ -882,49 +882,28 @@ impl BackgroundScanner {
             let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
             let age = now - call.called_at;
 
-            // Event-driven exits — checked before price rules. A DEV_SELLING
-            // alert (deployer dropped ≥10% of their initial balance) or a
-            // STAIRCASE→GRINDER classification regression are leading
-            // indicators that price hasn't yet reflected. The 31-call backtest
-            // showed ~92% of post-grad tokens eventually dump; the alpha is
-            // exiting before the price prints, not after.
+            // Event-driven exits — REVISED 2026-04-29 after mining 1700+
+            // dev_selling alerts and 1200+ class_regression alerts against
+            // subsequent 30-min price action. KEY FINDING: these alerts are
+            // NOT bearish on average — dev_selling 30m_mean +10.5%,
+            // class_regression +7.4%, concentrating +31.1%. The original
+            // event-exit code was force-closing calls into rallies (matches
+            // the SCAMC/$RESET screenshots showing tokens up +87% while
+            // DEV_SELLING fires).
+            //
+            // Conservative fix: only act on SEVERE dev-selling (alert
+            // confidence >= 90, which corresponds to deployer drop >= 40%
+            // per signals/mod.rs scoring). Class regression no longer a
+            // close trigger at all. The price-based ladder (TP/SL) handles
+            // the actual outcome correctly.
             let event_window_secs = 30 * 60i64;
             let event_since = now - event_window_secs;
-            let dev_selling = self
+            let severe_dev_selling = self
                 .db
-                .has_recent_alert(&call.mint, "dev_selling", event_since)
+                .has_recent_severe_alert(&call.mint, "dev_selling", event_since, 90)
                 .unwrap_or(false);
-            // Classification-regression check: STAIRCASE/GRINDER/SPRING are
-            // bullish, DEVELOPING is neutral-fading, CRASHING/DEAD/ACTIVE_TRAP
-            // are bearish. We compare last two snapshots and trigger when the
-            // current rank is strictly worse than entry's class.
-            let class_regressed = self
-                .db
-                .get_snapshot_history(&call.mint, 2)
-                .ok()
-                .and_then(|snaps| {
-                    if snaps.len() < 2 {
-                        return None;
-                    }
-                    let rank = |c: &str| match c {
-                        "SPRING" => 4,
-                        "STAIRCASE" => 3,
-                        "GRINDER" => 2,
-                        "DEVELOPING" => 1,
-                        _ => 0, // CRASHING/DEAD/ACTIVE_TRAP/UNSAFE_*
-                    };
-                    Some(rank(&snaps[0].classification) < rank(&snaps[1].classification))
-                })
-                .unwrap_or(false);
-
-            let event_exit: Option<(&'static str, String)> = if dev_selling {
-                Some(("failed", format!("{:+.1}% · dev selling", pct)))
-            } else if class_regressed && pct <= 0.0 {
-                // Class regression on a token already underwater: the surf
-                // ended. If the call's still green, let the price ladder
-                // handle profit-taking — class flips on green tokens are
-                // common volatility, not exit signals.
-                Some(("failed", format!("{:+.1}% · structure broke", pct)))
+            let event_exit: Option<(&'static str, String)> = if severe_dev_selling {
+                Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
             } else {
                 None
             };

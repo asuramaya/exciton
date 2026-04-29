@@ -50,40 +50,34 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // Every one of these gates must hold to open a signal.
 // =============================================================================
 
-// Gates calibrated against the 31-call closed-call backtest (2026-04-22..28).
-// Confidence: conf=75 calls returned -9.2% mean / 25% win, conf 76-77 returned
-// +9.7% mean / 57% win. The 75 floor is noise; 76 is signal.
+// Gates calibrated against the 31-call closed-call backtest (2026-04-22..28),
+// then RECALIBRATED via gate-sweep analysis on the same 31 calls + live
+// snapshot distribution mining (2026-04-29). Initial deployment was too
+// strict — sweep showed best total PnL at TIGHT(SHORT) + LOOSE(SCALP) split,
+// not a single tight gate. See conversation 2026-04-29 mining session.
+//
+// TIGHT (SHORT) bucket targets the deep market: $500k+ mcap, low concentration.
+// Backtest under sweep: n=7, 71% win, +5.8% mean, +40.6 sum.
 pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 76;
-// Top-holder gate: top1 < 6% AND liq >= $100k yielded 7/8 wins (+9.2% mean,
-// +73% sum). Industry-corroborated (DeFade rug-pull guide: any single holder
-// >5% in early stage is a red flag).
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 6.0;
-// Top-10 gate: catches insider networks that fragment 30-40% of supply
-// across 20+ wallets to look diversified. RugCheck threshold: top10 >35%
-// is a dump-risk indicator. Combined with top1<6, single addresses can't
-// alone exceed this.
-pub const SIGNAL_MAX_TOP10_PCT: f64 = 35.0;
+// Top-10 gate tightened from 35 → 30. SHORT winners had top10 in 9.7-20.4
+// range (BURNIE 20.4, maxxing 19.6, HENRY 16.3, SPIKE 9.7, ROTUS 13.4).
+// Losers reached 22-29. 30 is a clean separator at the deep-market band.
+pub const SIGNAL_MAX_TOP10_PCT: f64 = 30.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 pub const SIGNAL_DEDUP_HOURS: i64 = 6;
-// Liquidity floor: in the backtest, calls below $100k liquidity won 6/22
-// (27%) at -4% mean. Above $100k won 7/8 (88%) at +9.2% mean. Real exits
-// need real depth.
-pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 100_000.0;
-// 24h volume floor — proves the token is actually trading, not a dead curve
-// with a stale top_holder reading.
+// Liquidity floor relaxed from $100k → $50k. Sweep showed BELKA ($75k liq),
+// HENRY ($110k), Dunald ($52k), Trump ($51k) all in winner cohort. The $100k
+// floor was excluding 50%+ of true SHORT-bucket winners.
+pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 50_000.0;
 pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
-// Mcap floor — 8/8 sub-$150k mcap calls returned -5% mean / 25% win in the
-// backtest. The "shallow rug" bucket needs the separate event-driven scalp
-// strategy, not the SHORT ladder. Above $500k: 13/14 mean +5% / 57% win.
 pub const SIGNAL_MIN_MCAP_USD: f64 = 500_000.0;
-// Velocity gate (arxiv 2602.14860 Feb-2026: trading velocity is the dominant
-// graduation predictor). Tx_rate is per-minute; require ≥5 to filter out
-// dead post-grad books that look fine on holders but have no real flow.
 pub const SIGNAL_MIN_TX_RATE_PER_MIN: f64 = 5.0;
-// Holder-growth velocity gate: ≥50 new holders/hour scaled from the
-// "500+ holders in first hour = green flag" industry signal. Computed from
-// delta.holder_count_delta over delta.time_elapsed_seconds.
-pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 50.0;
+// Holder growth gate disabled by setting to 0. holder_count is RPC-capped at
+// 20 (`getTokenLargestAccounts` returns ≤20 accounts), making growth-rate
+// computation noisy. The forensics gates do the concentration job better.
+// Set non-zero to re-enable when a reliable holder-count source is wired.
+pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 0.0;
 // Launch-forensics ceilings — block calls when the measured concentration
 // signals a bundle / sniper-cohort / insider-network risk. Each metric is
 // 0.0 when unmeasured (fresh token), so the gate only fires above the
@@ -94,19 +88,27 @@ pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
 // =============================================================================
-// SCALP GATES — separate, looser bucket for sub-$250k mcap tokens that just
-// printed a 1h+ move. The thesis: catch the rip, exit on dev_selling /
-// classification regression, accept that 92% of these eventually rug.
-// Forensics gates STILL apply — we don't scalp pure bot rugs.
+// SCALP GATES — looser bucket for shallow tokens that just printed a 1h+ move.
+// Recalibrated 2026-04-29 from the 31-call backtest. Trump (+45.1, mcap 371k,
+// top1 9.3), ALEXCOIN (+44.8, mcap 115k, top1 11.7), BLIMP (+41.3, mcap 82k,
+// top1 13.4), Archangel (+16.5, mcap 174k) — these were the biggest absolute
+// winners and were ALL excluded by the original strict SCALP gate. Also Kiss
+// (+15.1) and DUMBMONEY (+6.2) live here.
+//
+// New mcap range $80k-$500k. New top1<14 / top10<40. Holder count gate
+// effectively disabled (RPC-capped at 20). Forensics gates retained — same
+// thresholds as SHORT — to filter pure bot rugs.
 // =============================================================================
-pub const SCALP_MIN_MCAP_USD: f64 = 20_000.0;
-pub const SCALP_MAX_MCAP_USD: f64 = 250_000.0;
+pub const SCALP_MIN_MCAP_USD: f64 = 80_000.0;
+pub const SCALP_MAX_MCAP_USD: f64 = 500_000.0;
+pub const SCALP_MAX_TOP_HOLDER_PCT: f64 = 14.0;
+pub const SCALP_MAX_TOP10_PCT: f64 = 40.0;
 pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 50.0;
 pub const SCALP_MAX_AGE_SECS: i64 = 4 * 3600;
-// Higher tx_rate floor than SHORT — SCALP requires the token is actively
-// running, not just a stale shallow pump that printed +50% an hour ago.
-pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 10.0;
-pub const SCALP_MIN_HOLDER_COUNT: i32 = 50;
+pub const SCALP_MIN_LIQUIDITY_USD: f64 = 20_000.0;
+pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 5.0;
+// 15 because RPC caps at 20 — anything above 20 is rare. Set to 0 to disable.
+pub const SCALP_MIN_HOLDER_COUNT: i32 = 15;
 // Token must be at least this old to auto-call. Fresh-deploy dumpsters that
 // pump for 5 minutes off creator buying then bleed back to zero are the
 // majority of -90% calls. One hour gives the holder base time to validate.
@@ -274,6 +276,16 @@ impl Notifier {
     /// log isn't flooded with tokens that weren't realistically close.
     ///
     /// Returns (gate_name, gap_description) if a near-miss, else None.
+    /// Classify near-misses across the FULL gate vector. Logs the first gate
+    /// that fails (in priority order) so the operator can see exactly which
+    /// gate is biting on which token. Without this, gate tuning flies blind:
+    /// before this expansion, only conf/top1/momentum/sell-pressure were
+    /// tracked, leaving 8 of 12 gates unmonitored.
+    ///
+    /// Returns (gate_name, gap_description) if the token passed the
+    /// classification + age + history checks but failed at least one gate.
+    /// Returns None when the token is a structural miss (wrong class) or
+    /// when it would have fired (no near-miss).
     pub fn classify_near_miss(
         &self,
         a: &TokenAnalysis,
@@ -281,54 +293,80 @@ impl Notifier {
     ) -> Option<(&'static str, String)> {
         let class = a.confidence.classification.as_str();
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
-        let conf_ok = effective_conf >= SIGNAL_MIN_EFFECTIVE_CONFIDENCE;
-        let holder_ok = a.top_holder_pct < SIGNAL_MAX_TOP_HOLDER_PCT;
-        let momentum_ok = a.delta.as_ref().map_or(true, |d| d.momentum_delta >= 0);
-
-        // Not a near-miss at all — it would have signaled
-        if class_ok && conf_ok && holder_ok && momentum_ok {
-            return None;
-        }
-        // Wrong class is a structural miss, not a near-miss
         if !class_ok {
+            return None; // structural miss
+        }
+        // Walk gates in priority order; first failing gate wins.
+        if effective_conf < SIGNAL_MIN_EFFECTIVE_CONFIDENCE {
+            // Only count "close" misses (>=60 confidence) so the log isn't
+            // flooded with random low-conf snapshots.
+            if effective_conf >= 60 {
+                return Some((
+                    "conf",
+                    format!(
+                        "conf {} < {} (short by {})",
+                        effective_conf,
+                        SIGNAL_MIN_EFFECTIVE_CONFIDENCE,
+                        SIGNAL_MIN_EFFECTIVE_CONFIDENCE - effective_conf
+                    ),
+                ));
+            }
             return None;
         }
-
-        // Confidence near-miss: conf in [65, 74]
-        if !conf_ok && effective_conf >= 65 {
-            return Some((
-                "conf",
-                format!(
-                    "conf {} < {}  (short by {})",
-                    effective_conf,
-                    SIGNAL_MIN_EFFECTIVE_CONFIDENCE,
-                    SIGNAL_MIN_EFFECTIVE_CONFIDENCE - effective_conf
-                ),
-            ));
-        }
-        // Top-holder near-miss: top in [20.00, 25.00]
-        if conf_ok && !holder_ok && a.top_holder_pct < 25.0 {
+        if a.top_holder_pct >= SIGNAL_MAX_TOP_HOLDER_PCT {
             return Some((
                 "top_holder",
                 format!(
-                    "top {:.2}% > {:.2}%  (over by {:.2}pp)",
+                    "top {:.2}% >= {:.2}% (over by {:.2}pp)",
                     a.top_holder_pct,
                     SIGNAL_MAX_TOP_HOLDER_PCT,
                     a.top_holder_pct - SIGNAL_MAX_TOP_HOLDER_PCT
                 ),
             ));
         }
-        // Momentum near-miss: delta in [-5, -1]
-        if conf_ok && holder_ok && !momentum_ok {
-            if let Some(d) = a.delta.as_ref() {
-                if d.momentum_delta >= -5 {
-                    return Some((
-                        "momentum_delta",
-                        format!("mom_delta {} < 0 (slipping)", d.momentum_delta),
-                    ));
-                }
-            }
+        if a.top10_pct >= SIGNAL_MAX_TOP10_PCT {
+            return Some((
+                "top10",
+                format!(
+                    "top10 {:.1}% >= {:.1}% (over by {:.1}pp)",
+                    a.top10_pct,
+                    SIGNAL_MAX_TOP10_PCT,
+                    a.top10_pct - SIGNAL_MAX_TOP10_PCT
+                ),
+            ));
         }
+        if a.tx_rate < SIGNAL_MIN_TX_RATE_PER_MIN {
+            return Some((
+                "tx_rate",
+                format!(
+                    "txr {:.1}/min < {:.1} (short by {:.1})",
+                    a.tx_rate,
+                    SIGNAL_MIN_TX_RATE_PER_MIN,
+                    SIGNAL_MIN_TX_RATE_PER_MIN - a.tx_rate
+                ),
+            ));
+        }
+        if a.bundle_pct >= SIGNAL_MAX_BUNDLE_PCT {
+            return Some(("bundle", format!("bundle {:.1}% >= {:.1}%", a.bundle_pct, SIGNAL_MAX_BUNDLE_PCT)));
+        }
+        if a.sniper_pct >= SIGNAL_MAX_SNIPER_PCT {
+            return Some(("sniper", format!("sniper {:.1}% >= {:.1}%", a.sniper_pct, SIGNAL_MAX_SNIPER_PCT)));
+        }
+        if a.insider_pct >= SIGNAL_MAX_INSIDER_PCT {
+            return Some(("insider", format!("insider {:.1}% >= {:.1}%", a.insider_pct, SIGNAL_MAX_INSIDER_PCT)));
+        }
+        if a.delta.as_ref().map_or(true, |d| d.momentum_delta < 0) {
+            if let Some(d) = a.delta.as_ref() {
+                return Some((
+                    "momentum_delta",
+                    format!("mom_delta {} < 0", d.momentum_delta),
+                ));
+            }
+            return Some(("history", "no prior snapshot".into()));
+        }
+        // All in-snapshot gates passed; remaining failures (liq/vol/mcap/age/
+        // holder_growth) require meta — those callers go through the path
+        // with meta visibility and would have logged via should_signal directly.
         None
     }
 
@@ -423,10 +461,9 @@ impl Notifier {
         if self.halted() {
             return false;
         }
-        // Still require a known classification — we don't scalp DEAD/UNSAFE.
         let class = a.confidence.classification.as_str();
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
-        // Mcap window — explicitly the shallow zone the SHORT/LONG bucket excludes.
+        // Mcap window — the shallow zone, $80k-$500k. Bigger tokens go SHORT.
         let mcap_val = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .unwrap_or(0.0);
@@ -434,17 +471,18 @@ impl Notifier {
         // Recent run — token must be moving NOW, not stale.
         let pc1h = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
         let pc_ok = pc1h >= SCALP_MIN_PRICE_CHANGE_1H_PCT;
-        // Velocity — must be live, not just printing a high 1h on stale data.
         let tx_rate_ok = a.tx_rate >= SCALP_MIN_TX_RATE_PER_MIN;
         let holders_ok = (a.holder_count as i32) >= SCALP_MIN_HOLDER_COUNT;
-        // Age cap — only fresh-grad tokens; a 6-day-old shallow pump that
-        // just printed +50% is a dead-cat bounce, not a scalp setup.
         let now = chrono::Utc::now().timestamp();
         let age_ok = first_seen.map_or(false, |fs| now - fs <= SCALP_MAX_AGE_SECS);
-        // Liquidity — looser than SHORT but still real.
         let liq_ok = meta
             .and_then(|m| m.liquidity_usd)
-            .map_or(false, |v| v >= 15_000.0);
+            .map_or(false, |v| v >= SCALP_MIN_LIQUIDITY_USD);
+        // Concentration ceilings — shallow tokens have higher natural top1
+        // (RPC top-20 dominate by accounting math). Trump/ALEXCOIN/BLIMP
+        // ranged 9.3-13.4% top1, 28.7-36.1% top10.
+        let top1_ok = a.top_holder_pct < SCALP_MAX_TOP_HOLDER_PCT;
+        let top10_ok = a.top10_pct < SCALP_MAX_TOP10_PCT;
         // Forensics ceilings — same as SHORT. Bot rugs don't pass.
         let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
         let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
@@ -457,6 +495,8 @@ impl Notifier {
             && holders_ok
             && age_ok
             && liq_ok
+            && top1_ok
+            && top10_ok
             && bundle_ok
             && sniper_ok
             && insider_ok
