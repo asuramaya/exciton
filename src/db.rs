@@ -472,6 +472,37 @@ impl Db {
         Ok(())
     }
 
+    // -- Periodic GC ---------------------------------------------------------
+
+    /// Periodic retention pass — same DELETE policies as the init-time GC,
+    /// but runnable on a timer so the DB doesn't grow unbounded between
+    /// container restarts. Returns total rows deleted across all tables.
+    pub fn run_periodic_gc(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut deleted = 0usize;
+        deleted += conn.execute(
+            "DELETE FROM curve_snapshots WHERE timestamp < strftime('%s','now') - 86400",
+            [],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 30*86400",
+            [],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM sniper_cohort WHERE mint_address NOT IN (
+                 SELECT DISTINCT token_address FROM token_snapshots
+                 UNION SELECT mint FROM calls
+                       WHERE called_at >= strftime('%s','now') - 30*86400
+             )",
+            [],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM alerts WHERE timestamp < strftime('%s','now') - 7*86400",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
     // -- Signal near-misses --------------------------------------------------
 
     pub fn insert_near_miss(

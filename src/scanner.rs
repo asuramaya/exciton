@@ -240,6 +240,25 @@ impl BackgroundScanner {
             });
         }
 
+        // Hourly retention GC. Without this the DB grows unbounded between
+        // container restarts; the init-time GC alone left curve_snapshots
+        // accumulating to 50k+ rows.
+        {
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(3600));
+                tick.tick().await; // skip the immediate first fire
+                loop {
+                    tick.tick().await;
+                    match db.run_periodic_gc() {
+                        Ok(n) if n > 0 => tracing::info!("gc: pruned {} rows", n),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("gc: failed: {}", e),
+                    }
+                }
+            });
+        }
+
         let mut cycle = 0u64;
         while self.running.load(AtomicOrdering::SeqCst) {
             cycle += 1;
