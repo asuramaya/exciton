@@ -190,7 +190,11 @@ async fn compute_smart_money_count(
     if refs.is_empty() {
         return Ok(0);
     }
-    let scope: Vec<&String> = top_owners.iter().take(20).collect();
+    // Scope top 5 instead of top 20: each owner = 2 RPC calls (one per
+    // SPL token program), so 5 owners = 10 calls vs 40. Smart-money is
+    // a tie-breaker signal anyway; trimming to top 5 keeps the strongest
+    // holders in scope while cutting the steady-state RPC load 4x.
+    let scope: Vec<&String> = top_owners.iter().take(5).collect();
     let futures = scope.iter().map(|owner| {
         let owner = (*owner).clone();
         let rpc = rpc.clone();
