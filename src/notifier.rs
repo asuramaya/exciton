@@ -143,10 +143,17 @@ pub const SCALP_MIN_LIQUIDITY_USD: f64 = 20_000.0;
 pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 5.0;
 // 15 because RPC caps at 20 — anything above 20 is rare. Set to 0 to disable.
 pub const SCALP_MIN_HOLDER_COUNT: i32 = 15;
-// Token must be at least this old to auto-call. Fresh-deploy dumpsters that
-// pump for 5 minutes off creator buying then bleed back to zero are the
-// majority of -90% calls. One hour gives the holder base time to validate.
-pub const SIGNAL_MIN_TOKEN_AGE_SECS: i64 = 3600;
+// Token must be at least this old to auto-call. Original 1h was excluding
+// the entire fresh-grad rip cycle (peak typically 10-30min post-grad).
+// 2ssMotVbTUfR at 14min old, GRINDER conf 71, top1=3.9, mcap $1.5M, bsr
+// 1.17 — textbook fire candidate, blocked by the 1h floor. Lowered to
+// 15min: enough time for the bsr ratio + holder distribution to be
+// meaningful, but not so much that the move is over before we fire.
+//
+// The bot-rug protection that the 1h floor was meant to provide now
+// comes from the forensics layer (bundle/sniper/insider %) and the
+// tightened bsr ratio band [1.10, 1.30].
+pub const SIGNAL_MIN_TOKEN_AGE_SECS: i64 = 900;
 
 // =============================================================================
 // MATERIAL CHANGE THRESHOLDS — only edit the card when something notable moves.
