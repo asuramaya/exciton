@@ -67,7 +67,7 @@ pub async fn compute(
     let owners = rpc
         .get_multiple_token_account_owners(&acct_addrs)
         .await
-        .unwrap_or_else(|_| vec![None; acct_addrs.len()]);
+        .map_err(|e| anyhow::anyhow!("get_multiple_token_account_owners: {}", e))?;
 
     // Build owner -> total balance map. Multiple token accounts per owner
     // get summed.
