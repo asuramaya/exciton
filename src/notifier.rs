@@ -95,19 +95,18 @@ pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
-// Buy/sell ratio gates — recalibrated 2026-04-29 with 5 additional post-deploy
-// losing scalps in the cohort (NOHOUSE 1.40, scam 1.27, plus original
-// chadhouse 1.37). The original 0.9-1.6 band let too many "barely-organic"
-// losers slip through. Tightening to 1.10-1.30 retains 4 of 5 historical
-// winners (1.19-1.24) and blocks scam, chadhouse, NOHOUSE; only TOK (1.49)
-// sacrificed.
+// Buy/sell ratio gates — relaxed 2026-04-30 from 1.10-1.30 to 1.05-1.40
+// after live observation that the tighter band caught zero candidates.
+// 2ssMotVbTUfR (GRINDER conf 74, top1 3.5%, top10 14.2%, mcap $2M) sat
+// at 1.05-1.09 bsr for an hour, perfect by every other measure but
+// blocked. The 1.05-1.40 band still excludes the bimodal failure modes
+// from the historical cohort (0.82/0.93 dumping, 3.48/3.70/3.77 FOMO
+// peak) while letting through borderline-organic flow.
 //
-// Counterfactual on the 13-call cohort:
-//   - old gate (0.9-1.6) + no pc1h ceiling: 5 wins + 8 losses = -329
-//   - new gate (1.10-1.30) + pc1h ceiling: 4 wins + 0 losses = +155
-//   - swing: +484% PnL improvement
-pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.10;
-pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.30;
+// Trade-off: chadhouse (1.37) historical loser slips back through.
+// Accepted given that nothing fires under the tighter band.
+pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.05;
+pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.40;
 // Minimum sample size — below this the ratio is noise.
 pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 
