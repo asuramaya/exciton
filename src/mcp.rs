@@ -886,8 +886,12 @@ impl PhotonServer {
                 }
                 None => ("(madapes disabled)".to_string(), -1),
             };
+        // -1 = disabled (no recraft key). Front-end pipeline_health
+        // reports "stale" for any positive number above the threshold;
+        // -1 means we shouldn't flag it stale at all (the processor
+        // intentionally isn't running).
         let assets_age_seconds: i64 = match self.config.madapes.as_ref() {
-            Some(mp) => {
+            Some(mp) if !mp.recraft_api_key.is_empty() => {
                 let p = format!("{}/thoughts/assets.json", mp.repo_path);
                 std::fs::metadata(&p)
                     .and_then(|m| m.modified())
@@ -896,7 +900,7 @@ impl PhotonServer {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(-1)
             }
-            None => -1,
+            _ => -1,
         };
 
         // Scanner / alert activity — newest alert ts.

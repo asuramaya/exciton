@@ -858,29 +858,16 @@ pub async fn analyze_token(
                         return;
                     }
                     Err(_) => {
-                        // Fail-closed sentinel write: when compute can't
-                        // complete (RPC degradation / network outage),
-                        // record forensics_computed_at = now with all
-                        // metrics maxed (100%). This makes the bundle/
-                        // sniper/insider gates BLOCK the token until a
-                        // future cycle's compute succeeds (1h refresh).
-                        // Without this, the gate-required check (line in
-                        // notifier.rs: `forensics_measured = a.forensics_
-                        // computed_at > 0`) deadlocks: gate requires
-                        // forensics, forensics never completes, no calls
-                        // fire ever.
+                        // Timeout: log + return without writing. The
+                        // fail-closed sentinel (write 100/100/100) was
+                        // wrong — it interacted with the now-removed
+                        // forensics_required gate to block every token
+                        // forever. Now: forensics gates are soft (0
+                        // passes), so a no-write here just leaves the
+                        // gate permissive until next refresh succeeds.
                         tracing::warn!(
-                            "launch_forensics: {} timed out after 180s — recording sentinel block",
+                            "launch_forensics: {} timed out after 180s",
                             mint_owned
-                        );
-                        let stamp = chrono::Utc::now().timestamp();
-                        let _ = db_clone.update_launch_forensics(
-                            &mint_owned,
-                            100.0,
-                            100.0,
-                            100.0,
-                            0,
-                            stamp,
                         );
                         return;
                     }

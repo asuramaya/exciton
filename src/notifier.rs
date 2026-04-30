@@ -452,17 +452,25 @@ impl Notifier {
                 per_hour >= SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR
             }
         });
-        // Launch-forensics: blocked when measured > threshold OR when never
-        // measured. Audit 2026-04-29 found 11/15 calls fired with
-        // forensics_computed_at=0 — bundle/sniper/insider all defaulted to 0
-        // and silently passed every gate. Now: require forensics_computed_at
-        // > 0 (i.e. the async refresh has populated at least once for this
-        // mint). New tokens skip their first-fire window; second analysis
-        // cycle (~5min later) reads fresh data and can fire.
-        let forensics_measured = a.forensics_computed_at > 0;
-        let bundle_ok = forensics_measured && a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = forensics_measured && a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
-        let insider_ok = forensics_measured && a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Launch-forensics: blocked when measured > threshold. The
+        // "forensics_required" gate (added 2026-04-30) was correct in
+        // theory but caused 0-fire deadlock in production: forensics
+        // tasks timing out at 180s under the degraded public-RPC
+        // environment (429 cascade) → fail-closed sentinel writes 100%
+        // → all forensics gates fail → no calls fire ever.
+        //
+        // Reverted to soft gate: a 0 (unmeasured) value passes through.
+        // Sentinel-100 (timeout) still blocks correctly. This is the
+        // intended design — measured-clean tokens fire, measured-bad
+        // are blocked, unmeasured pass through and the 1h refresh
+        // tightens the gate retroactively as data arrives.
+        //
+        // The 11/15-fired-on-zeros problem the gate was meant to solve
+        // is mitigated by the b/s ratio gate + pc1h ceiling that came
+        // in the same audit cycle — those filter the actual rugs.
+        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate: organic accumulation lives in 0.9-1.6.
         // Below = already dumping. Above = late-stage FOMO peak.
         let total_txns = a.buys_h1 + a.sells_h1;
@@ -541,13 +549,11 @@ impl Notifier {
         // ranged 9.3-13.4% top1, 28.7-36.1% top10.
         let top1_ok = a.top_holder_pct < SCALP_MAX_TOP_HOLDER_PCT;
         let top10_ok = a.top10_pct < SCALP_MAX_TOP10_PCT;
-        // Forensics ceilings — same as SHORT. Bot rugs don't pass. Required
-        // measurement: a token with forensics_computed_at=0 (never measured)
-        // fails all three gates, deferring fire until next analysis cycle.
-        let forensics_measured = a.forensics_computed_at > 0;
-        let bundle_ok = forensics_measured && a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = forensics_measured && a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
-        let insider_ok = forensics_measured && a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
+        // Forensics ceilings — same as SHORT. Soft gate: unmeasured passes,
+        // measured-bad blocks. See should_signal for the full rationale.
+        let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate — the strongest single signal in the
         // 11-call live SCALP backtest. Inherited from SHORT.
         let total_txns = a.buys_h1 + a.sells_h1;
@@ -968,17 +974,27 @@ impl Notifier {
         };
 
         let mut timeline: Vec<TimelineEntry> = serde_json::from_str(&d.timeline_json).unwrap_or_default();
-        let line = {
+        // Construct the line WITHOUT prepending pct — settle passes exit_note
+        // already formatted with the pct ("-32.8% · scalp stop"), so adding
+        // another pct prefix produces "-32.8% · -32.8% · scalp stop". Only
+        // prepend when exit_note doesn't already start with a percentage.
+        let already_has_pct = exit_note.trim_start().starts_with(|c: char| c == '+' || c == '-')
+            && exit_note.contains('%');
+        let line = if already_has_pct {
+            exit_note.to_string()
+        } else {
             let pct = exit_pct.map(|p| format!("{:+.1}% · ", p)).unwrap_or_default();
             format!("{}{}", pct, exit_note)
         };
-        // Don't append a duplicate timeline entry when the last one already
-        // matches — keeps idempotent backfill from growing the timeline on
-        // every restart.
-        let is_dup = timeline
-            .last()
-            .map(|e| e.kind == outcome && e.line == line)
-            .unwrap_or(false);
+        // Dedup: skip when the most-recent entry has the same outcome AND
+        // a line that's a substring/superset (handles the historical
+        // double-pct entries that already exist in production timelines).
+        let is_dup = timeline.last().map(|e| {
+            e.kind == outcome
+                && (e.line == line
+                    || e.line.contains(&line)
+                    || line.contains(&e.line))
+        }).unwrap_or(false);
         if !is_dup {
             timeline.push(TimelineEntry { ts: now, kind: outcome.to_string(), line: line.clone() });
         }

@@ -355,6 +355,19 @@ impl Db {
             [],
         );
 
+        // Clear forensics-timeout sentinels (100/100/100) so the soft
+        // gate doesn't permanently block those tokens. The buggy write
+        // happened during the 2026-04-30 RPC-degradation hours; now
+        // that the sentinel write has been removed, clearing the
+        // existing rows lets a future compute succeed and overwrite
+        // with real values.
+        let _ = conn.execute(
+            "UPDATE token_snapshots
+             SET bundle_pct=0, sniper_pct=0, insider_pct=0, forensics_computed_at=0
+             WHERE bundle_pct=100 AND sniper_pct=100 AND insider_pct=100",
+            [],
+        );
+
         // Sniper cohort — the wallets that bought in the first window of
         // a token's life. Captured once per token at discovery.
         conn.execute_batch(
