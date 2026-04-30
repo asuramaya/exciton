@@ -1132,9 +1132,22 @@ fn mask_url(url: &str) -> String {
     }
 }
 
+/// Should this error sideline the endpoint immediately, instead of waiting
+/// for the 3-strike error_count path? Catches both transient throttles
+/// and structural breakage (expired keys, plan-restricted methods, dead
+/// TLS subscriptions) — anything where retrying the same endpoint inside
+/// the same cycle is just wasted RTT.
 fn is_rate_limited(error: &str) -> bool {
     let lowered = error.to_ascii_lowercase();
-    error.contains("429") || lowered.contains("too many requests") || lowered.contains("rate limit")
+    error.contains("429")
+        || error.contains("403")
+        || lowered.contains("too many requests")
+        || lowered.contains("rate limit")
+        || lowered.contains("monthly capacity")
+        || lowered.contains("plan upgrade")
+        || lowered.contains("tlsv1 alert")
+        || lowered.contains("ssl routines")
+        || lowered.contains("forbidden")
 }
 
 /// Resolve endpoint URLs, substituting environment variables
