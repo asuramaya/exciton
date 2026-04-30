@@ -47,19 +47,19 @@ pub async fn compute(
     rpc: &Arc<RpcRouter>,
 ) -> Result<LaunchForensics> {
     // Total supply — needed by all three. Without it we can't compute %.
-    let supply_ui = match rpc.get_token_supply(mint).await {
-        Ok(s) => s.ui_amount,
-        Err(_) => return Ok(LaunchForensics::default()),
-    };
+    // Bubble RPC errors up so the caller takes the no-write path — writing
+    // 0/0/0/0/now would mark the token "measured clean" and suppress retry
+    // for a full hour even though we never actually measured.
+    let supply = rpc.get_token_supply(mint).await
+        .map_err(|e| anyhow::anyhow!("get_token_supply: {}", e))?;
+    let supply_ui = supply.ui_amount;
     if supply_ui <= 0.0 {
         return Ok(LaunchForensics::default());
     }
 
     // Top holders + owner resolution. Reused by sniper and insider.
-    let largest = match rpc.get_token_largest_accounts(mint).await {
-        Ok(v) => v,
-        Err(_) => return Ok(LaunchForensics::default()),
-    };
+    let largest = rpc.get_token_largest_accounts(mint).await
+        .map_err(|e| anyhow::anyhow!("get_token_largest_accounts: {}", e))?;
     if largest.is_empty() {
         return Ok(LaunchForensics::default());
     }
