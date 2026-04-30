@@ -87,14 +87,21 @@ pub async fn compute(
     // concurrently so the wall-time is max(slowest) instead of sum(all).
     let sniper_pct = compute_sniper_pct(mint, supply_ui, db, &owner_balances)
         .unwrap_or(0.0);
-    let (bundle_pct, insider_pct, smart_money_count) = tokio::join!(
+    let (bundle_res, insider_res, smart_res) = tokio::join!(
         compute_bundle_pct(mint, supply_ui, &owner_balances, rpc),
         compute_insider_pct(supply_ui, &top_owners_in_order, &owner_balances, rpc),
         compute_smart_money_count(&top_owners_in_order, db, rpc),
     );
-    let bundle_pct = bundle_pct.unwrap_or(0.0);
-    let insider_pct = insider_pct.unwrap_or(0.0);
-    let smart_money_count = smart_money_count.unwrap_or(0);
+    // If all three RPC sub-computes failed, treat the whole compute as
+    // unmeasured so the persist path skips the write. Otherwise an
+    // all-zero forensics row would land and the soft gate would accept
+    // it as "measured clean" until the next 1h refresh.
+    if bundle_res.is_err() && insider_res.is_err() && smart_res.is_err() {
+        anyhow::bail!("forensics: all three RPC sub-computes failed");
+    }
+    let bundle_pct = bundle_res.unwrap_or(0.0);
+    let insider_pct = insider_res.unwrap_or(0.0);
+    let smart_money_count = smart_res.unwrap_or(0);
 
     Ok(LaunchForensics {
         bundle_pct,
