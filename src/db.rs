@@ -68,60 +68,16 @@ impl Db {
                 safety_score INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS token_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                token_address TEXT NOT NULL REFERENCES tokens(address),
-                layer TEXT NOT NULL,
-                signal_type TEXT NOT NULL,
-                score INTEGER NOT NULL,
-                details TEXT,
-                timestamp INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS wallets (
-                address TEXT PRIMARY KEY,
-                label TEXT,
-                win_rate REAL NOT NULL DEFAULT 0.0,
-                avg_return REAL NOT NULL DEFAULT 0.0,
-                trade_count INTEGER NOT NULL DEFAULT 0,
-                last_seen INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS wallet_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_address TEXT NOT NULL REFERENCES wallets(address),
-                token_address TEXT NOT NULL,
-                side TEXT NOT NULL,
-                amount_sol REAL NOT NULL,
-                token_amount REAL NOT NULL,
-                timestamp INTEGER NOT NULL,
-                tx_signature TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                token_address TEXT NOT NULL,
-                side TEXT NOT NULL,
-                amount_sol REAL NOT NULL,
-                token_amount REAL NOT NULL,
-                entry_price REAL,
-                exit_price REAL,
-                pnl_sol REAL,
-                confidence_at_entry INTEGER,
-                signal_state TEXT,
-                tx_signature TEXT,
-                status TEXT NOT NULL DEFAULT 'open',
-                opened_at INTEGER NOT NULL,
-                closed_at INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS regimes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                regime_type TEXT NOT NULL,
-                confidence INTEGER NOT NULL,
-                features TEXT NOT NULL,
-                timestamp INTEGER NOT NULL
-            );
+            -- Tables removed 2026-04-30 (no compile-time inserters):
+            --   token_signals — replaced by per-snapshot scores in
+            --     token_snapshots (mom/dist/spring/conf columns)
+            --   wallets / wallet_trades / trades — superseded by
+            --     wallet_ledger (signature-keyed, used by publisher)
+            --   regimes — Forecaster::classify_regime was deleted in the
+            --     hygiene-audit cleanup; nothing populates this anymore
+            -- Existing rows in production DBs are left in place. The
+            -- IF NOT EXISTS pattern means dropping the CREATE doesn't
+            -- delete data on upgrade.
 
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,14 +163,10 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_snapshots_token_time ON token_snapshots(token_address, timestamp);
             CREATE INDEX IF NOT EXISTS idx_watchlist_active_checked ON watchlist(active, last_checked);
 
-            CREATE INDEX IF NOT EXISTS idx_token_signals_token ON token_signals(token_address);
-            CREATE INDEX IF NOT EXISTS idx_token_signals_timestamp ON token_signals(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet_address);
-            CREATE INDEX IF NOT EXISTS idx_wallet_trades_token ON wallet_trades(token_address);
-            CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);
-            CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+            -- Indexes for the dead tables (token_signals/wallet_trades/
+            -- trades/regimes) removed alongside their CREATE TABLE
+            -- statements. Existing indexes in production DBs survive.
             CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_regimes_timestamp ON regimes(timestamp);
 
             -- Signal-gate near-misses: tokens that came close but didn't pass.
             -- Truth-telling — shows what almost fired so gate tuning is informed
