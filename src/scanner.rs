@@ -1311,17 +1311,23 @@ fn has_favorable_watchlist_profile(candidate: &crate::db::WatchlistCandidate) ->
 fn should_evict_watchlist_candidate(candidate: &crate::db::WatchlistCandidate, now: i64) -> bool {
     let class = effective_watchlist_class(candidate);
     let holders = candidate.snapshot_holder_count.unwrap_or(0);
-    let top_holder_pct = candidate.snapshot_top_holder_pct.unwrap_or(100.0);
+    // CRITICAL: default top_holder_pct to 0.0 when NO snapshot exists yet
+    // (fresh watchlist additions). Previous default of 100.0 immediately
+    // tripped the >=50 concentration eviction on every fresh add — every
+    // newly-added token got instantly deactivated before its first
+    // analysis cycle could even run. Result: watchlist permanently
+    // empty + 0 calls fire ever. Use 0.0 as 'unknown', let the first
+    // analysis cycle populate the real value, then re-evaluate.
+    let top_holder_pct = candidate.snapshot_top_holder_pct.unwrap_or(0.0);
+    let has_snapshot = candidate.snapshot_classification.is_some();
 
     if matches!(class, "DEAD" | "CRASHING" | "ACTIVE_TRAP") || class.starts_with("UNSAFE") {
         return true;
     }
-    // Parallel concentration trigger to should_remove_from_watchlist.
-    // top1>=50 is the unambiguous "one whale owns it all" cut. The earlier
-    // (holders<25 && top1>=33) was permanently-true on the first leg
-    // because RPC caps holder count at 20.
-    let _ = holders; // retained for future use; not gating today
-    if top_holder_pct >= 50.0 {
+    // top1>=50 concentration cut applies only when we HAVE measured data.
+    // No snapshot yet = give the token a chance to be analyzed first.
+    let _ = holders;
+    if has_snapshot && top_holder_pct >= 50.0 {
         return true;
     }
     now - candidate.added_at > WATCHLIST_STALE_SECONDS

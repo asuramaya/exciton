@@ -246,6 +246,22 @@ struct InspectResult {
     risk_rating: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     delta: Option<DeltaInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forensics: Option<ForensicsInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct ForensicsInfo {
+    bundle_pct: f64,
+    sniper_pct: f64,
+    insider_pct: f64,
+    smart_money_count: i32,
+    /// 0 when forensics never measured for this token. Newer tokens may
+    /// show 0 until the async refresh completes (~next analysis cycle).
+    computed_at: i64,
+    /// Trailing 1h tape — surfaces alongside forensics for narrative context.
+    buys_h1: i32,
+    sells_h1: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -603,6 +619,15 @@ impl PhotonServer {
                     }
                 });
 
+                let forensics = Some(ForensicsInfo {
+                    bundle_pct: analysis.bundle_pct,
+                    sniper_pct: analysis.sniper_pct,
+                    insider_pct: analysis.insider_pct,
+                    smart_money_count: analysis.smart_money_count,
+                    computed_at: analysis.forensics_computed_at,
+                    buys_h1: analysis.buys_h1,
+                    sells_h1: analysis.sells_h1,
+                });
                 to_json(&InspectResult {
                     target: params.address,
                     target_type: "token".to_string(),
@@ -611,6 +636,7 @@ impl PhotonServer {
                     signals: other_scores,
                     risk_rating,
                     delta: delta_info,
+                    forensics,
                 })
             }
             Err(e) => to_json(&InspectResult {
@@ -626,6 +652,7 @@ impl PhotonServer {
                 }],
                 risk_rating: format!("UNKNOWN — analysis error: {}", e),
                 delta: None,
+                forensics: None,
             }),
         }
     }
