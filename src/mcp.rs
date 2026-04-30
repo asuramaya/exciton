@@ -951,6 +951,7 @@ impl PhotonServer {
                 "any_endpoint_up": rpc_ok,
                 "total_endpoints": rpc_total,
                 "healthy_endpoints": rpc_healthy,
+                "endpoints": self.rpc.endpoint_stats(),
             },
             "wallet": {
                 "address": self.config.wallet.public_key,

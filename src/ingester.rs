@@ -24,6 +24,10 @@ struct Endpoint {
     client: RpcClient,
     request_count: AtomicU64,
     error_count: AtomicU64,
+    /// Lifetime success count — does not reset on transient errors.
+    success_total: AtomicU64,
+    /// Lifetime failure count — does not reset on transient successes.
+    failure_total: AtomicU64,
     healthy: AtomicBool,
 }
 
@@ -39,19 +43,22 @@ impl Endpoint {
             client,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            success_total: AtomicU64::new(0),
+            failure_total: AtomicU64::new(0),
             healthy: AtomicBool::new(true),
         }
     }
 
     fn record_success(&self) {
         self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.success_total.fetch_add(1, Ordering::Relaxed);
         self.healthy.store(true, Ordering::Relaxed);
     }
 
     fn record_error(&self) {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         self.error_count.fetch_add(1, Ordering::Relaxed);
-        // Mark unhealthy after 3 consecutive errors
+        self.failure_total.fetch_add(1, Ordering::Relaxed);
         if self.error_count.load(Ordering::Relaxed) > 3 {
             self.healthy.store(false, Ordering::Relaxed);
         }
@@ -65,6 +72,15 @@ impl Endpoint {
         self.error_count.store(0, Ordering::Relaxed);
         self.healthy.store(true, Ordering::Relaxed);
     }
+}
+
+/// Per-endpoint health snapshot for diagnostics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EndpointStats {
+    pub url: String,
+    pub healthy: bool,
+    pub success_total: u64,
+    pub failure_total: u64,
 }
 
 /// Multi-endpoint RPC router with round-robin and failover
@@ -144,6 +160,18 @@ impl RpcRouter {
 
     pub fn healthy_count(&self) -> usize {
         self.endpoints.iter().filter(|e| e.is_healthy()).count()
+    }
+
+    pub fn endpoint_stats(&self) -> Vec<EndpointStats> {
+        self.endpoints
+            .iter()
+            .map(|e| EndpointStats {
+                url: mask_url(&e.url),
+                healthy: e.is_healthy(),
+                success_total: e.success_total.load(Ordering::Relaxed),
+                failure_total: e.failure_total.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// Send a signed VersionedTransaction to the network via the best available endpoint.
