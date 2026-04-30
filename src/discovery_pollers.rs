@@ -64,13 +64,16 @@ impl DiscoveryPoller {
                 idx = idx.wrapping_add(1);
                 match self.poll_one(url).await {
                     Ok(added) => {
-                        if added > 0 {
-                            tracing::info!(
-                                "discovery poll: {} new mints from {}",
-                                added,
-                                short_url(url)
-                            );
-                        }
+                        // Always log so the poller's heartbeat is visible.
+                        // PumpPortal firehose typically adds the same mints
+                        // first, so 0-adds is the normal steady state — but
+                        // distinguishing "0 because already known" from
+                        // "0 because the poller died silently" matters.
+                        tracing::info!(
+                            "discovery poll: +{} new mints from {}",
+                            added,
+                            short_url(url)
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("discovery poll {} failed: {}", short_url(url), e);
