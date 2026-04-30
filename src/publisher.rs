@@ -274,12 +274,19 @@ impl Publisher {
                 }
                 last_run = tokio::time::Instant::now();
                 tracing::debug!("publisher tick start");
-                match self.run_once().await {
-                    Ok(committed) if committed => {
+                // Hard 60s budget on the entire tick. The inner per-RPC
+                // timeouts (5s/8s) cap individual hot calls, but downstream
+                // work (build_calls_file's per-mint market fetches, scout/
+                // whale/details per active call, the git push) can still
+                // accumulate beyond a useful staleness budget. If the tick
+                // can't finish in 60s it's not worth the next tick waiting.
+                match tokio::time::timeout(Duration::from_secs(60), self.run_once()).await {
+                    Ok(Ok(committed)) if committed => {
                         tracing::info!("MadApes publish: data snapshot pushed")
                     }
-                    Ok(_) => tracing::info!("MadApes publish: no data change"),
-                    Err(e) => tracing::warn!("MadApes publish failed: {}", e),
+                    Ok(Ok(_)) => tracing::info!("MadApes publish: no data change"),
+                    Ok(Err(e)) => tracing::warn!("MadApes publish failed: {}", e),
+                    Err(_) => tracing::warn!("MadApes publish: tick exceeded 60s budget — abandoning"),
                 }
             }
         });
