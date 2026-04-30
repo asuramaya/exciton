@@ -141,13 +141,11 @@ async fn compute_bundle_pct(
     owner_balances: &HashMap<String, f64>,
     rpc: &Arc<RpcRouter>,
 ) -> Result<f64> {
-    // Pull a generous window of recent signatures and take the oldest.
-    // Pump.fun mints accumulate thousands of txs fast — 1000 may not
-    // reach inception. For v1 we accept "the oldest among the most
-    // recent 1000" as a proxy: if a token has fewer than 1000 lifetime
-    // txs we hit the actual launch tx; otherwise we get an arbitrary
-    // post-launch tx and bundle_pct returns 0 (clean data > wrong data).
-    let sigs = rpc.get_recent_signatures(mint, 1000).await?;
+    // 100-sig window (was 1000): for mature tokens (>100 lifetime txs)
+    // we hit a post-launch tx and return 0 anyway; for fresh tokens 100
+    // is plenty. The 10x reduction matches the same cost-cut applied to
+    // compute_insider_pct's signature fetch.
+    let sigs = rpc.get_recent_signatures(mint, 100).await?;
     if sigs.is_empty() {
         return Ok(0.0);
     }
@@ -229,19 +227,24 @@ async fn compute_insider_pct(
     if top_owners.is_empty() {
         return Ok(0.0);
     }
-    // Top 10 (was 20) — halves RPC cost while still catching the biggest
-    // insider clusters. The bottom-10 of the top-20 are usually small
-    // enough that even if they share a funder, the cluster's % of supply
-    // is below the gate threshold anyway.
-    let scope: Vec<&String> = top_owners.iter().take(10).collect();
-    // Resolve funder per owner concurrently. Two RPC calls per owner
-    // (recent_signatures + tx_wallet_summary). Total wall-time bounded
-    // by the slowest of 10 (vs sum of 40 in the previous serial form).
+    // Top 5 (was 10, originally 20) — reducing scope progressively to
+    // keep forensics within the 180s timeout in the degraded RPC
+    // environment we're observing (public-RPC 429 cascade across 4 of
+    // 5 endpoints). The top 5 are where the biggest single-funder
+    // clusters actually appear; deeper holders contribute small balances
+    // even when grouped.
+    //
+    // Also: limit signatures fetch to 100 (was 1000). For finding the
+    // OLDEST signature of a wallet, we just need pagination back through
+    // history — but the wallet's first observed sig is likely within the
+    // first 100 of the most-recent page for a fresh-grad token's holders.
+    // Trade accuracy on stale wallets for 10x faster RPC response.
+    let scope: Vec<&String> = top_owners.iter().take(5).collect();
     let funder_results = futures_util::future::join_all(scope.iter().map(|owner| {
         let owner = (*owner).clone();
         let rpc = rpc.clone();
         async move {
-            let sigs = rpc.get_recent_signatures(&owner, 1000).await.ok()?;
+            let sigs = rpc.get_recent_signatures(&owner, 100).await.ok()?;
             let oldest = sigs.last().filter(|s| !s.err).map(|s| s.signature.clone())?;
             let summary = rpc.get_tx_wallet_summary(&oldest, &owner).await.ok()?;
             if !summary.fee_payer.is_empty() && summary.fee_payer != owner {
