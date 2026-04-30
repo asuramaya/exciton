@@ -5,9 +5,13 @@ pub mod smartmoney;
 
 use crate::ingester::{parse_mint_account, RpcRouter};
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+static FORENSICS_IN_FLIGHT: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalLayer {
@@ -830,6 +834,12 @@ pub async fn analyze_token(
             .unwrap_or((0.0, 0.0, 0.0, 0, 0));
         if now - forensics_age >= 3600 {
             let mint_owned = mint_address.to_string();
+            // Single-flight guard: only spawn if no compute task already running for this mint.
+            let claimed = {
+                let mut set = FORENSICS_IN_FLIGHT.lock().unwrap();
+                set.insert(mint_owned.clone())
+            };
+            if claimed {
             let db_clone = db.clone();
             let rpc_clone = rpc.clone();
             tokio::spawn(async move {
@@ -858,49 +868,44 @@ pub async fn analyze_token(
                 )
                 .await
                 {
-                    Ok(Ok(f)) => f,
+                    Ok(Ok(f)) => Some(f),
                     Ok(Err(e)) => {
                         tracing::warn!(
                             "launch_forensics: {} compute err: {}",
                             mint_owned, e
                         );
-                        return;
+                        None
                     }
                     Err(_) => {
-                        // Timeout: log + return without writing. The
-                        // fail-closed sentinel (write 100/100/100) was
-                        // wrong — it interacted with the now-removed
-                        // forensics_required gate to block every token
-                        // forever. Now: forensics gates are soft (0
-                        // passes), so a no-write here just leaves the
-                        // gate permissive until next refresh succeeds.
                         tracing::warn!(
                             "launch_forensics: {} timed out after 180s",
                             mint_owned
                         );
-                        return;
+                        None
                     }
                 };
-                let stamp = chrono::Utc::now().timestamp();
-                if let Err(e) = db_clone.update_launch_forensics(
-                    &mint_owned,
-                    f.bundle_pct,
-                    f.sniper_pct,
-                    f.insider_pct,
-                    f.smart_money_count,
-                    stamp,
-                ) {
-                    tracing::warn!("launch_forensics: persist {} failed: {}", mint_owned, e);
-                } else {
-                    // Elevated debug→info so we can see the cadence in logs
-                    // without enabling debug-level globally.
-                    tracing::info!(
-                        "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}% smart={}",
-                        &mint_owned[..mint_owned.len().min(12)],
-                        f.bundle_pct, f.sniper_pct, f.insider_pct, f.smart_money_count
-                    );
+                if let Some(f) = f {
+                    let stamp = chrono::Utc::now().timestamp();
+                    if let Err(e) = db_clone.update_launch_forensics(
+                        &mint_owned,
+                        f.bundle_pct,
+                        f.sniper_pct,
+                        f.insider_pct,
+                        f.smart_money_count,
+                        stamp,
+                    ) {
+                        tracing::warn!("launch_forensics: persist {} failed: {}", mint_owned, e);
+                    } else {
+                        tracing::info!(
+                            "launch_forensics: {} bundle={:.1}% sniper={:.1}% insider={:.1}% smart={}",
+                            &mint_owned[..mint_owned.len().min(12)],
+                            f.bundle_pct, f.sniper_pct, f.insider_pct, f.smart_money_count
+                        );
+                    }
                 }
+                FORENSICS_IN_FLIGHT.lock().unwrap().remove(&mint_owned);
             });
+            }
         }
 
         d
