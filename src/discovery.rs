@@ -73,11 +73,8 @@ pub async fn discover_new_tokens(
         match signals::analyze_token(rpc, mint, Some(db), None).await {
             Ok(analysis) => {
                 let _ = db.insert_token(&analysis.address, analysis.confidence.total);
-                let _ = db.audit_log(
-                    "discovery",
-                    "new_token",
-                    &format!("{} confidence={}", mint, analysis.confidence.total),
-                );
+                // No audit_log here — same noise removal as the
+                // pumpportal sink. tokens table is the canonical record.
                 analyses.push(analysis);
             }
             Err(e) => {

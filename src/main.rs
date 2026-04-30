@@ -202,16 +202,11 @@ async fn main() -> Result<()> {
                     if let Err(e) = sink_db.insert_token(&token.mint, 0) {
                         tracing::warn!("pumpportal-sink: insert_token {} failed: {}", token.mint, e);
                     }
-                    let _ = sink_db.audit_log(
-                        "pumpportal",
-                        "new_token",
-                        &format!(
-                            "{} sym={} mcap_sol={:.3}",
-                            token.mint,
-                            token.symbol.as_deref().unwrap_or(""),
-                            token.market_cap_sol.unwrap_or(0.0),
-                        ),
-                    );
+                    // Audit-log spam removed 2026-04-30: 68k of 130k
+                    // audit_log rows were "pumpportal/new_token" entries
+                    // from this hot path (~30/min). The DB tokens table
+                    // is the canonical record of new mints; audit_log
+                    // is reserved for state changes and human/MCP actions.
                 }
                 pumpportal::PumpEvent::Migration(m) => {
                     // The token just graduated to an AMM (pump-amm or

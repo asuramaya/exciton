@@ -311,6 +311,17 @@ impl Db {
             [],
         );
 
+        // One-shot purge: pumpportal/new_token + discovery/new_token
+        // audit entries dominated audit_log (~127k of 130k rows). The
+        // hot-path code that wrote them was removed 2026-04-30; this
+        // migration cleans the historical noise. tokens table remains
+        // the canonical record of new mints; audit_log is reserved for
+        // state changes and human/MCP actions.
+        let _ = conn.execute(
+            "DELETE FROM audit_log WHERE action = 'new_token' AND actor IN ('pumpportal','discovery')",
+            [],
+        );
+
         // Sniper cohort — the wallets that bought in the first window of
         // a token's life. Captured once per token at discovery.
         conn.execute_batch(
