@@ -326,6 +326,8 @@ impl Notifier {
         &self,
         a: &TokenAnalysis,
         effective_conf: i32,
+        meta: Option<&TokenMeta>,
+        first_seen: Option<i64>,
     ) -> Option<(&'static str, String)> {
         let class = a.confidence.classification.as_str();
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
@@ -414,9 +416,49 @@ impl Notifier {
             }
             return Some(("history", "no prior snapshot".into()));
         }
-        // All in-snapshot gates passed; remaining failures (liq/vol/mcap/age/
-        // holder_growth) require meta — those callers go through the path
-        // with meta visibility and would have logged via should_signal directly.
+        // Meta-dependent gates — without these tracked we can't see why
+        // otherwise-clean candidates fail to fire.
+        let liq = meta.and_then(|m| m.liquidity_usd);
+        if liq.map_or(true, |v| v < SIGNAL_MIN_LIQUIDITY_USD) {
+            return Some(("liquidity", format!(
+                "liq ${:.0} < ${:.0}",
+                liq.unwrap_or(0.0), SIGNAL_MIN_LIQUIDITY_USD
+            )));
+        }
+        let vol = meta.and_then(|m| m.volume_24h_usd);
+        if vol.map_or(true, |v| v < SIGNAL_MIN_VOLUME_24H_USD) {
+            return Some(("volume24", format!(
+                "vol24 ${:.0} < ${:.0}",
+                vol.unwrap_or(0.0), SIGNAL_MIN_VOLUME_24H_USD
+            )));
+        }
+        let mcap = meta.and_then(|m| m.market_cap_usd.or(m.fdv_usd));
+        if mcap.map_or(true, |v| v < SIGNAL_MIN_MCAP_USD) {
+            return Some(("mcap", format!(
+                "mcap ${:.0} < ${:.0}",
+                mcap.unwrap_or(0.0), SIGNAL_MIN_MCAP_USD
+            )));
+        }
+        let now = chrono::Utc::now().timestamp();
+        let age = first_seen.map(|fs| now - fs).unwrap_or(0);
+        if age < SIGNAL_MIN_TOKEN_AGE_SECS {
+            return Some(("age", format!(
+                "age {}s < {}s",
+                age, SIGNAL_MIN_TOKEN_AGE_SECS
+            )));
+        }
+        if let Some(d) = a.delta.as_ref() {
+            if d.time_elapsed_seconds > 0 {
+                let per_hour =
+                    d.holder_count_delta as f64 * 3600.0 / d.time_elapsed_seconds as f64;
+                if per_hour < SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR {
+                    return Some(("holder_growth", format!(
+                        "holders/h {:.1} < {:.1}",
+                        per_hour, SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR
+                    )));
+                }
+            }
+        }
         None
     }
 
@@ -1106,7 +1148,7 @@ impl Notifier {
                 let scalp_pass = !standard_pass
                     && self.should_scalp_signal(a, meta.as_ref(), first_seen);
                 if !standard_pass && !scalp_pass {
-                    if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf) {
+                    if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf, meta.as_ref(), first_seen) {
                         let mom_delta = a.delta.as_ref().map(|d| d.momentum_delta);
                         let _ = self.db.insert_near_miss(
                             &a.address,
