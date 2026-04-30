@@ -2336,6 +2336,14 @@ pub struct TokenSnapshot {
     pub sells_h1: i32,
     pub price_change_h1: f64,
     pub pair_dex: String,
+    // Launch forensics — populated by the async refresh task; 0 when
+    // never measured. Surfaced in published call-detail JSON so the
+    // public ledger shows what we knew about each token's structure.
+    pub bundle_pct: f64,
+    pub sniper_pct: f64,
+    pub insider_pct: f64,
+    pub smart_money_count: i32,
+    pub forensics_computed_at: i64,
 }
 
 /// Snapshot of one public call for publisher/UI consumption. Mirrors the
@@ -2373,7 +2381,8 @@ const SNAPSHOT_COLS: &str =
     "token_address, top_holder_pct, top5_pct, top10_pct, holder_count, tx_rate, \
      velocity, momentum, distribution, spring, classification, confidence, timestamp, \
      price_usd, mcap_usd, liquidity_usd, volume_h1_usd, buys_h1, sells_h1, \
-     price_change_h1, pair_dex";
+     price_change_h1, pair_dex, bundle_pct, sniper_pct, insider_pct, \
+     smart_money_count, forensics_computed_at";
 
 fn snapshot_from_row(row: &rusqlite::Row) -> rusqlite::Result<TokenSnapshot> {
     Ok(TokenSnapshot {
@@ -2398,6 +2407,11 @@ fn snapshot_from_row(row: &rusqlite::Row) -> rusqlite::Result<TokenSnapshot> {
         sells_h1: row.get(18)?,
         price_change_h1: row.get(19)?,
         pair_dex: row.get(20)?,
+        bundle_pct: row.get::<_, f64>(21).unwrap_or(0.0),
+        sniper_pct: row.get::<_, f64>(22).unwrap_or(0.0),
+        insider_pct: row.get::<_, f64>(23).unwrap_or(0.0),
+        smart_money_count: row.get::<_, i32>(24).unwrap_or(0),
+        forensics_computed_at: row.get::<_, i64>(25).unwrap_or(0),
     })
 }
 

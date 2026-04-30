@@ -650,6 +650,15 @@ pub async fn analyze_token(
             .as_ref()
             .map(|m| m.pair_dex.clone())
             .unwrap_or_default(),
+        // Forensics fields default to 0 here; the async refresh writes
+        // real values into the row via update_launch_forensics. Reading
+        // them via get_latest_forensics into TokenAnalysis happens later
+        // in this same function.
+        bundle_pct: 0.0,
+        sniper_pct: 0.0,
+        insider_pct: 0.0,
+        smart_money_count: 0,
+        forensics_computed_at: 0,
     };
 
     let delta = if let Some(db) = db {
