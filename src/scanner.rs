@@ -1340,7 +1340,14 @@ fn watchlist_priority(candidate: &crate::db::WatchlistCandidate, now: i64) -> f6
     let momentum = candidate.snapshot_momentum.unwrap_or(0) as f64;
     let distribution = candidate.snapshot_distribution.unwrap_or(0) as f64;
     let holders = candidate.snapshot_holder_count.unwrap_or(0);
-    let top_holder_pct = candidate.snapshot_top_holder_pct.unwrap_or(100.0);
+    // Default top_holder_pct to 0.0 (unknown) instead of 100.0. The 100.0
+    // default was treating fresh items as maximally-concentrated and
+    // applying the +45 concentration penalty — pushing freshly-added
+    // tokens to the BACK of the queue and starving them of analysis.
+    // Fresh items should sort by class+age, then get analyzed to populate
+    // real top_holder_pct. Only THEN does the concentration penalty matter.
+    let top_holder_pct = candidate.snapshot_top_holder_pct.unwrap_or(0.0);
+    let has_snapshot = candidate.snapshot_classification.is_some();
     let snapshot_age_seconds = candidate
         .snapshot_timestamp
         .map(|ts| (now - ts).max(0))
@@ -1367,7 +1374,12 @@ fn watchlist_priority(candidate: &crate::db::WatchlistCandidate, now: i64) -> f6
     } else {
         -12.0
     };
-    let concentration_penalty = if top_holder_pct >= 40.0 {
+    // Concentration penalty only applies to MEASURED data. Fresh items
+    // (no snapshot) get 0 penalty so they sort by class/age, then get
+    // analyzed first to populate real values.
+    let concentration_penalty = if !has_snapshot {
+        0.0
+    } else if top_holder_pct >= 40.0 {
         45.0
     } else if top_holder_pct >= 35.0 {
         30.0
@@ -1378,6 +1390,10 @@ fn watchlist_priority(candidate: &crate::db::WatchlistCandidate, now: i64) -> f6
     } else {
         0.0
     };
+    // First-snapshot boost: items with no snapshot yet get a small bump
+    // so they're not at the bottom of the queue. After their first
+    // analysis, real metrics determine priority.
+    let first_snapshot_boost = if !has_snapshot { 15.0 } else { 0.0 };
     let freshness_bonus = if snapshot_age_seconds <= 10 * 60 {
         10.0
     } else if snapshot_age_seconds <= 30 * 60 {
@@ -1398,7 +1414,13 @@ fn watchlist_priority(candidate: &crate::db::WatchlistCandidate, now: i64) -> f6
         0.0
     };
 
-    class_base + confidence + momentum / 3.0 + distribution / 4.0 + holder_bonus + freshness_bonus
+    class_base
+        + confidence
+        + momentum / 3.0
+        + distribution / 4.0
+        + holder_bonus
+        + freshness_bonus
+        + first_snapshot_boost
         - concentration_penalty
         - stale_penalty
         - aged_without_step_penalty
