@@ -10,8 +10,24 @@ use crate::db::Db;
 use crate::ingester::RpcRouter;
 use crate::market;
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::sync::Arc;
+
+/// Shared client for project-website fetches. Browser UA + 5-redirect
+/// limit + 8s timeout so we behave like a normal user agent on the
+/// operator pages we audit.
+static WEBSITE_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Photon/1.0",
+        )
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .expect("scout WEBSITE_CLIENT init")
+});
 
 // Cap on bytes of website text we return — enough for a human or LLM reader
 // to extract a thesis, short enough that one scout response fits in a single
@@ -142,15 +158,7 @@ pub async fn scout_deployer(
 /// is registered. Never errors on a network failure — we report the
 /// HTTP status so the caller can reason about dead sites.
 pub async fn scout_website(url: &str) -> Result<WebsiteFetch> {
-    let client = reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Photon/1.0",
-        )
-        .timeout(std::time::Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()?;
-    let resp = client.get(url).send().await;
+    let resp = WEBSITE_CLIENT.get(url).send().await;
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();

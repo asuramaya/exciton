@@ -1092,11 +1092,16 @@ fn summarize_whales(whales: &[scout::WhaleMove]) -> WhaleSummary {
 }
 
 async fn fetch_rug_report(mint: &str, rpc: &Arc<RpcRouter>) -> Result<RugReport> {
+    use once_cell::sync::Lazy;
+    static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .user_agent("photon/0.1")
+            .build()
+            .expect("intel rugcheck HTTP init")
+    });
     let url = format!("https://api.rugcheck.xyz/v1/tokens/{}/report", mint);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()?;
-    let resp = client.get(&url).send().await?;
+    let resp = HTTP.get(&url).send().await?;
     let resp = resp.error_for_status()?;
     let value: Value = resp.json().await?;
 
