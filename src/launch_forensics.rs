@@ -82,17 +82,19 @@ pub async fn compute(
         }
     }
 
+    // sniper_pct is sync (just a HashSet intersection over owner_balances) —
+    // compute it inline. The other three each fire RPC calls; run them
+    // concurrently so the wall-time is max(slowest) instead of sum(all).
     let sniper_pct = compute_sniper_pct(mint, supply_ui, db, &owner_balances)
         .unwrap_or(0.0);
-    let bundle_pct = compute_bundle_pct(mint, supply_ui, &owner_balances, rpc)
-        .await
-        .unwrap_or(0.0);
-    let insider_pct = compute_insider_pct(supply_ui, &top_owners_in_order, &owner_balances, rpc)
-        .await
-        .unwrap_or(0.0);
-    let smart_money_count = compute_smart_money_count(&top_owners_in_order, db, rpc)
-        .await
-        .unwrap_or(0);
+    let (bundle_pct, insider_pct, smart_money_count) = tokio::join!(
+        compute_bundle_pct(mint, supply_ui, &owner_balances, rpc),
+        compute_insider_pct(supply_ui, &top_owners_in_order, &owner_balances, rpc),
+        compute_smart_money_count(&top_owners_in_order, db, rpc),
+    );
+    let bundle_pct = bundle_pct.unwrap_or(0.0);
+    let insider_pct = insider_pct.unwrap_or(0.0);
+    let smart_money_count = smart_money_count.unwrap_or(0);
 
     Ok(LaunchForensics {
         bundle_pct,
