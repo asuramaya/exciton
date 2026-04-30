@@ -2048,12 +2048,23 @@ impl Db {
 
     pub fn insert_snapshot(&self, snap: &TokenSnapshot) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Carry forensics forward — schema defaults to 0, which would race with the next async refresh and reopen gates.
+        let prior: Option<(f64, f64, f64, i32, i64)> = conn
+            .query_row(
+                "SELECT bundle_pct, sniper_pct, insider_pct, smart_money_count, forensics_computed_at \
+                 FROM token_snapshots WHERE token_address = ?1 ORDER BY timestamp DESC LIMIT 1",
+                params![snap.token_address],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let (bp, sp, ip, sm, fc) = prior.unwrap_or((0.0, 0.0, 0.0, 0, 0));
         conn.execute(
             "INSERT INTO token_snapshots (token_address, top_holder_pct, top5_pct, top10_pct, \
              holder_count, tx_rate, velocity, momentum, distribution, spring, classification, \
              confidence, timestamp, price_usd, mcap_usd, liquidity_usd, volume_h1_usd, \
-             buys_h1, sells_h1, price_change_h1, pair_dex) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+             buys_h1, sells_h1, price_change_h1, pair_dex, \
+             bundle_pct, sniper_pct, insider_pct, smart_money_count, forensics_computed_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 snap.token_address,
                 snap.top_holder_pct,
@@ -2076,6 +2087,11 @@ impl Db {
                 snap.sells_h1,
                 snap.price_change_h1,
                 snap.pair_dex,
+                bp,
+                sp,
+                ip,
+                sm,
+                fc,
             ],
         )?;
         Ok(())
