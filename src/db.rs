@@ -322,6 +322,39 @@ impl Db {
             [],
         );
 
+        // Curve_snapshots GC: keep only the latest snapshot per mint plus
+        // the most recent 24h. Curves graduate or die within minutes;
+        // anything older than 24h is reference data we don't need to
+        // re-query. observe_bonding_curves only polls non-graduated mints
+        // so write-rate is bounded going forward, but the backlog from
+        // before this GC was 143k rows.
+        let _ = conn.execute(
+            "DELETE FROM curve_snapshots WHERE timestamp < strftime('%s','now') - 86400",
+            [],
+        );
+        // token_snapshots GC: 30-day retention. Matches LONG horizon's
+        // 30d timeout — any active call will still have its full lifetime
+        // history queryable. SHORT/SCALP calls close in hours so 30d is
+        // far more than they need. Backtest mining over 30d windows
+        // remains possible; deeper analysis would need a separate archive.
+        let _ = conn.execute(
+            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 30*86400",
+            [],
+        );
+
+        // sniper_cohort GC: only keep cohorts for mints that still have
+        // recent snapshots OR an active/recent call. 356k rows of
+        // dust-cohort data on retired pump.fun mints is pure storage
+        // bloat — those tokens will never be re-analyzed.
+        let _ = conn.execute(
+            "DELETE FROM sniper_cohort WHERE mint_address NOT IN (
+                 SELECT DISTINCT token_address FROM token_snapshots
+                 UNION SELECT mint FROM calls
+                       WHERE called_at >= strftime('%s','now') - 30*86400
+             )",
+            [],
+        );
+
         // Sniper cohort — the wallets that bought in the first window of
         // a token's life. Captured once per token at discovery.
         conn.execute_batch(
