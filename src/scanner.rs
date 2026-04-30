@@ -798,6 +798,14 @@ impl BackgroundScanner {
         if active.is_empty() {
             return;
         }
+        // Batch DexScreener fetch — one HTTP request for all active mints
+        // instead of N serial per-call requests. Saves N-1 round-trips
+        // every 15s; at 5 active calls that's 4 fewer HTTP calls per
+        // settle cycle. DexScreener supports comma-joined mints natively.
+        let active_mints: Vec<&str> = active.iter().map(|c| c.mint.as_str()).collect();
+        let market_cache = crate::market::get_market_batch(&active_mints)
+            .await
+            .unwrap_or_default();
         let now = chrono::Utc::now().timestamp();
         for call in active {
             // Horizon parsing via the shared module. Default-on-Unknown
@@ -806,7 +814,13 @@ impl BackgroundScanner {
             let h = horizon::parse(&call.note);
             let is_long = h.is_long();
             let is_scalp = h.is_scalp();
-            let market = crate::market::get_market(&call.mint).await.ok().flatten();
+            // Try batch cache first; fall back to per-token fetch when
+            // DexScreener doesn't return the mint (unindexed fresh-grad
+            // edge case). Maintains correctness while keeping the fast path.
+            let market = match market_cache.get(&call.mint) {
+                Some(m) => Some(m.clone()),
+                None => crate::market::get_market(&call.mint).await.ok().flatten(),
+            };
             let current_price = market.as_ref().map(|m| m.price_usd).unwrap_or(0.0);
             // No reliable price → nothing to settle on. Could happen during
             // a DexScreener outage; skip and try next cycle.
