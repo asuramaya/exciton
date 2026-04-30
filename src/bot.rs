@@ -2561,11 +2561,12 @@ pub async fn serve_claw_api(
                             },
                             "scalp": {
                                 "horizon": "SCALP",
-                                "default_for": "shallow-mcap auto-calls ($60k-$500k mcap, 1h+50% momentum)",
+                                "default_for": "shallow-mcap auto-calls ($60k-$500k mcap, 1h price-change between +50% and +350%)",
                                 "triggers": [
-                                    { "trigger": "+60%", "outcome": "withdrew", "verdict": "scalp 1.6x" },
+                                    { "trigger": "+50%", "outcome": "withdrew", "verdict": "scalp 1.5x" },
                                     { "trigger": "+30%", "outcome": "withdrew", "verdict": "scalp +30 done" },
                                     { "trigger": "-30%", "outcome": "failed", "verdict": "scalp stop" },
+                                    { "trigger": ">=30min held AND red AND peak <=+15", "outcome": "failed", "verdict": "scalp no-pump" },
                                     { "trigger": "age >=4h", "outcome": "expired", "verdict": "scalp timeout" }
                                 ]
                             },
