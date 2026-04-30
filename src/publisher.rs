@@ -1053,19 +1053,25 @@ impl Publisher {
             .get_recent_signatures(&self.wallet, 40)
             .await
             .unwrap_or_default();
+        // Build the set of known signatures ONCE, outside the loop. The
+        // previous code called get_wallet_trades_recent per-signature —
+        // 40× DB round-trips fetching 200 rows each, all for a membership
+        // check. Now: one query, one HashSet, O(1) lookup per sig.
+        let known: std::collections::HashSet<String> = self
+            .db
+            .get_wallet_trades_recent(&self.wallet, 200)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, _, _, s, _, _)| s)
+            .collect();
         for sig in sigs.iter() {
             if sig.err {
                 continue;
             }
-            // Once we hit a signature we already stored, stop — the ledger
-            // is immutable from older-than-that onward.
-            let already = self
-                .db
-                .get_wallet_trades_recent(&self.wallet, 200)
-                .unwrap_or_default()
-                .into_iter()
-                .any(|(_, _, _, s, _, _)| s == sig.signature);
-            if already {
+            // Hit a known sig → ledger is immutable from older onward;
+            // stop walking. Returned-newest-first means continuing past
+            // a known sig only re-touches older known rows.
+            if known.contains(&sig.signature) {
                 break;
             }
             let summary = match self
