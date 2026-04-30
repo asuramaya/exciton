@@ -5,7 +5,20 @@
 //! indexed too, though some brand-new mints may not appear yet.
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use serde::Deserialize;
+
+/// Shared reqwest client for all metadata::fetch calls. Reusing the
+/// client (and its connection pool) instead of building a fresh one
+/// per call saves the TLS handshake + DNS resolution on every fetch.
+/// At 30+ fetches/min across the system that's a meaningful win.
+static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("photon/0.1")
+        .build()
+        .expect("metadata::HTTP client init")
+});
 
 #[derive(Debug, Clone)]
 pub struct TokenMeta {
@@ -100,11 +113,7 @@ pub async fn fetch(mint_address: &str) -> Result<Option<TokenMeta>> {
         "https://api.dexscreener.com/latest/dex/tokens/{}",
         mint_address
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-
-    let resp = client.get(&url).send().await?;
+    let resp = HTTP.get(&url).send().await?;
     if !resp.status().is_success() {
         return Ok(None);
     }

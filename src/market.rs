@@ -5,8 +5,20 @@
 //! endpoint covers everything the signal pipeline can't get from RPC alone.
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
+
+/// Shared reqwest client. See metadata::HTTP for rationale — same trade-off,
+/// same gain. We use a single 8s timeout here (vs 5s in metadata) because
+/// the batch path can return larger payloads.
+static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("photon/0.1")
+        .build()
+        .expect("market::HTTP client init")
+});
 
 /// Normalized market snapshot returned to the signal pipeline. Zero-initialized
 /// fields mean "not reported by DexScreener"; callers decide how to treat that.
@@ -230,10 +242,7 @@ fn best_solana_pair(pairs: Vec<DsPair>) -> Option<DsPair> {
 /// haven't been indexed yet.
 pub async fn get_market(mint: &str) -> Result<Option<MarketData>> {
     let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let resp = client.get(&url).send().await?;
+    let resp = HTTP.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("dexscreener status {}", resp.status());
     }
@@ -253,10 +262,7 @@ pub async fn get_market_batch(mints: &[&str]) -> Result<HashMap<String, MarketDa
         "https://api.dexscreener.com/latest/dex/tokens/{}",
         mints.join(",")
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()?;
-    let resp = client.get(&url).send().await?;
+    let resp = HTTP.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("dexscreener batch status {}", resp.status());
     }
