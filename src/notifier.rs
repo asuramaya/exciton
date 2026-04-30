@@ -122,6 +122,16 @@ pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 // effectively disabled (RPC-capped at 20). Forensics gates retained — same
 // thresholds as SHORT — to filter pure bot rugs.
 // =============================================================================
+// 2026-04-30: SCALP DISABLED. Live audit on 18 production calls (ids 52-70):
+// 6 wins / 12 losses = 33% win rate. Avg loser -56%, avg winner +43%. Sliced
+// every dimension (mcap, top1, txr, classification, confidence) — no clean
+// tightening saves it; losses are catastrophic across the board (-30 to -99%).
+// Expected value is negative. The bucket short-circuits in should_scalp_signal
+// below; constants are kept (not deleted) so a recalibration can flip it back
+// without rebuilding the gate from scratch. To revive: flip SCALP_ENABLED + a
+// fresh look at the entry parameters using post-disable observation data.
+pub const SCALP_ENABLED: bool = false;
+// =============================================================================
 // Floor at $60k after observing 7G1JZK87EbvZ (mcap $73k, conf 71 STAIRCASE,
 // txr 375/min, pc1h +55.8%, all forensics 0) — a textbook SCALP candidate
 // that was being blocked by the $80k floor by just $7k. BLIMP historical
@@ -571,12 +581,16 @@ impl Notifier {
     /// +30/+60 take, -30 hard stop, 4h timeout. DEV_SELLING and class
     /// regression are the primary exits, handled by the global event-exit
     /// path in scanner::settle_calls.
+    #[allow(unreachable_code, dead_code, clippy::let_and_return)]
     pub fn should_scalp_signal(
         &self,
         a: &TokenAnalysis,
         meta: Option<&TokenMeta>,
         first_seen: Option<i64>,
     ) -> bool {
+        if !SCALP_ENABLED {
+            return false;
+        }
         if self.halted() {
             return false;
         }
