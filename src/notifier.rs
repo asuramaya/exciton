@@ -51,14 +51,23 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // =============================================================================
 
 // Gates calibrated against the 31-call closed-call backtest (2026-04-22..28),
-// then RECALIBRATED via gate-sweep analysis on the same 31 calls + live
-// snapshot distribution mining (2026-04-29). Initial deployment was too
-// strict — sweep showed best total PnL at TIGHT(SHORT) + LOOSE(SCALP) split,
-// not a single tight gate. See conversation 2026-04-29 mining session.
+// recalibrated via gate-sweep analysis (2026-04-29), and AGAIN lowered to
+// match live distribution (2026-04-30):
 //
-// TIGHT (SHORT) bucket targets the deep market: $500k+ mcap, low concentration.
-// Backtest under sweep: n=7, 71% win, +5.8% mean, +40.6 sum.
-pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 76;
+// 6h DB sample 2026-04-30:
+//   conf >=80: 0 snapshots
+//   conf 76-79: 0
+//   conf 70-75: 19
+//   conf 60-69: 37
+//   conf <60:   38
+//
+// The 76 floor was producing 0 fires for 5+ hours straight. Backtest
+// winners averaged conf 67-70 with brief 76-82 PEAKS — the current
+// pump.fun environment isn't producing those peaks at all (RPC
+// degradation possibly suppressing momentum scoring; or fewer
+// high-quality launches; or both). Lowering to 70 to match the
+// observed median of healthy-classification snapshots.
+pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 70;
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 6.0;
 // Top-10 gate tightened from 35 → 30. SHORT winners had top10 in 9.7-20.4
 // range (BURNIE 20.4, maxxing 19.6, HENRY 16.3, SPIKE 9.7, ROTUS 13.4).
