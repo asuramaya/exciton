@@ -758,7 +758,10 @@ impl BackgroundScanner {
             // produced systematic -90% phantom losses. Observation kept;
             // calling resumes post-grad via Phase 1's DexScreener path.
         }
-        if written > 0 {
+        // Log only when something graduated. The "X snapshots, 0 graduated"
+        // line every 15s was 4k+ lines/hour of pure noise — worse, it
+        // crowded out actually-actionable scanner logs.
+        if graduated > 0 {
             tracing::info!(
                 "curve-observe: {} snapshots ({} graduated this batch)",
                 written, graduated
