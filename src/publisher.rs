@@ -273,11 +273,12 @@ impl Publisher {
                     tokio::time::sleep(MIN_INTERVAL - since).await;
                 }
                 last_run = tokio::time::Instant::now();
+                tracing::debug!("publisher tick start");
                 match self.run_once().await {
                     Ok(committed) if committed => {
                         tracing::info!("MadApes publish: data snapshot pushed")
                     }
-                    Ok(_) => tracing::debug!("MadApes publish: no data change"),
+                    Ok(_) => tracing::info!("MadApes publish: no data change"),
                     Err(e) => tracing::warn!("MadApes publish failed: {}", e),
                 }
             }
@@ -297,14 +298,22 @@ impl Publisher {
         // the entire tick, which froze the public ledger whenever both RPCs
         // were 429'd — calls.json, scout receipts, and whale snapshots all
         // stopped publishing for unrelated reasons. Now: log + degrade to 0
-        // so the rest of the pipeline still ships fresh data.
-        let sol_balance = match self.rpc.get_balance(&self.wallet).await {
-            Ok(lamports) => lamports as f64 / 1e9,
-            Err(e) => {
+        // so the rest of the pipeline still ships fresh data. Hard 5s
+        // timeout so a degraded RPC fleet (every endpoint walking sequentially
+        // before sidelining) can't eat the whole tick — under all-5-down,
+        // get_balance was taking minutes and the loop never published.
+        const RPC_BUDGET: Duration = Duration::from_secs(5);
+        let sol_balance = match tokio::time::timeout(RPC_BUDGET, self.rpc.get_balance(&self.wallet)).await {
+            Ok(Ok(lamports)) => lamports as f64 / 1e9,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "publisher: get_balance failed ({}) — degrading wallet snapshot, continuing",
                     e
                 );
+                0.0
+            }
+            Err(_) => {
+                tracing::warn!("publisher: get_balance timed out (>5s) — degrading wallet snapshot");
                 0.0
             }
         };
@@ -313,16 +322,33 @@ impl Publisher {
             .unwrap_or(self.cfg.sol_price_fallback_usd);
 
         // 2. Current holdings — used for positions + mark-to-market PnL.
-        let holdings = self
-            .rpc
-            .get_wallet_token_holdings(&self.wallet)
-            .await
-            .unwrap_or_default();
+        let holdings = match tokio::time::timeout(
+            RPC_BUDGET,
+            self.rpc.get_wallet_token_holdings(&self.wallet),
+        )
+        .await
+        {
+            Ok(Ok(h)) => h,
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!("publisher: get_wallet_token_holdings degraded (timeout or err)");
+                Default::default()
+            }
+        };
 
         // 3. Scan recent wallet signatures, record any detected trades into
         //    the wallet_ledger. Idempotent by signature, so re-scanning the
-        //    same window never double-counts.
-        self.capture_recent_trades(now).await;
+        //    same window never double-counts. Capped at 8s — capture walks
+        //    multiple per-sig RPC calls and can stall the whole tick under
+        //    full upstream failure.
+        if tokio::time::timeout(
+            Duration::from_secs(8),
+            self.capture_recent_trades(now),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("publisher: capture_recent_trades timed out (>8s) — skipping this tick");
+        }
 
         // 4. Build positions, bringing in cost basis from the ledger.
         let cost_basis = self
