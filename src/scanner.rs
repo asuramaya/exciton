@@ -953,9 +953,62 @@ impl BackgroundScanner {
                 None
             };
 
+            // Universal trailing-stop ladder. The single biggest EV leak in
+            // the prior settle was holding peaked positions through their
+            // dump back through a fixed stop. $Pets peaked +251% → exited
+            // -21%. $S&L peaked +169% → exited -62%. $Fartbuckle peaked
+            // +73% → exited -67%. The fix: once a position has run, the
+            // stop ratchets up so it can never lose more than what was
+            // banked. "Enter for free, ride the profit."
+            //
+            // Tiers (peak observed since entry → stop floor):
+            //   peak ≥ +400% → floor +200%   (lock 4x of the 5x)
+            //   peak ≥ +200% → floor +100%
+            //   peak ≥ +100% → floor +50%
+            //   peak ≥  +50% → floor +25%
+            //   peak ≥  +20% → floor   0%   (breakeven — entered for free)
+            //   else        → floor = default_stop_for_horizon
+            //
+            // The take ladder still owns the upside (e.g. moonshot's +250%
+            // take fires before the +200% trail tier). The trail floor
+            // only kicks when the position has peaked but is now retracing.
+            // Time-expire is gated to peak<+20% so we never time-out a
+            // winning position arbitrarily — it rides until the trail
+            // catches it. peak comes from snapshots OR current take_pct
+            // (whichever is larger) — the on-chain snapshot path captures
+            // momentary spikes that DexScreener missed.
+            let default_stop_for_horizon = if is_moonshot { -25.0 }
+                else if is_scalp { -30.0 }
+                else if is_long { -50.0 }
+                else { -40.0 };
+            let snapshot_peak = self
+                .db
+                .get_peak_pct_since(&call.mint, call.called_at, call.entry_price_usd)
+                .unwrap_or(0.0);
+            let peak_observed = snapshot_peak.max(take_pct).max(pct);
+            let trail_floor = trailing_stop_floor(peak_observed, default_stop_for_horizon);
+            // Trail-stop trigger. When floor ≥ 0 we're locking a profit
+            // and the verdict is "withdrew" (a win, not a failure). When
+            // floor < 0 we're using the bucket's default_stop and the
+            // verdict is the bucket-specific failure label.
+            let trail_exit: Option<(&'static str, String)> = if pct <= trail_floor {
+                if trail_floor >= 0.0 {
+                    Some((
+                        "withdrew",
+                        format!("{:+.1}% · trailing stop @ +{:.0}% (peak {:+.0}%)", pct, trail_floor, peak_observed),
+                    ))
+                } else {
+                    None // let the per-horizon block produce its own label
+                }
+            } else {
+                None
+            };
+
             // Outcome decision: returns (action, status_str, exit_note).
             // Action determines which DB call + which TG outcome string.
             let outcome: Option<(&'static str, String)> = if let Some(e) = event_exit {
+                Some(e)
+            } else if let Some(e) = trail_exit {
                 Some(e)
             } else if is_scalp {
                 // SCALP bucket exit ladder. Recalibrated 2026-04-29 against
@@ -971,24 +1024,19 @@ impl BackgroundScanner {
                     Some(("withdrew", format!("{:+.1}% · scalp 1.5x", take_pct)))
                 } else if take_pct >= 30.0 {
                     Some(("withdrew", format!("{:+.1}% · scalp +30 done", take_pct)))
-                } else if pct <= -30.0 {
+                } else if pct <= trail_floor {
+                    // Default-stop case (peak hasn't activated trail tier).
+                    // trail_exit covered the lock-profit case earlier.
                     Some(("failed", format!("{:+.1}% · scalp stop", pct)))
-                } else if age >= 30 * 60 && pct < 0.0 {
-                    // No pump after 30min — most losers (NICETRUMP, wiffy,
-                    // HSBC) bleed slowly past the -30 stop while never going
-                    // green. The peak observation lets us spare runners that
-                    // briefly went green: only fire if max-observed peak
-                    // <= +15.
-                    let peaked = self
-                        .db
-                        .get_peak_pct_since(&call.mint, call.called_at, call.entry_price_usd)
-                        .unwrap_or(pct);
-                    if peaked <= 15.0 {
-                        Some(("failed", format!("{:+.1}% · scalp no-pump", pct)))
-                    } else {
-                        None
-                    }
-                } else if age >= 4 * 3600 {
+                } else if age >= 30 * 60 && pct < 0.0 && peak_observed <= 15.0 {
+                    // No pump after 30min — peak never crossed the trail-stop
+                    // activation. Bleeds slowly past the floor while never
+                    // going green; close at current.
+                    Some(("failed", format!("{:+.1}% · scalp no-pump", pct)))
+                } else if age >= 4 * 3600 && peak_observed < 20.0 {
+                    // Time-expire only when the position never even hit
+                    // breakeven trail activation. Winning positions ride
+                    // until the trailing stop catches them.
                     Some(("expired", format!("{:+.1}% · scalp timeout", pct)))
                 } else {
                     None
@@ -1003,11 +1051,14 @@ impl BackgroundScanner {
                 // at -25% trigger; lower take threshold doubles realized
                 // capture rate (11.3% of cohort hit ≥+200% peak vs 5.7%
                 // hitting ≥+500%).
-                if pct <= -25.0 {
+                if pct <= trail_floor {
                     Some(("failed", format!("{:+.1}% · moonshot stop", pct)))
                 } else if take_pct >= 250.0 {
                     Some(("withdrew", format!("{:+.1}% · moonshot 3.5x", take_pct)))
-                } else if age >= 72 * 3600 {
+                } else if age >= 72 * 3600 && peak_observed < 20.0 {
+                    // 72h timeout fires only when the moonshot never even
+                    // hit breakeven trail activation. Winning positions
+                    // ride until the trailing stop catches them.
                     Some(("expired", format!("{:+.1}% · moonshot timeout", pct)))
                 } else {
                     None
@@ -1019,7 +1070,7 @@ impl BackgroundScanner {
                 // tier just closes the call (we don't track partials at the
                 // call-row level today); operator-discretionary scaling is
                 // outside the auto-settle path.
-                if pct <= -50.0 {
+                if pct <= trail_floor {
                     Some(("failed", format!("{:+.1}% · thesis broke", pct)))
                 } else if take_pct >= 150.0 {
                     Some(("withdrew", format!("{:+.1}% · 2.5x done", take_pct)))
@@ -1027,7 +1078,7 @@ impl BackgroundScanner {
                     Some(("withdrew", format!("{:+.1}% · long second take", take_pct)))
                 } else if take_pct >= 40.0 {
                     Some(("withdrew", format!("{:+.1}% · long first take", take_pct)))
-                } else if age >= 30 * 86_400 {
+                } else if age >= 30 * 86_400 && peak_observed < 20.0 {
                     Some(("expired", format!("{:+.1}% · 30d hold complete", pct)))
                 } else {
                     None
@@ -1039,12 +1090,9 @@ impl BackgroundScanner {
             } else if age <= 30 * 60 && pct <= -25.0 {
                 // Fast-fail: SHORT calls that drop ≥25% within the first 30
                 // minutes are dead. Memecoins don't recover from a -25% in
-                // half an hour — waiting for the regular -40% / 6h envelope
-                // just publishes a more catastrophic loss. mOK lost -98%
-                // because we waited; this stops at -25% with the runway
-                // intact.
+                // half an hour. Faster than the trail floor's default -40%.
                 Some(("failed", format!("{:+.1}% · early collapse", pct)))
-            } else if pct <= -40.0 {
+            } else if pct <= trail_floor {
                 Some(("failed", format!("{:+.1}% · thesis broke", pct)))
             } else if call.entry_tx_rate > 0.0
                 && self.detect_volume_collapse(&call.mint, call.entry_tx_rate)
@@ -1054,7 +1102,7 @@ impl BackgroundScanner {
                 // price hasn't moved -40% yet but flow is gone. Better
                 // close at break-even-ish than wait 6h for the bleed.
                 Some(("withdrew", format!("{:+.1}% · energy gone", pct)))
-            } else if age >= 6 * 3600 {
+            } else if age >= 6 * 3600 && peak_observed < 20.0 {
                 Some(("expired", format!("{:+.1}% · no follow-through", pct)))
             } else {
                 None
@@ -1443,6 +1491,31 @@ impl BackgroundScanner {
             .map(|candidate| (candidate.token_address, candidate.added_at))
             .collect();
         Ok(due)
+    }
+}
+
+/// Trailing-stop floor — given the peak return observed since entry and the
+/// horizon's default stop, return the stop floor that should fire the exit.
+/// Once a position has run, the floor ratchets upward so a previously
+/// profitable trade can never be closed at a loss. "Enter for free, ride
+/// the profit." Tiers tuned against the live cohort: most peaked positions
+/// retraced 30-50% off peak before recovering or rugging, so each tier
+/// captures roughly half of the prior tier's gain.
+fn trailing_stop_floor(peak_pct: f64, default_stop: f64) -> f64 {
+    if peak_pct >= 400.0 {
+        200.0
+    } else if peak_pct >= 200.0 {
+        100.0
+    } else if peak_pct >= 100.0 {
+        50.0
+    } else if peak_pct >= 50.0 {
+        25.0
+    } else if peak_pct >= 20.0 {
+        // Breakeven floor — once the position has gained 20% it can never
+        // be closed below entry. The "free ride" threshold.
+        0.0
+    } else {
+        default_stop
     }
 }
 
