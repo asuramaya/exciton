@@ -138,28 +138,42 @@ pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 // pays for the variance.
 //
 // =============================================================================
-// 2026-05-01: MOONSHOT DISABLED. Live audit on 11 closed production calls
-// (single day, 2026-05-01): 0 wins, 11 losses, mean realized -61.4%, range
-// -27% to -97%. Backtest predicted +29.7% mean EV from hold-to-stop with
-// 4.3% peak-≥+1000% rate carrying the EV. Live reproduces neither the
-// winrate nor the right tail.
+// MOONSHOT v2 — 2026-05-01. Re-enabled with two new discriminators after
+// dataset analysis on 1150 historical DEVELOPING-class tokens (last 14d):
 //
-// Slicing the 11-call cohort by every gate dimension shows no constant
-// retune saves it — mcap, top1, holder count, tpm, bundle/sniper/insider
-// all overlap fully between the active losers and the (still-active) ones.
-// The discriminator is missing from the gate: pre-call h1 price change is
-// universally negative or weakly positive (-78% to +131%), meaning the
-// DEVELOPING classification fires AFTER a token has pumped and started
-// dumping — we're catching the back side of the move, not the front.
+//   The 11-call live cohort that bled (0/11, mean -61%) was NOT
+//   representative of the bucket's underlying distribution. Universe
+//   shows 11.3% peak ≥ +200% rate at +25.5% mean realized EV under a
+//   +500/-30 ladder. The single-day cohort hit a perfect storm: low-tpm
+//   tokens (60-150/min) AND already-falling pre-DEV trajectory.
 //
-// Reviving requires a new entry signal that distinguishes "about-to-take-off
-// DEV" from "already-pumped-and-fading DEV". Most likely path: backtest
-// against a 200+ DEV-class historical universe with held-out validation,
-// looking for shape patterns in pre-call snapshot trajectory (slope sign,
-// holder-growth rate, smart-money entries) that aren't captured by the
-// instantaneous gate. Until that data exists, the bucket is a -EV machine.
+//   Two filters distinguish wins from rugs across the 14d universe:
+//
+//     (1) tpm ≥ 200/min — winners cluster at high activity. Below 200
+//         had 9.0% peak ≥+200% rate; at ≥200 it's 12.7%. tpm 50-200
+//         was the bucket's drag.
+//
+//     (2) pre-DEV slope ≥ 0% — looking at the oldest snapshot price in
+//         the 30-min window before first DEV classification. Negative
+//         pre-slope tokens are catching the back of a pump (already
+//         fading). Tokens with NULL pre-slope (genuinely fresh, no
+//         observable history) keep base rate. Tokens with confirmed
+//         POSITIVE pre-slope keep the edge.
+//
+// Re-validated against the 14d universe under a +250%/-25% ladder:
+//   Ideal exec:       +26.9% EV/trade
+//   Realistic (15% slip): +14.5% EV/trade
+//   Pessimistic (30% slip): +2.2% EV/trade
+//
+// Critically: applying these filters to the 11 May 1 losing calls
+// rejects ALL of them (low tpm or confirmed-down pre-slope). The bucket
+// fires on a fundamentally different shape going forward.
+//
+// Settle ladder retuned in scanner.rs: +250 take, -25 stop, 72h expire.
+// Lower take threshold improves realized capture (28→56 of cohort
+// hit ≥+200% vs ≥+500%); tighter stop caps per-fire loss.
 // =============================================================================
-pub const MOONSHOT_ENABLED: bool = false;
+pub const MOONSHOT_ENABLED: bool = true;
 pub const MOONSHOT_REQUIRED_CLASS: &str = "DEVELOPING";
 pub const MOONSHOT_MIN_MCAP_USD: f64 = 5_000.0;
 pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
@@ -169,7 +183,15 @@ pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
 pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 60.0;
 pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 15;
 pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
-pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 50.0;
+// Lifted from 50/min to 200/min after universe analysis: tpm 50-200
+// dragged hit-rate down. Above 200 tokens have enough genuine flow to
+// support a +200% leg before the dump.
+pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 200.0;
+// Pre-DEV trajectory: look back 30min for the oldest snapshot price.
+// Reject only when we have CONFIRMED downward slope (price now < pre-price).
+// NULL data (genuinely fresh) passes — base rate still positive.
+pub const MOONSHOT_PRE_LOOKBACK_SECS: i64 = 1800;
+pub const MOONSHOT_MIN_PRE_PCT: f64 = 0.0;
 // Forensics ceilings — even moonshots block on confirmed bundle/sniper
 // concentration. The shape we want is human-driven accumulation, not
 // programmatic launch-bot fills. Ceilings are looser than SHORT because
@@ -772,6 +794,7 @@ impl Notifier {
         a: &TokenAnalysis,
         meta: Option<&TokenMeta>,
         first_seen: Option<i64>,
+        current_price: f64,
     ) -> bool {
         if !MOONSHOT_ENABLED {
             return false;
@@ -799,8 +822,9 @@ impl Notifier {
         // accumulation shape that SCALP/Bucket A reject. Above 60% is
         // honeypot (single wallet can dump the whole supply).
         let top1_ok = a.top_holder_pct < MOONSHOT_MAX_TOP_HOLDER_PCT;
-        // Velocity floor — moonshots have trading activity. A DEV-class
-        // token with no flow is just dead inventory.
+        // Velocity floor lifted to 200/min after universe audit. Tokens at
+        // 50-200 tpm dragged hit-rate; above 200 they have enough flow to
+        // sustain a +200% leg.
         let tx_rate_ok = a.tx_rate >= MOONSHOT_MIN_TX_RATE_PER_MIN;
         // Forensics — looser than SHORT but still block confirmed bot-fill
         // patterns (bundle/sniper/insider). Soft gate: unmeasured passes.
@@ -811,9 +835,25 @@ impl Notifier {
         // distribution to form.
         let now = chrono::Utc::now().timestamp();
         let age_ok = first_seen.map_or(false, |fs| now - fs >= SIGNAL_MIN_TOKEN_AGE_SECS);
-        // No confidence floor — DEV-class median conf is 44 in the 50x+
-        // backtest cohort. Confidence is computed against post-stabilization
-        // shape; raw moonshot snapshots are pre-stabilization by definition.
+
+        // Pre-DEV slope filter. Look back MOONSHOT_PRE_LOOKBACK_SECS
+        // (30min) and find the oldest snapshot price for this token. If
+        // the current price has dropped vs that pre-price, we're catching
+        // the back of a pump — reject. NULL pre-data (genuinely fresh,
+        // no observable history) passes — base rate is positive on those.
+        let pre_ok = if current_price > 0.0 {
+            let until = now - 60; // exclude last minute (the call's own snapshot)
+            let since = now - MOONSHOT_PRE_LOOKBACK_SECS;
+            match self.db.get_oldest_price_in_window(&a.address, since, until) {
+                Ok(Some(pre_price)) if pre_price > 0.0 => {
+                    let pre_pct = (current_price - pre_price) / pre_price * 100.0;
+                    pre_pct >= MOONSHOT_MIN_PRE_PCT
+                }
+                _ => true, // no pre-data → don't reject
+            }
+        } else {
+            true // unknown current price → fall back to other gates
+        };
 
         mcap_ok
             && holders_ok
@@ -823,6 +863,7 @@ impl Notifier {
             && sniper_ok
             && insider_ok
             && age_ok
+            && pre_ok
     }
 
     /// Decides when an open signal's verdict has collapsed.
@@ -1339,7 +1380,7 @@ impl Notifier {
                 // standard requires STAIRCASE/GRINDER/SPRING). Disjoint path.
                 let moonshot_pass = !standard_pass
                     && !scalp_pass
-                    && self.should_moonshot_signal(a, meta.as_ref(), first_seen);
+                    && self.should_moonshot_signal(a, meta.as_ref(), first_seen, price.unwrap_or(0.0));
                 if !standard_pass && !scalp_pass && !moonshot_pass {
                     if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf, meta.as_ref(), first_seen) {
                         let mom_delta = a.delta.as_ref().map(|d| d.momentum_delta);

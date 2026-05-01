@@ -2165,6 +2165,30 @@ impl Db {
         Ok(max_price.map(|p| (p / entry - 1.0) * 100.0).unwrap_or(0.0))
     }
 
+    /// Oldest snapshot price within [since_ts, until_ts]. Used by the
+    /// moonshot gate to compute pre-DEV trajectory slope: compare current
+    /// entry price to the oldest price in the lookback window. None means
+    /// no observable history — caller decides whether to treat as pass or
+    /// reject. Returns the price only (not the full snapshot) to keep the
+    /// query cheap.
+    pub fn get_oldest_price_in_window(
+        &self,
+        address: &str,
+        since_ts: i64,
+        until_ts: i64,
+    ) -> Result<Option<f64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT price_usd FROM token_snapshots
+             WHERE token_address = ?1 AND timestamp >= ?2 AND timestamp <= ?3 AND price_usd > 0
+             ORDER BY timestamp ASC LIMIT 1",
+        )?;
+        let price: Option<f64> = stmt
+            .query_row(params![address, since_ts, until_ts], |row| row.get(0))
+            .ok();
+        Ok(price)
+    }
+
     /// Peak snapshot by confidence within a time window — used to measure
     /// collapse severity against a token's best state in recent memory.
     pub fn get_peak_snapshot(&self, address: &str, since_ts: i64) -> Result<Option<TokenSnapshot>> {

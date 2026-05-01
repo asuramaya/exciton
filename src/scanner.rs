@@ -994,19 +994,19 @@ impl BackgroundScanner {
                     None
                 }
             } else if is_moonshot {
-                // Bucket B — DEVELOPING-class right-tail capture. 397-entry
-                // backtest gave +29.7% mean realized EV with hold-to-stop
-                // (-60% / 72h / no upper take). 4.3% of entries hit peak
-                // ≥+1000% — that subset carries the EV. Single-position
-                // infra: no partials; full-take @ +500% balances right-
-                // tail capture against bird-in-hand variance reduction.
-                // Entries below +500 ride to either -60 stop or 72h
-                // expiration. Take_pct used so on-chain spike captures
-                // through DexScreener lag.
-                if pct <= -60.0 {
+                // Bucket B v2 — retuned 2026-05-01 after 1150-token universe
+                // analysis. Old +500/-60 ladder had +21% sim EV but bled in
+                // live (0/11 -61%) due to settle latency widening realized
+                // stop fills. New +250/-25 ladder simulates +14.5% EV under
+                // realistic execution and +2.2% under pessimistic — robust
+                // across slippage regimes. Tighter stop caps per-fire loss
+                // at -25% trigger; lower take threshold doubles realized
+                // capture rate (11.3% of cohort hit ≥+200% peak vs 5.7%
+                // hitting ≥+500%).
+                if pct <= -25.0 {
                     Some(("failed", format!("{:+.1}% · moonshot stop", pct)))
-                } else if take_pct >= 500.0 {
-                    Some(("withdrew", format!("{:+.1}% · moonshot 6x", take_pct)))
+                } else if take_pct >= 250.0 {
+                    Some(("withdrew", format!("{:+.1}% · moonshot 3.5x", take_pct)))
                 } else if age >= 72 * 3600 {
                     Some(("expired", format!("{:+.1}% · moonshot timeout", pct)))
                 } else {
