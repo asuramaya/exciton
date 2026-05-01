@@ -345,96 +345,101 @@ fn compact_usd(v: f64) -> String {
     }
 }
 
-/// Compose the structural narrative paragraph that backs every auto-fired
-/// call card on the public site. Reads the same shape signals the gate
-/// already saw (classification, confidence, h1 trend, mcap, holder
-/// distribution, tpm) and prints them in editorial order: what fired, why
-/// it passed, exit ladder, hold window. Operator-typed /call notes use a
-/// different path and override entirely. Forensics callouts only emit
-/// when measurably non-zero — clean tokens read clean.
+/// Compose the auto-fired call narrative in TG-caller voice. NOT a structural
+/// info-dump — reads like a person on the channel calling out a position.
+/// Three short pieces: the setup line, a shape observation, a punchy exit
+/// plan. Forensics callouts mention specific numbers only when they're
+/// actually concerning. The whole strategy is "abnormal signal influx,
+/// ride, exit green" — not multi-hour holds — so the language reflects
+/// minute-window plays.
 fn compose_auto_narrative(
     a: &TokenAnalysis,
     meta: Option<&TokenMeta>,
     horizon: crate::horizon::Horizon,
     mcap_usd: f64,
-    effective_conf: i32,
+    _effective_conf: i32,
 ) -> String {
     let cls = a.confidence.classification.as_str();
     let h1 = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
-    let liq = meta.and_then(|m| m.liquidity_usd).unwrap_or(0.0);
-
-    // Classification + numeric snapshot — the spine sentence.
-    let mut header = format!(
-        "{cls} conf {conf} fired at {mcap} mcap, top1 {top1:.1}%, {hc} holders, {tpm:.0}/min flow",
-        cls = cls,
-        conf = effective_conf,
-        mcap = compact_usd(mcap_usd),
-        top1 = a.top_holder_pct,
-        hc = a.holder_count,
-        tpm = a.tx_rate,
-    );
-    if h1.abs() >= 1.0 {
-        let h1_label = if h1 >= 0.0 {
-            format!("+{:.0}%", h1)
+    let mcap_short = compact_usd(mcap_usd);
+    let h1_label = if h1.abs() >= 1.0 {
+        if h1 >= 0.0 {
+            format!("+{:.0}% h1", h1)
         } else {
-            format!("{:.0}%", h1)
-        };
-        header.push_str(&format!(", h1 {}", h1_label));
-    }
-    if liq >= 1.0 {
-        header.push_str(&format!(", liq {}", compact_usd(liq)));
-    }
-    header.push('.');
+            format!("{:.0}% h1", h1)
+        }
+    } else {
+        String::new()
+    };
 
-    // Forensics callout — only emit when measurable. Clean tokens skip
-    // the line entirely (no "0% bundle, 0% sniper" noise).
-    let mut forensics_bits = Vec::new();
-    if a.bundle_pct >= 5.0 {
-        forensics_bits.push(format!("bundle {:.0}%", a.bundle_pct));
+    // Tape phrase — caller-style flow read off tpm.
+    let tape = if a.tx_rate >= 500.0 {
+        "tape is loud"
+    } else if a.tx_rate >= 200.0 {
+        "flow's stacking"
+    } else if a.tx_rate >= 100.0 {
+        "decent flow"
+    } else {
+        "thin tape"
+    };
+
+    // Forensics — only mention when actually concerning. Otherwise skip
+    // entirely. Clean tokens just don't get the line.
+    let mut warnings = Vec::new();
+    if a.bundle_pct >= 15.0 {
+        warnings.push(format!("bundle {:.0}%", a.bundle_pct));
     }
-    if a.sniper_pct >= 5.0 {
-        forensics_bits.push(format!("sniper {:.0}%", a.sniper_pct));
+    if a.sniper_pct >= 30.0 {
+        warnings.push(format!("sniper {:.0}%", a.sniper_pct));
     }
-    if a.insider_pct >= 5.0 {
-        forensics_bits.push(format!("insider {:.0}%", a.insider_pct));
+    if a.insider_pct >= 15.0 {
+        warnings.push(format!("insider {:.0}%", a.insider_pct));
     }
-    let forensics_line = if forensics_bits.is_empty() {
+    let warn_line = if warnings.is_empty() {
         String::new()
     } else {
-        format!(" Forensics: {}.", forensics_bits.join(", "))
+        format!(" {} but riding it.", warnings.join(" + "))
     };
 
-    // Bucket-specific shape line — names which gate fired and what it's
-    // betting on. Ladder line — exits + window. Both pinned to the
-    // constants in scanner::settle_calls so the card matches reality.
-    let (shape, ladder) = match horizon {
-        crate::horizon::Horizon::Moonshot => (
-            " Bucket B (right-tail capture): DEVELOPING zone with confirmed positive pre-DEV slope, \
-             concentrated holders read as early accumulation, not honeypot.",
-            " Take +250%, stop -25%, 72h hold.",
+    // Setup line — what we're playing, in caller voice. Each horizon has
+    // its own opener that matches the actual gate logic.
+    let setup = match horizon {
+        crate::horizon::Horizon::Moonshot => format!(
+            "moonshot punt on a fresh {mc} DEV with {top:.0}% top1",
+            mc = mcap_short,
+            top = a.top_holder_pct,
         ),
-        crate::horizon::Horizon::Scalp => (
-            " SCALP corridor: shallow-mcap rip, tpm \u{2265}25/min, h1 pc \u{2208} [+100%, +300%]. \
-             Catching post-discovery before exhaustion.",
-            " Take +30%, stop -30%, 4h max.",
+        crate::horizon::Horizon::Scalp => format!(
+            "clean {cls} running on {mc} mc{h1_part}, top holder under {top:.0}%",
+            cls = cls,
+            mc = mcap_short,
+            h1_part = if h1_label.is_empty() { String::new() } else { format!(", {}", h1_label) },
+            top = a.top_holder_pct,
         ),
-        crate::horizon::Horizon::Long => (
-            " Bucket A LONG: graduated zone, distribution clean, classification stable. \
-             Sized to ride beyond a 6h window.",
-            " Tiered exits +40%/+80%/+150%, stop -50%, 30d hold.",
+        crate::horizon::Horizon::Long => format!(
+            "{cls} graduated at {mc} mc, structure looks held",
+            cls = cls,
+            mc = mcap_short,
         ),
-        crate::horizon::Horizon::Short => (
-            " Bucket A SHORT: liquid mid-cap with clean concentration profile, \
-             passing the standard signal gate.",
-            " Take +50%/+100%, stop -40%, 6h max.",
+        crate::horizon::Horizon::Short => format!(
+            "{cls} setup at {mc} mc{h1_part}, distribution clean",
+            cls = cls,
+            mc = mcap_short,
+            h1_part = if h1_label.is_empty() { String::new() } else { format!(" after {}", h1_label) },
         ),
-        crate::horizon::Horizon::Unknown => (
-            "",
-            " Settle ladder defaults to SHORT.",
-        ),
+        crate::horizon::Horizon::Unknown => format!("{cls} signal at {mcap_short} mc"),
     };
 
-    format!("{}{}{}{}", header, forensics_line, shape, ladder).trim().to_string()
+    // Exit plan in colloquial form. Pinned to scanner::settle_calls.
+    let plan = match horizon {
+        crate::horizon::Horizon::Moonshot => "Aping in — +250 take, -25 stop, ~90min if it doesn't move",
+        crate::horizon::Horizon::Scalp => "Riding the move — +30 take, -30 stop, ~90min window",
+        crate::horizon::Horizon::Long => "Worth a longer ride — +40/+80/+150 ladder, -50 stop",
+        crate::horizon::Horizon::Short => "Bucket A swing — +50/+100 ladder, -40 stop, ~90min window",
+        crate::horizon::Horizon::Unknown => "Riding it — see settle ladder",
+    };
+
+    format!("{setup}, {tape}.{warn_line} {plan}.").trim().to_string()
 }
 
 // -- Notifier core -----------------------------------------------------------
@@ -1633,12 +1638,20 @@ impl Notifier {
                     // (scanner::settle_calls). Without this, the UI badges a
                     // misleading "13d left" on every call while the settling
                     // phase actually closes SHORT at 6h.
+                    // Auto-fired calls are minute-window plays — capture the
+                    // signal influx, ride the trailing stop, exit green.
+                    // 90min default: a position that hasn't moved 20% in 90
+                    // minutes is dead inventory tying up capital. Trailing
+                    // stop already extends winning positions indefinitely
+                    // via peak<+20% gate, so 90min only kills flat ones.
+                    // LONG horizon (auto-fired at >= $1M graduated mcap)
+                    // gets 6h since deeper-cap moves develop slower.
                     let window_secs: i64 = match auto_horizon {
-                        crate::horizon::Horizon::Scalp => 4 * 3600,
-                        crate::horizon::Horizon::Short => 6 * 3600,
-                        crate::horizon::Horizon::Long => 30 * 86_400,
-                        crate::horizon::Horizon::Moonshot => 72 * 3600,
-                        crate::horizon::Horizon::Unknown => 14 * 86_400,
+                        crate::horizon::Horizon::Scalp => 90 * 60,
+                        crate::horizon::Horizon::Short => 90 * 60,
+                        crate::horizon::Horizon::Moonshot => 90 * 60,
+                        crate::horizon::Horizon::Long => 6 * 3600,
+                        crate::horizon::Horizon::Unknown => 90 * 60,
                     };
                     let expires = now + window_secs;
                     let _ = self.db.set_call_expiration(&a.address, Some(expires));

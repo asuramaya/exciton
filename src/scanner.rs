@@ -1033,10 +1033,9 @@ impl BackgroundScanner {
                     // activation. Bleeds slowly past the floor while never
                     // going green; close at current.
                     Some(("failed", format!("{:+.1}% · scalp no-pump", pct)))
-                } else if age >= 4 * 3600 && peak_observed < 20.0 {
-                    // Time-expire only when the position never even hit
-                    // breakeven trail activation. Winning positions ride
-                    // until the trailing stop catches them.
+                } else if age >= 90 * 60 && peak_observed < 20.0 {
+                    // 90min flat-position cutoff. Winning positions ride
+                    // until trailing stop catches them.
                     Some(("expired", format!("{:+.1}% · scalp timeout", pct)))
                 } else {
                     None
@@ -1055,10 +1054,10 @@ impl BackgroundScanner {
                     Some(("failed", format!("{:+.1}% · moonshot stop", pct)))
                 } else if take_pct >= 250.0 {
                     Some(("withdrew", format!("{:+.1}% · moonshot 3.5x", take_pct)))
-                } else if age >= 72 * 3600 && peak_observed < 20.0 {
-                    // 72h timeout fires only when the moonshot never even
-                    // hit breakeven trail activation. Winning positions
-                    // ride until the trailing stop catches them.
+                } else if age >= 90 * 60 && peak_observed < 20.0 {
+                    // 90min flat cutoff (was 72h). Strategy is fast-influx
+                    // capture — a moonshot that hasn't moved 20% in 90min
+                    // isn't going to. Winning positions ride trailing stop.
                     Some(("expired", format!("{:+.1}% · moonshot timeout", pct)))
                 } else {
                     None
@@ -1078,8 +1077,10 @@ impl BackgroundScanner {
                     Some(("withdrew", format!("{:+.1}% · long second take", take_pct)))
                 } else if take_pct >= 40.0 {
                     Some(("withdrew", format!("{:+.1}% · long first take", take_pct)))
-                } else if age >= 30 * 86_400 && peak_observed < 20.0 {
-                    Some(("expired", format!("{:+.1}% · 30d hold complete", pct)))
+                } else if age >= 6 * 3600 && peak_observed < 20.0 {
+                    // Auto-LONG cutoff at 6h (was 30d). Operator-driven
+                    // long-thesis calls would override via /call note path.
+                    Some(("expired", format!("{:+.1}% · long hold timeout", pct)))
                 } else {
                     None
                 }
@@ -1102,7 +1103,8 @@ impl BackgroundScanner {
                 // price hasn't moved -40% yet but flow is gone. Better
                 // close at break-even-ish than wait 6h for the bleed.
                 Some(("withdrew", format!("{:+.1}% · energy gone", pct)))
-            } else if age >= 6 * 3600 && peak_observed < 20.0 {
+            } else if age >= 90 * 60 && peak_observed < 20.0 {
+                // SHORT auto-cutoff at 90min (was 6h). Same fast-influx logic.
                 Some(("expired", format!("{:+.1}% · no follow-through", pct)))
             } else {
                 None
