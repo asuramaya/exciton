@@ -1,12 +1,18 @@
-//! Direct-message bot — long-poll interface for interactive commands.
+//! Telegram bot surfaces — long-poll interfaces for interactive commands.
 //!
-//! Feels like a Telegram bot, not an AI. Users DM @MadApesAIBot, type slash
-//! commands, get structured responses. Multi-user by default; per-user state
-//! (watchlist, mutes) persisted in SQLite. Admin tier gated via config.
+//! Two distinct surfaces share this module:
 //!
-//! Architecture: single tokio task polls getUpdates with long timeout, dispatches
-//! each incoming update to a command handler. Handlers reuse notifier/templates
-//! rendering — single source of truth for message formatting.
+//! - **Private** (@Claudeinatorbot, `dm_bot_token`): operator + admin commands
+//!   plus `/claw`. Hard-gated by `admin_user_ids`; non-admins get a routing
+//!   hint to the public bot. Built for the operator only.
+//! - **Public** (@MadApesAIBot, `bot_token`): read-only intel + per-user
+//!   watchlist for anyone. Same per-user 30/min rate limit as before plus a
+//!   global 1-per-minute ceiling on RPC-heavy lookup commands so random
+//!   traffic can't drain the cache.
+//!
+//! Architecture: each surface runs its own tokio long-poll task with its own
+//! token. Dispatch is filtered by `Surface` allow-list — out-of-set commands
+//! get a cross-route hint instead of a generic "unknown command".
 
 use crate::config::TelegramConfig;
 use crate::db::Db;
@@ -18,7 +24,36 @@ use crate::templates::{self, Template};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// Operator-only DM bot (Claudeinatorbot). All commands gated to admins;
+    /// hosts /claw plus the runtime control surface (halt/resume/threshold/etc).
+    Private,
+    /// Public-facing bot (MadApesAIBot). Read-only intel + per-user state.
+    /// No admin gate; global 1/min ceiling on RPC-heavy lookup commands.
+    Public,
+}
+
+impl Surface {
+    fn label(self) -> &'static str {
+        match self {
+            Surface::Private => "Private",
+            Surface::Public => "Public",
+        }
+    }
+}
+
+/// Shared global rate-limit handle for the public surface's RPC-heavy lookups
+/// (inspect / why / safety / lp / deployer / scout / whales). One instance is
+/// created in main.rs and cloned into the public DmBot. Private surface holds
+/// a separate handle that's never consulted, keeping the type uniform.
+pub type PublicLookupGate = Arc<tokio::sync::Mutex<Option<Instant>>>;
+
+pub fn new_public_lookup_gate() -> PublicLookupGate {
+    Arc::new(tokio::sync::Mutex::new(None))
+}
 
 pub struct DmBot {
     cfg: TelegramConfig,
@@ -28,15 +63,62 @@ pub struct DmBot {
     call_expiry_days: i64,
     http: reqwest::Client,
     running: Arc<AtomicBool>,
+    surface: Surface,
+    token: String,
+    /// Last successful public lookup (any surface, any user). Public surface
+    /// rejects the next lookup if <60s have passed. Private surface holds a
+    /// dedicated unused gate for type uniformity.
+    public_lookup_gate: PublicLookupGate,
 }
 
 impl DmBot {
-    pub fn new(
+    /// Construct a Private (operator-only) surface bound to `dm_bot_token`.
+    /// Returns an error if the token is empty so we never collide with the
+    /// channel poster's `bot_token` getUpdates.
+    pub fn private(
         cfg: TelegramConfig,
         db: Arc<Db>,
         rpc: Arc<RpcRouter>,
         notifier: Arc<Notifier>,
         call_expiry_days: i64,
+    ) -> Result<Self> {
+        if cfg.dm_bot_token.is_empty() {
+            return Err(anyhow!(
+                "Private surface requires a dedicated dm_bot_token — refusing to share bot_token \
+                 with the channel poster (would 409 on getUpdates)"
+            ));
+        }
+        let token = cfg.dm_bot_token.clone();
+        Self::build(cfg, db, rpc, notifier, call_expiry_days, Surface::Private, token, new_public_lookup_gate())
+    }
+
+    /// Construct a Public surface bound to `bot_token`. The provided
+    /// `public_lookup_gate` enforces the global 1/min ceiling on RPC-heavy
+    /// lookups across all users.
+    pub fn public(
+        cfg: TelegramConfig,
+        db: Arc<Db>,
+        rpc: Arc<RpcRouter>,
+        notifier: Arc<Notifier>,
+        call_expiry_days: i64,
+        public_lookup_gate: PublicLookupGate,
+    ) -> Result<Self> {
+        if cfg.bot_token.is_empty() {
+            return Err(anyhow!("Public surface requires bot_token"));
+        }
+        let token = cfg.bot_token.clone();
+        Self::build(cfg, db, rpc, notifier, call_expiry_days, Surface::Public, token, public_lookup_gate)
+    }
+
+    fn build(
+        cfg: TelegramConfig,
+        db: Arc<Db>,
+        rpc: Arc<RpcRouter>,
+        notifier: Arc<Notifier>,
+        call_expiry_days: i64,
+        surface: Surface,
+        token: String,
+        public_lookup_gate: PublicLookupGate,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -49,19 +131,16 @@ impl DmBot {
             call_expiry_days,
             http,
             running: Arc::new(AtomicBool::new(false)),
+            surface,
+            token,
+            public_lookup_gate,
         })
     }
 
-    /// Token used for DM interactions. Falls back to the channel bot token
-    /// when no dedicated DM bot is configured. Splitting prevents 409 Conflict
-    /// when the channel bot is shared with other long-pollers (group webhooks
-    /// etc.) — only one process can `getUpdates` per token at a time.
+    /// Token bound to this surface. Set at construction so each surface
+    /// long-polls its own bot independently.
     fn dm_token(&self) -> &str {
-        if self.cfg.dm_bot_token.is_empty() {
-            &self.cfg.bot_token
-        } else {
-            &self.cfg.dm_bot_token
-        }
+        &self.token
     }
 
     pub fn start(self: Arc<Self>) {
@@ -84,63 +163,60 @@ impl DmBot {
             // Register commands with Telegram for client-side autocomplete
             let _ = me.register_commands().await;
 
-            tracing::info!("DM bot started, long-polling for direct messages");
+            tracing::info!(
+                "{} bot started, long-polling for direct messages",
+                me.surface.label()
+            );
             me.poll_loop().await;
         });
     }
 
     async fn register_commands(&self) -> Result<()> {
-        let commands = [
-            ("help", "List available commands"),
-            ("scan", "Queue overview — top 5 by effective confidence"),
-            ("inspect", "Deep dive on a token: /inspect <addr>"),
-            ("status", "System health, wallet, active signals"),
-            ("signals", "Currently active signal cards"),
-            ("traps", "Hour's trap report: /traps [hours_ago]"),
-            (
-                "top",
-                "Top tokens in a class: /top staircase|grinder|spring",
-            ),
-            ("regime", "Current market regime"),
-            ("why", "Classification reasoning: /why <addr>"),
-            ("safety", "Safety signals only: /safety <addr>"),
-            ("watch", "Track a token: /watch <addr> [note]"),
-            ("unwatch", "Stop tracking: /unwatch <addr>"),
-            ("watchlist", "Your tracked tokens"),
-            ("mute", "Silence a token: /mute <addr>"),
-            ("unmute", "Unmute a token"),
-            ("muted", "Your muted tokens"),
-            ("nearmisses", "Recent tokens that almost fired a signal"),
-            (
-                "watch_wallet",
-                "Track a smart wallet: /watch_wallet <addr> [label]",
-            ),
-            ("unwatch_wallet", "Stop tracking: /unwatch_wallet <addr>"),
-            ("wallets", "Your smart-wallet watchlist"),
-            (
-                "scout",
-                "Pull deployer profile + website for a mint: /scout <addr>",
-            ),
-            ("call", "Fire a public call: /call <mint> [short|long] [note]"),
-            (
-                "close_call",
-                "Close an active call: /close_call <mint> [outcome]",
-            ),
-            ("calls", "Active calls + recent history"),
-            (
-                "whales",
-                "Trace top-10 holder flow for a mint: /whales <addr>",
-            ),
-            ("lp", "Check LP lock/burn/program status: /lp <addr>"),
-            ("deployer", "Deployer's past launches: /deployer <addr>"),
-            (
-                "ref_mint",
-                "Add a known-winner reference mint: /ref_mint <addr> [label]",
-            ),
-            ("unref_mint", "Remove: /unref_mint <addr>"),
-            ("refs", "List reference mints"),
-            ("menu", "Show the quick-action reply keyboard (opt-in)"),
-        ];
+        // Per-surface command list. Telegram autocomplete uses these; we also
+        // call setMyCommands per-bot so each surface advertises only its own.
+        let commands: &[(&str, &str)] = match self.surface {
+            Surface::Private => &[
+                ("help", "List operator commands"),
+                ("claw", "Ask the LLM agent: /claw <prompt>"),
+                ("call", "Fire a public call: /call <mint> [short|long] [note]"),
+                ("close_call", "Close an active call: /close_call <mint> [outcome]"),
+                ("watch_wallet", "Track a smart wallet: /watch_wallet <addr> [label]"),
+                ("unwatch_wallet", "Stop tracking: /unwatch_wallet <addr>"),
+                ("ref_mint", "Add a reference mint: /ref_mint <addr> [label]"),
+                ("unref_mint", "Remove: /unref_mint <addr>"),
+                ("halt", "Pause the notifier"),
+                ("resume", "Resume the notifier"),
+                ("threshold", "Override signal threshold: /threshold <0-100>"),
+                ("stats", "Bot stats — users + commands"),
+            ],
+            Surface::Public => &[
+                ("help", "List available commands"),
+                ("scan", "Queue overview — top 5 by effective confidence"),
+                ("status", "System health, wallet, active signals"),
+                ("regime", "Current market regime"),
+                ("signals", "Currently active signal cards"),
+                ("calls", "Active calls + recent history"),
+                ("traps", "Hour's trap report: /traps [hours_ago]"),
+                ("top", "Top tokens in a class: /top staircase|grinder|spring"),
+                ("nearmisses", "Recent tokens that almost fired a signal"),
+                ("inspect", "Deep dive on a token: /inspect <addr>"),
+                ("why", "Classification reasoning: /why <addr>"),
+                ("safety", "Safety signals only: /safety <addr>"),
+                ("lp", "LP lock/burn/program status: /lp <addr>"),
+                ("deployer", "Deployer's past launches: /deployer <addr>"),
+                ("scout", "Deployer profile + website: /scout <addr>"),
+                ("whales", "Trace top-10 holder flow: /whales <addr>"),
+                ("refs", "List reference mints"),
+                ("wallets", "Smart-wallet watchlist"),
+                ("watch", "Track a token: /watch <addr> [note]"),
+                ("unwatch", "Stop tracking: /unwatch <addr>"),
+                ("watchlist", "Your tracked tokens"),
+                ("mute", "Silence a token: /mute <addr>"),
+                ("unmute", "Unmute a token"),
+                ("muted", "Your muted tokens"),
+                ("menu", "Show the quick-action reply keyboard (opt-in)"),
+            ],
+        };
         let json = serde_json::json!({
             "commands": commands.iter().map(|(c, d)| {
                 serde_json::json!({"command": c, "description": d})
@@ -266,6 +342,32 @@ impl DmBot {
         let start = std::time::Instant::now();
         let is_admin = self.db.is_admin(user_id)?;
 
+        // Surface allow-list gate. Cross-route mismatched commands instead of
+        // pretending they don't exist — users typing /halt in the public bot
+        // get a hint pointing them at the right surface.
+        if let Some(hint) = self.routing_hint(&cmd, is_admin) {
+            self.send(chat_id, &hint, None).await?;
+            return Ok(());
+        }
+
+        // Global 1/min ceiling on RPC-heavy public lookups. Per-user 30/min
+        // already ran above; this stops a coordinated hammering of /inspect
+        // across many users from melting the cache.
+        if self.surface == Surface::Public && is_public_lookup(&cmd) {
+            if let Some(wait_secs) = self.public_lookup_throttle().await {
+                self.send(
+                    chat_id,
+                    &format!(
+                        "⏸ Public lookups are limited to 1/min globally — try again in {}s.",
+                        wait_secs
+                    ),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
         let result = match cmd.as_str() {
             "start" => self.cmd_start(chat_id, first_time).await,
             "help" => self.cmd_help(chat_id, is_admin).await,
@@ -360,6 +462,65 @@ impl DmBot {
         Ok(())
     }
 
+    // -- Routing + throttling helpers --------------------------------------
+
+    /// Return Some(message) if `cmd` is not allowed on this surface.
+    /// None means "proceed to dispatch". Cross-route hints point at the
+    /// other surface so users discover the right bot.
+    fn routing_hint(&self, cmd: &str, is_admin: bool) -> Option<String> {
+        match self.surface {
+            Surface::Private => {
+                if PRIVATE_COMMANDS.contains(&cmd) {
+                    // Hard admin gate: even on the private surface, refuse
+                    // anything to non-admins. Stops a curious stranger who
+                    // discovered the bot from invoking /claw or /halt.
+                    if !is_admin {
+                        return Some(
+                            "🚫 <i>This bot is operator-only.</i> Try @MadApesAIBot for public commands."
+                                .to_string(),
+                        );
+                    }
+                    None
+                } else if PUBLIC_COMMANDS.contains(&cmd) {
+                    Some(format!(
+                        "↪️ <code>/{}</code> lives on @MadApesAIBot. This bot is operator-only.",
+                        html_escape(cmd)
+                    ))
+                } else {
+                    None // unknown — let the dispatcher's default arm handle it
+                }
+            }
+            Surface::Public => {
+                if PUBLIC_COMMANDS.contains(&cmd) {
+                    None
+                } else if PRIVATE_COMMANDS.contains(&cmd) {
+                    Some(format!(
+                        "🔒 <code>/{}</code> is operator-only and lives on @Claudeinatorbot.",
+                        html_escape(cmd)
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Returns Some(seconds_remaining) when the global 1/min ceiling is hit.
+    /// On success records `now` so the next caller is rejected within the
+    /// window. Only consulted on the public surface.
+    async fn public_lookup_throttle(&self) -> Option<i64> {
+        let mut guard = self.public_lookup_gate.lock().await;
+        let now = Instant::now();
+        if let Some(prev) = *guard {
+            let elapsed = now.duration_since(prev);
+            if elapsed < Duration::from_secs(60) {
+                return Some((60 - elapsed.as_secs() as i64).max(1));
+            }
+        }
+        *guard = Some(now);
+        None
+    }
+
     // -- API wrappers -------------------------------------------------------
 
     async fn send(&self, chat_id: i64, text: &str, reply_markup: Option<&str>) -> Result<i64> {
@@ -399,44 +560,69 @@ impl DmBot {
         } else {
             "🤖 <b>Back at it</b>"
         };
-        let body = format!(
-            "{greeting}\n<i>Why: /start</i>\n\n\
-             DM interface to Photon — Solana signal forecaster. Type / to autocomplete.\n\n\
-             Quick: /scan · /status · /signals · /traps · /help"
-        );
+        let body = match self.surface {
+            Surface::Private => format!(
+                "{greeting}\n\n\
+                 Operator surface for Photon. Hosts <code>/claw</code> + runtime control.\n\n\
+                 Quick: /claw · /stats · /halt · /resume · /help"
+            ),
+            Surface::Public => format!(
+                "{greeting}\n\n\
+                 MadApesAI — Solana signal forecaster. Type <code>/</code> to autocomplete.\n\n\
+                 Quick: /scan · /signals · /calls · /traps · /help"
+            ),
+        };
         // Clear any stale persistent reply keyboard from prior versions.
         self.send(chat_id, &body, Some(&clear_keyboard())).await?;
         Ok(())
     }
 
     async fn cmd_help(&self, chat_id: i64, is_admin: bool) -> Result<()> {
-        // Compact help — one line per command, grouped in a blockquote so it
-        // stays glanceable and collapsible.
-        let mut body = String::from(
-            "📖 <b>Commands</b>\n\n\
-             <blockquote expandable><b>Query</b>\n\
-             /scan · /status · /signals · /regime\n\
-             /traps [N] · /top &lt;class&gt;\n\n\
-             <b>Token</b>\n\
-             /inspect &lt;addr&gt; · /why &lt;addr&gt; · /safety &lt;addr&gt;\n\n\
-             <b>State</b>\n\
-             /watch &lt;addr&gt; [note] · /unwatch · /watchlist\n\
-             /calls · /mute &lt;addr&gt; · /unmute · /muted\n\n\
-             <b>UI</b>\n\
-             /menu — show quick-action keyboard",
-        );
-        if is_admin {
-            body.push_str(
-                "\n\n<b>Admin</b>\n\
-                 /call &lt;mint&gt; [short|long] [note]\n\
-                 /close_call &lt;mint&gt; [note]\n\
-                 /calls — active calls + history\n\
-                 /halt · /resume · /threshold &lt;N&gt; · /stats\n\
-                 /watch_wallet · /unwatch_wallet · /wallets\n\
-                 /ref_mint · /unref_mint · /refs",
-            );
-        }
-        body.push_str("</blockquote>");
+        // Per-surface help. Each lists ONLY the commands that surface serves —
+        // no more cross-surface clutter.
+        let body = match self.surface {
+            Surface::Public => String::from(
+                "📖 <b>Commands</b>\n\n\
+                 <blockquote expandable><b>Intel</b>\n\
+                 /scan · /status · /regime · /signals\n\
+                 /calls · /traps [N] · /top &lt;class&gt; · /nearmisses\n\n\
+                 <b>Token lookup</b>\n\
+                 /inspect &lt;addr&gt; · /why &lt;addr&gt; · /safety &lt;addr&gt;\n\
+                 /lp &lt;addr&gt; · /deployer &lt;addr&gt;\n\
+                 /scout &lt;addr&gt; · /whales &lt;addr&gt;\n\n\
+                 <b>Lists</b>\n\
+                 /refs · /wallets\n\n\
+                 <b>Personal</b>\n\
+                 /watch &lt;addr&gt; [note] · /unwatch · /watchlist\n\
+                 /mute &lt;addr&gt; · /unmute · /muted\n\n\
+                 <b>UI</b>\n\
+                 /menu — show quick-action keyboard\n\n\
+                 <i>Lookup commands (/inspect, /why, /safety, /lp, /deployer, /scout, /whales) are throttled to 1/min globally to protect RPC.</i></blockquote>",
+            ),
+            Surface::Private => {
+                if !is_admin {
+                    String::from(
+                        "🚫 <i>This bot is operator-only.</i>\n\n\
+                         Public commands live on @MadApesAIBot.",
+                    )
+                } else {
+                    String::from(
+                        "📖 <b>Operator commands</b>\n\n\
+                         <blockquote expandable><b>Agent</b>\n\
+                         /claw &lt;prompt&gt; — LLM agent\n\n\
+                         <b>Calls</b>\n\
+                         /call &lt;mint&gt; [short|long] [note]\n\
+                         /close_call &lt;mint&gt; [note]\n\n\
+                         <b>Watchlists</b>\n\
+                         /watch_wallet &lt;addr&gt; [label] · /unwatch_wallet\n\
+                         /ref_mint &lt;addr&gt; [label] · /unref_mint\n\n\
+                         <b>Runtime</b>\n\
+                         /halt · /resume · /threshold &lt;N&gt; · /stats\n\n\
+                         <i>Public intel (/scan, /inspect, /signals, etc.) lives on @MadApesAIBot.</i></blockquote>",
+                    )
+                }
+            }
+        };
         self.send(chat_id, &body, None).await?;
         Ok(())
     }
@@ -2751,6 +2937,62 @@ fn short_mint(m: &str) -> String {
     } else {
         format!("{}…{}", &m[..4], &m[m.len() - 4..])
     }
+}
+
+/// Commands that live on the Private (operator) surface. Matched against
+/// the parsed command string by `routing_hint`. `start` and `help` are
+/// served on both surfaces and intentionally absent from these sets.
+const PRIVATE_COMMANDS: &[&str] = &[
+    "claw",
+    "call",
+    "close_call",
+    "watch_wallet",
+    "unwatch_wallet",
+    "ref_mint",
+    "unref_mint",
+    "halt",
+    "resume",
+    "threshold",
+    "stats",
+];
+
+/// Commands that live on the Public surface. `calls` lives here too because
+/// public exposure of live calls is by design.
+const PUBLIC_COMMANDS: &[&str] = &[
+    "menu",
+    "scan",
+    "status",
+    "regime",
+    "signals",
+    "calls",
+    "traps",
+    "top",
+    "nearmisses",
+    "inspect",
+    "why",
+    "safety",
+    "lp",
+    "deployer",
+    "scout",
+    "whales",
+    "refs",
+    "wallets",
+    "watch",
+    "unwatch",
+    "watchlist",
+    "mute",
+    "unmute",
+    "muted",
+];
+
+/// RPC-heavy public commands subject to the global 1/min throttle. Cheap
+/// reads (DB-only: /scan, /status, /signals, /calls, /traps, /top, /regime,
+/// /nearmisses, /refs, /wallets, /menu, /watch*, /mute*) are not throttled.
+fn is_public_lookup(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "inspect" | "why" | "safety" | "lp" | "deployer" | "scout" | "whales"
+    )
 }
 
 /// Strip any persistent reply keyboard — used when we want the chat to feel

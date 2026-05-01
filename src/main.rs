@@ -202,21 +202,68 @@ async fn main() -> Result<()> {
                 }
                 notifier_arc = Some(arc);
 
-                // DM bot (long-poll) — started alongside the notifier when dm_enabled.
+                // Telegram bot surfaces — two long-polls, one per surface.
+                // Private (Claudeinatorbot) hosts operator+claw; Public
+                // (MadApesAIBot) hosts read-only intel + per-user state.
+                // Public surface enforces a 1/min global ceiling on
+                // RPC-heavy lookup commands; the gate is shared across
+                // every public user and persists for the bot's lifetime.
                 if cfg.dm_enabled {
-                    match bot::DmBot::new(
-                        cfg.clone(),
-                        db.clone(),
-                        rpc.clone(),
-                        notifier_arc.as_ref().unwrap().clone(),
-                        14, // call_expiry_days default
-                    ) {
-                        Ok(b) => {
-                            let admins = cfg.admin_user_ids.len();
-                            tracing::info!("DM bot enabled (admin_user_ids={})", admins);
-                            Arc::new(b).start();
+                    let public_gate = bot::new_public_lookup_gate();
+                    let notifier_clone = notifier_arc.as_ref().unwrap().clone();
+
+                    // Private surface — requires dm_bot_token and at least
+                    // one admin. We refuse to fall back to bot_token here
+                    // (would 409 on getUpdates with the public bot).
+                    if !cfg.dm_bot_token.is_empty() {
+                        match bot::DmBot::private(
+                            cfg.clone(),
+                            db.clone(),
+                            rpc.clone(),
+                            notifier_clone.clone(),
+                            14,
+                        ) {
+                            Ok(b) => {
+                                let admins = cfg.admin_user_ids.len();
+                                tracing::info!(
+                                    "Private bot (Claudeinatorbot) enabled (admin_user_ids={})",
+                                    admins
+                                );
+                                Arc::new(b).start();
+                            }
+                            Err(e) => tracing::warn!(
+                                "Private bot init failed: {} — operator surface offline",
+                                e
+                            ),
                         }
-                        Err(e) => tracing::warn!("DM bot init failed: {} — continuing without", e),
+                    } else {
+                        tracing::info!(
+                            "dm_bot_token empty — private operator bot disabled (set dm_bot_token to enable)"
+                        );
+                    }
+
+                    // Public surface — bot_token is also the channel poster,
+                    // so this adds a long-poll on it. Only ever one process
+                    // does getUpdates per token; if you run two photon
+                    // instances against the same bot_token you'll see 409s.
+                    if !cfg.bot_token.is_empty() {
+                        match bot::DmBot::public(
+                            cfg.clone(),
+                            db.clone(),
+                            rpc.clone(),
+                            notifier_clone,
+                            14,
+                            public_gate,
+                        ) {
+                            Ok(b) => {
+                                tracing::info!("Public bot (MadApesAIBot) enabled");
+                                Arc::new(b).start();
+                            }
+                            Err(e) => tracing::warn!(
+                                "Public bot init failed: {} — intel surface offline",
+                                e
+                            ),
+                        }
                     }
                 }
             }
