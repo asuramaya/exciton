@@ -1202,7 +1202,8 @@ impl Notifier {
         meta: Option<&crate::metadata::TokenMeta>,
         timeline: &[TimelineEntry],
         status: &str,  // "active" | "withdrew" | "failed" | "expired"
-        note: &str,
+        entry_note: &str,   // original call.note — narrative + horizon tag
+        exit_note: &str,    // settle verdict (empty for active)
     ) -> String {
         let ticker_name = match meta {
             Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
@@ -1211,13 +1212,12 @@ impl Notifier {
                 format!("<code>{}…{}</code>", &address[..6.min(address.len())], &address[end..])
             }
         };
-        // Parse horizon tag from note: "horizon=SHORT" or "horizon=LONG"
-        let (horizon_badge, clean_note) = parse_horizon_from_note(note);
+        // Parse horizon tag from the entry narrative — produces both the
+        // badge (SHORT/LONG/SCALP/MOONSHOT) and the clean prose with the
+        // tag stripped. Operator-typed notes ("FIRST CALL — $PsyopAnime")
+        // pass through with their editorial framing intact.
+        let (horizon_badge, narrative) = parse_horizon_from_note(entry_note);
         let term_label = horizon_badge.map(|h| format!(" · <b>{}</b>", h)).unwrap_or_default();
-        // Header emoji + verb. Settling phase produces explicit verdict
-        // strings ("took the win" / "2x done" / "thesis broke" / "no
-        // follow-through" / "30d hold complete") that are richer than the
-        // bare status — those come through `note` for closed states.
         let header = match status {
             "withdrew" | "closed" => format!("🟢 <b>BANKED</b>{} · {}", term_label, ticker_name),
             "failed"   => format!("🔴 <b>FAILED</b>{} · {}", term_label, ticker_name),
@@ -1225,19 +1225,28 @@ impl Notifier {
             "voided"   => format!("⚪ <b>VOIDED</b>{} · {}", term_label, ticker_name),
             _          => format!("📣 <b>NEW CALL</b>{} · {}", term_label, ticker_name),
         };
-        // Lead line. For active calls: operator's clean note (or a default
-        // caller phrase if blank). For closed calls: the verdict line from
-        // the settling phase ("+52% · took the win"), already written to
-        // `note` by update_call_outcome.
-        let lead = if clean_note.is_empty() {
-            match status {
-                "active" => "swing taken on this one.".to_string(),
-                _ => "—".to_string(),
-            }
+
+        // Verdict line for closed cards. settle path passes the formatted
+        // verdict ("-66.8% · moonshot stop") via exit_note. Bolded so it
+        // reads as the headline outcome, not a footnote.
+        let verdict_line = if !exit_note.trim().is_empty() && status != "active" {
+            format!("\n<b>{}</b>", html_escape(exit_note))
         } else {
-            html_escape(&clean_note)
+            String::new()
         };
-        let body = match meta {
+
+        // Narrative paragraph — the thesis. For auto-fired calls this is
+        // the structural compose_auto_narrative output (classification +
+        // shape + ladder). For operator-typed calls this is whatever they
+        // wrote. Always shown when present.
+        let narrative_block = if narrative.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", html_escape(&narrative))
+        };
+
+        // Compact market line — one row of bullet-separated stats.
+        let market_line = match meta {
             Some(m) => {
                 let mc  = m.market_cap_usd.or(m.fdv_usd).map(|v| format!("mc {}", compact_usd(v))).unwrap_or_else(|| "mc ?".to_string());
                 let liq = m.liquidity_usd.map(|v| format!("liq {}", compact_usd(v))).unwrap_or_default();
@@ -1248,11 +1257,27 @@ impl Notifier {
                     .filter(|s| !s.is_empty())
                     .copied()
                     .collect();
-                parts.join(" · ")
+                format!("\n\n{}", parts.join(" · "))
             }
-            None => "no market data".to_string(),
+            None => String::new(),
         };
-        let mut html = format!("{}\n{}\n\n{}", header, lead, body);
+
+        // Track-live link — every card points at the public ledger so the
+        // reader can follow the position's lifecycle on the site without
+        // hunting for the per-call URL.
+        let track_line = format!(
+            "\n\n📊 <a href=\"https://madapesai.com/#call={}\">track live on madapesai.com</a>",
+            address
+        );
+
+        let mut html = format!(
+            "{header}{verdict}{narrative}{market}{track}",
+            header = header,
+            verdict = verdict_line,
+            narrative = narrative_block,
+            market = market_line,
+            track = track_line,
+        );
         if !timeline.is_empty() {
             html.push_str("\n\n<blockquote expandable>— history ——");
             for e in timeline {
@@ -1294,7 +1319,7 @@ impl Notifier {
         match existing {
             None => {
                 let timeline = vec![TimelineEntry { ts: now, kind: "called".into(), line: call_line }];
-                let html = self.render_call_card(address, meta_ref, &timeline, "active", note);
+                let html = self.render_call_card(address, meta_ref, &timeline, "active", note, "");
                 let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
                 let msg_id = self.send_message_ex(&chat_id, &html, Some(&kb)).await?;
                 let timeline_json = serde_json::to_string(&timeline)?;
@@ -1303,7 +1328,7 @@ impl Notifier {
             Some(d) if d.status == "active" => {
                 let mut timeline: Vec<TimelineEntry> = serde_json::from_str(&d.timeline_json).unwrap_or_default();
                 timeline.push(TimelineEntry { ts: now, kind: "called".into(), line: call_line });
-                let html = self.render_call_card(address, meta_ref, &timeline, "active", note);
+                let html = self.render_call_card(address, meta_ref, &timeline, "active", note, "");
                 let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
                 self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await?;
                 let timeline_json = serde_json::to_string(&timeline)?;
@@ -1376,7 +1401,16 @@ impl Notifier {
             timeline.push(TimelineEntry { ts: now, kind: outcome.to_string(), line: line.clone() });
         }
 
-        let html = self.render_call_card(address, meta_ref, &timeline, outcome, exit_note);
+        // Recover the original entry narrative so closed cards still render
+        // their thesis instead of degrading to just the verdict line.
+        let entry_note = self
+            .db
+            .get_call_by_mint(address)
+            .ok()
+            .flatten()
+            .map(|c| c.note)
+            .unwrap_or_default();
+        let html = self.render_call_card(address, meta_ref, &timeline, outcome, &entry_note, exit_note);
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
         // Soft-error on edits: when re-running a backfill we may hit
         // "message is not modified" or "message to edit not found"

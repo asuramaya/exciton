@@ -2165,6 +2165,48 @@ impl Db {
         Ok(max_price.map(|p| (p / entry - 1.0) * 100.0).unwrap_or(0.0))
     }
 
+    /// Fetch a single call row by mint, status-agnostic. Returns the most
+    /// recent row when there are multiple historical entries for the same
+    /// mint. None when no row exists. Used by the TG card renderer to
+    /// recover the original call narrative even after the call has closed.
+    pub fn get_call_by_mint(&self, mint: &str) -> Result<Option<CallRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, mint, symbol, classification, confidence, called_at,
+                    entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
+                    entry_top_holder_pct, entry_pair_dex, note, source,
+                    status, closed_at, exit_price_usd, exit_note, expires_at,
+                    entry_tx_rate
+             FROM calls WHERE mint = ?1 ORDER BY called_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![mint])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(CallRow {
+                id: row.get(0)?,
+                mint: row.get(1)?,
+                symbol: row.get(2)?,
+                classification: row.get(3)?,
+                confidence: row.get(4)?,
+                called_at: row.get(5)?,
+                entry_mcap_usd: row.get(6)?,
+                entry_price_usd: row.get(7)?,
+                entry_liquidity_usd: row.get(8)?,
+                entry_top_holder_pct: row.get(9)?,
+                entry_pair_dex: row.get(10)?,
+                note: row.get(11)?,
+                source: row.get(12)?,
+                status: row.get(13)?,
+                closed_at: row.get(14).ok(),
+                exit_price_usd: row.get(15).ok(),
+                exit_note: row.get(16).ok(),
+                expires_at: row.get(17).ok(),
+                entry_tx_rate: row.get(18).unwrap_or(0.0),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Oldest snapshot price within [since_ts, until_ts]. Used by the
     /// moonshot gate to compute pre-DEV trajectory slope: compare current
     /// entry price to the oldest price in the lookback window. None means
