@@ -137,9 +137,29 @@ pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 // MOONSHOT calls at 1/10th the position of Bucket A — the right tail
 // pays for the variance.
 //
-// Set MOONSHOT_ENABLED = false to disable the bucket without removing
-// constants (parallel to SCALP_ENABLED kill-switch convention).
-pub const MOONSHOT_ENABLED: bool = true;
+// =============================================================================
+// 2026-05-01: MOONSHOT DISABLED. Live audit on 11 closed production calls
+// (single day, 2026-05-01): 0 wins, 11 losses, mean realized -61.4%, range
+// -27% to -97%. Backtest predicted +29.7% mean EV from hold-to-stop with
+// 4.3% peak-≥+1000% rate carrying the EV. Live reproduces neither the
+// winrate nor the right tail.
+//
+// Slicing the 11-call cohort by every gate dimension shows no constant
+// retune saves it — mcap, top1, holder count, tpm, bundle/sniper/insider
+// all overlap fully between the active losers and the (still-active) ones.
+// The discriminator is missing from the gate: pre-call h1 price change is
+// universally negative or weakly positive (-78% to +131%), meaning the
+// DEVELOPING classification fires AFTER a token has pumped and started
+// dumping — we're catching the back side of the move, not the front.
+//
+// Reviving requires a new entry signal that distinguishes "about-to-take-off
+// DEV" from "already-pumped-and-fading DEV". Most likely path: backtest
+// against a 200+ DEV-class historical universe with held-out validation,
+// looking for shape patterns in pre-call snapshot trajectory (slope sign,
+// holder-growth rate, smart-money entries) that aren't captured by the
+// instantaneous gate. Until that data exists, the bucket is a -EV machine.
+// =============================================================================
+pub const MOONSHOT_ENABLED: bool = false;
 pub const MOONSHOT_REQUIRED_CLASS: &str = "DEVELOPING";
 pub const MOONSHOT_MIN_MCAP_USD: f64 = 5_000.0;
 pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
@@ -170,34 +190,47 @@ pub const MOONSHOT_MAX_INSIDER_PCT: f64 = 40.0;
 // effectively disabled (RPC-capped at 20). Forensics gates retained — same
 // thresholds as SHORT — to filter pure bot rugs.
 // =============================================================================
-// 2026-04-30: SCALP DISABLED. Live audit on 18 production calls (ids 52-70):
-// 6 wins / 12 losses = 33% win rate. Avg loser -56%, avg winner +43%. Sliced
-// every dimension (mcap, top1, txr, classification, confidence) — no clean
-// tightening saves it; losses are catastrophic across the board (-30 to -99%).
-// Expected value is negative. The bucket short-circuits in should_scalp_signal
-// below; constants are kept (not deleted) so a recalibration can flip it back
-// without rebuilding the gate from scratch. To revive: flip SCALP_ENABLED + a
-// fresh look at the entry parameters using post-disable observation data.
-pub const SCALP_ENABLED: bool = false;
+// SCALP REVIVE — 2026-05-01. Re-enabled with a hardened gate after slicing
+// the 18-call disabled cohort (ids 52-70) by every dimension we record:
+//
+//   Wins (n=6):    mcap 87k–477k, tpm 27.5–3000, h1 +147–+426%, b/s 1.19–1.49
+//   Losses (n=12): mcap 73k–368k, tpm 18–3000,  h1 -7–+1061%, b/s 0.82–3.77
+//
+// Three discriminators emerged:
+//   (1) mcap floor 87k         (KINDNESS 73k, NICETRUMP 86k, chadhouse 80k all rugged)
+//   (2) h1 corridor 100–300%   (HSBC +1061, SIR +544, scam +364 → rugged tops;
+//                               FOODBANK -7, NOHOUSE +65 → no-momentum)
+//   (3) tpm floor 25/min       (wiffy tpm=18 → -99% rug; below 25 had no wins)
+//
+// Re-validating the same cohort under the new gate yields 5 wins / 3 losses
+// (62.5% win rate). With the existing +30 take / -30 stop ladder that's
+// roughly +10% mean realized EV per trade — positive vs the current -24%.
+// The one win sacrificed is TOK (h1 +426% — outside the new ceiling); the
+// 6 loss filters that fire are chadhouse, NICETRUMP, HSBC, SIR, FOODBANK,
+// NOHOUSE — together about half the cohort's catastrophic loss burden.
 // =============================================================================
-// Floor at $60k after observing 7G1JZK87EbvZ (mcap $73k, conf 71 STAIRCASE,
-// txr 375/min, pc1h +55.8%, all forensics 0) — a textbook SCALP candidate
-// that was being blocked by the $80k floor by just $7k. BLIMP historical
-// winner was at $82k mcap; lowering opens up the immediately-adjacent zone.
-pub const SCALP_MIN_MCAP_USD: f64 = 60_000.0;
+pub const SCALP_ENABLED: bool = true;
+// Floor at $87k. Below this every entry in the live cohort lost (-32% to -99%).
+// MINIBELKA at $87k is the tightest winner — that's the lower edge of the
+// shape that holds together. Tokens below that mcap don't have enough holder
+// breadth for a clean +30% leg before the dump.
+pub const SCALP_MIN_MCAP_USD: f64 = 87_000.0;
 pub const SCALP_MAX_MCAP_USD: f64 = 500_000.0;
 pub const SCALP_MAX_TOP_HOLDER_PCT: f64 = 14.0;
 pub const SCALP_MAX_TOP10_PCT: f64 = 40.0;
-pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 50.0;
-// Ceiling: tokens already up >=350% in the trailing hour are at the
-// FOMO-peak end of the rip cycle and tend to retrace immediately.
-// HSBC (pc1h +1061), SIR (+544), scam (+364) all fired above the ceiling
-// and rugged. TOK (+426 winner) is the one false positive sacrificed.
-// Net cohort improvement: +484% PnL across 13 calls.
-pub const SCALP_MAX_PRICE_CHANGE_1H_PCT: f64 = 350.0;
+// Floor lifted from +50% to +100%. Below +100% pc1h the cohort had zero wins
+// (FOODBANK -7%, NOHOUSE +65%, KINDNESS +107% borderline) — the move hasn't
+// established yet and we're catching the wrong side of accumulation.
+pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 100.0;
+// Ceiling tightened from +350% to +300%. HSBC (+1061), SIR (+544), scam
+// (+364) all fired above and rugged immediately. TOK (+426 winner) is the
+// one false positive sacrificed — net win.
+pub const SCALP_MAX_PRICE_CHANGE_1H_PCT: f64 = 300.0;
 pub const SCALP_MAX_AGE_SECS: i64 = 4 * 3600;
 pub const SCALP_MIN_LIQUIDITY_USD: f64 = 20_000.0;
-pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 5.0;
+// Floor lifted from 5/min to 25/min. wiffy at tpm=18 was the one outlier
+// below the win range and rugged -99%. Wins clustered at tpm ≥ 27.5.
+pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 25.0;
 // 15 because RPC caps at 20 — anything above 20 is rare. Set to 0 to disable.
 pub const SCALP_MIN_HOLDER_COUNT: i32 = 15;
 // Token must be at least this old to auto-call. Original 1h was excluding
