@@ -21,6 +21,82 @@ pub struct Config {
     /// Optional — when absent, no data is published to the MadApes.ai repo.
     #[serde(default)]
     pub madapes: Option<MadapesConfig>,
+    /// Optional — when absent OR `enabled=false`, photon stays paper-only.
+    /// Auto-calls insert rows + post TG cards but never sign trades.
+    #[serde(default)]
+    pub execution: Option<ExecutionConfig>,
+}
+
+/// Trade-execution sizing + safety budget. Master kill switch is `enabled`.
+/// When false (or section absent) photon is paper-only and the keypair
+/// loaded from `PHOTON_PRIVATE_KEY` is never used by the auto path.
+///
+/// Sizing is **adaptive**: `*_size_pct` is a percentage of the wallet's
+/// current SOL balance at call-fire time. As wallet grows, position size
+/// grows proportionally — no manual rebalancing. With $2 wallet at 5%,
+/// each call risks ~$0.10 (just above Jupiter's ~0.001 SOL floor).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutionConfig {
+    /// MASTER KILL SWITCH. Default false. Flip to true on the VM in
+    /// config.vm.toml when ready to go live.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bucket A (SHORT default) sizing — % of wallet SOL.
+    #[serde(default = "default_size_pct_5")]
+    pub bucket_a_size_pct: f64,
+    /// Bucket B (MOONSHOT) sizing — % of wallet SOL.
+    #[serde(default = "default_size_pct_5")]
+    pub bucket_b_size_pct: f64,
+    /// LONG-horizon (operator) sizing — % of wallet SOL.
+    #[serde(default = "default_size_pct_5")]
+    pub long_size_pct: f64,
+    /// SCALP sizing if/when re-enabled — % of wallet SOL.
+    #[serde(default = "default_size_pct_5")]
+    pub scalp_size_pct: f64,
+    /// Hard floor on per-trade SOL — Jupiter rejects below ~0.001.
+    #[serde(default = "default_min_trade_sol")]
+    pub min_trade_sol: f64,
+    /// Slippage tolerance (basis points) on Jupiter quotes. Memes
+    /// routinely slip 5-10%; below 1000 bps we'll get blocked a lot.
+    #[serde(default = "default_slippage_bps")]
+    pub slippage_bps: u16,
+    /// Max calls with an open position at one time. Settle waits for
+    /// sell confirmation before the slot frees up.
+    #[serde(default = "default_max_simultaneous")]
+    pub max_simultaneous_positions: i64,
+    /// Daily SOL spend cap (sum of buy_sol_spent over rolling 24h).
+    /// At 5% sizing on $2 this caps roughly 50 trades/day.
+    #[serde(default = "default_max_daily_sol")]
+    pub max_daily_position_sol: f64,
+    /// Buy-confirmation timeout. Beyond this with no signature, the
+    /// settle path voids the call.
+    #[serde(default = "default_buy_timeout_secs")]
+    pub buy_confirm_timeout_secs: i64,
+    /// Sell retry cap. After this many failures, settle marks the call
+    /// failed for manual operator exit.
+    #[serde(default = "default_sell_retry_max")]
+    pub sell_retry_max: i32,
+}
+
+fn default_size_pct_5() -> f64 { 5.0 }
+fn default_min_trade_sol() -> f64 { 0.001 }
+fn default_slippage_bps() -> u16 { 1000 }
+fn default_max_simultaneous() -> i64 { 5 }
+fn default_max_daily_sol() -> f64 { 1.0 }
+fn default_buy_timeout_secs() -> i64 { 60 }
+fn default_sell_retry_max() -> i32 { 6 }
+
+impl ExecutionConfig {
+    /// Pick the size pct for a given horizon string (matches the
+    /// horizon::Horizon::tag values + a fallback).
+    pub fn size_pct_for_horizon(&self, horizon_tag: &str) -> f64 {
+        match horizon_tag {
+            "horizon=MOONSHOT" => self.bucket_b_size_pct,
+            "horizon=SCALP" => self.scalp_size_pct,
+            "horizon=LONG" => self.long_size_pct,
+            _ => self.bucket_a_size_pct,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

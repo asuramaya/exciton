@@ -32,6 +32,11 @@ pub struct BackgroundScanner {
     /// straight to the DB). When stale, the sig-walks resume as
     /// fallback. Connectivity is the gate; no separate flag.
     pumpportal_health: Option<Arc<crate::pumpportal::PumpPortalHealth>>,
+    /// Optional execution context. Some(_) only when PHOTON_PRIVATE_KEY is
+    /// loaded AND [execution].enabled=true. None = settle is paper-only.
+    /// Sells fire BEFORE the call row's status flips (`withdrew`/`failed`/
+    /// `expired`) so the on-chain action precedes the public verdict.
+    executor: Option<Arc<crate::execution::ExecutionCtx>>,
 }
 
 impl BackgroundScanner {
@@ -56,7 +61,16 @@ impl BackgroundScanner {
             running: Arc::new(AtomicBool::new(false)),
             notifier: None,
             pumpportal_health: None,
+            executor: None,
         }
+    }
+
+    /// Attach trade-execution capability. Sells will fire on settle-decided
+    /// outcomes when this is set AND ctx.cfg.enabled is true. Idempotent
+    /// per-call via DB single-flight; safe under restart.
+    pub fn with_executor(mut self, ctx: Arc<crate::execution::ExecutionCtx>) -> Self {
+        self.executor = Some(ctx);
+        self
     }
 
     pub fn with_pumpportal_health(
@@ -1050,9 +1064,81 @@ impl BackgroundScanner {
                 continue;
             };
 
+            // Real-money sell gating. If the call has a buy_signature
+            // (real position open) and execution is enabled, fire the
+            // sell first, BEFORE flipping the call's status to a paper
+            // verdict. The sell either succeeds (proceed to status flip)
+            // or fails this cycle (skip status flip, settle retries
+            // next cycle until sell_attempt_count hits cap).
+            let mut paper_only = true;
+            if let Some(exec) = self.executor.as_ref() {
+                if exec.cfg.enabled
+                    && self.db.call_has_buy(call.id).unwrap_or(false)
+                    && !self.db.call_has_sell(call.id).unwrap_or(false)
+                {
+                    paper_only = false;
+                    let attempts = self.db.get_sell_attempt_count(call.id).unwrap_or(0);
+                    if attempts >= exec.cfg.sell_retry_max {
+                        // Retry cap exhausted — flip the row to failed
+                        // with a stuck-position note for manual exit. The
+                        // sell will not be retried automatically.
+                        let stuck_note = format!(
+                            "{:+.1}% · stuck position — manual exit (sells failed {}× / cap {})",
+                            pct, attempts, exec.cfg.sell_retry_max
+                        );
+                        let _ = self.db.fail_call(&call.mint, current_price, &stuck_note);
+                        tracing::warn!(
+                            "settle: stuck position on call {} ({}) after {} sell attempts — manual exit required",
+                            call.id, call.symbol, attempts
+                        );
+                        continue;
+                    }
+                    // Pull the buy-time token amount as the sell quantity.
+                    // Survives RPC weather (no live SPL balance fetch needed).
+                    let token_amount = self.db.get_buy_token_amount(call.id).unwrap_or(None).unwrap_or(0.0);
+                    if token_amount <= 0.0 {
+                        tracing::warn!(
+                            "settle: call {} has buy_signature but buy_token_received is 0 — skipping sell",
+                            call.id
+                        );
+                        continue;
+                    }
+                    let mcap_for_sell = call.entry_mcap_usd; // for ledger record only
+                    let sell_result = crate::execution::execute_sell_for_call(
+                        &exec.http,
+                        &exec.rpc,
+                        &self.db,
+                        &exec.keypair,
+                        call.id,
+                        &call.mint,
+                        token_amount,
+                        exec.cfg.slippage_bps,
+                        exec.priority_fee_lamports,
+                        exec.jito_tip_lamports,
+                        current_price,
+                        mcap_for_sell,
+                    )
+                    .await;
+                    if sell_result.is_err() {
+                        // Failure was already logged + record_sell_failure
+                        // bumped the attempt counter inside execute_sell_for_call.
+                        // Leave the call active so the next cycle retries.
+                        tracing::info!(
+                            "settle: sell deferred for call {} — will retry next cycle (attempt {})",
+                            call.id, attempts + 1
+                        );
+                        continue;
+                    }
+                }
+            }
+
             // Apply DB write per outcome. Each helper is idempotent on the
             // (mint, status='active') unique partial index — safe under any
-            // double-fire race with another scan cycle.
+            // double-fire race with another scan cycle. paper_only=true
+            // means there was no real position to sell; status flip stands
+            // alone. paper_only=false + we got here means the sell already
+            // confirmed and we proceed to mirror the outcome publicly.
+            let _ = paper_only; // silence: kept for future telemetry
             let db_ok = match status {
                 "withdrew" => self.db.close_call(&call.mint, current_price, &exit_note),
                 "failed" => self.db.fail_call(&call.mint, current_price, &exit_note),

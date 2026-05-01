@@ -303,6 +303,11 @@ pub struct Notifier {
     /// run a snapshot now instead of waiting for the next 300s tick.
     /// `None` when the publisher isn't configured.
     publish_kick: Option<crate::publisher::PublishKick>,
+    /// Optional trade-execution context. Some(_) only when
+    /// PHOTON_PRIVATE_KEY env var is set AND [execution] config block
+    /// has enabled=true. None = paper-only mode, the auto-call path
+    /// inserts rows + posts cards but never signs trades.
+    executor: Option<Arc<crate::execution::ExecutionCtx>>,
 }
 
 impl Notifier {
@@ -321,7 +326,21 @@ impl Notifier {
             halted: Arc::new(AtomicBool::new(false)),
             signal_threshold_override: Arc::new(AtomicI32::new(0)),
             publish_kick,
+            executor: None,
         })
+    }
+
+    /// Attach trade-execution capability. Call once at boot when
+    /// PHOTON_PRIVATE_KEY + [execution] config are both wired. Mutates
+    /// in place because Notifier is instantiated, then optionally
+    /// upgraded — same pattern as `with_notifier` on the scanner.
+    pub fn with_executor(mut self, ctx: Arc<crate::execution::ExecutionCtx>) -> Self {
+        self.executor = Some(ctx);
+        self
+    }
+
+    pub fn executor(&self) -> Option<&Arc<crate::execution::ExecutionCtx>> {
+        self.executor.as_ref()
     }
 
     /// Wake the publisher to run an immediate snapshot. Coalesces with
@@ -1392,7 +1411,7 @@ impl Notifier {
                     "notifier",
                     a.tx_rate,
                 );
-                if let Ok(Some(_)) = inserted {
+                if let Ok(Some(call_id)) = inserted {
                     // Align expires_at with the horizon-based settling window
                     // (scanner::settle_calls). Without this, the UI badges a
                     // misleading "13d left" on every call while the settling
@@ -1409,6 +1428,23 @@ impl Notifier {
                     // New auto-call landed — wake the publisher so the site
                     // shows it within ~30s instead of waiting on the 300s tick.
                     self.kick_publisher();
+
+                    // Real-money path: if execution is wired AND enabled,
+                    // spawn an async buy bound to this call. Sized adaptively
+                    // from the wallet's current SOL balance × the bucket's
+                    // size_pct. Single-flight via mark_buy_attempt; settle
+                    // path waits on buy_signature before any sell decision.
+                    if let Some(exec) = self.executor.clone() {
+                        if exec.cfg.enabled {
+                            let mint = a.address.clone();
+                            let entry_price = price.unwrap_or(0.0);
+                            let mcap_for_record = mcap;
+                            let horizon_tag = auto_horizon_tag.to_string();
+                            tokio::spawn(async move {
+                                spawn_buy(exec, call_id, mint, horizon_tag, entry_price, mcap_for_record).await;
+                            });
+                        }
+                    }
                 }
             }
             Some(delivery) if delivery.status == "active" => {
@@ -1913,4 +1949,63 @@ impl Notifier {
         }
         Ok(())
     }
+}
+
+/// Spawn a single buy attempt for a freshly-inserted call. Pulls live wallet
+/// balance + open-position count + daily spend so the size is right at this
+/// moment. Single-flight via `db.mark_buy_attempt` inside
+/// `execute_buy_for_call`; concurrent calls for the same call_id collapse
+/// into one. Logs but does not propagate errors — a buy failure shouldn't
+/// kill the calling task.
+async fn spawn_buy(
+    exec: Arc<crate::execution::ExecutionCtx>,
+    call_id: i64,
+    mint: String,
+    horizon_tag: String,
+    price_usd: f64,
+    mcap_usd: f64,
+) {
+    let bal = match exec.wallet_sol_balance().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("spawn_buy call {}: wallet_sol_balance failed: {}", call_id, e);
+            let _ = exec.db.record_buy_failure(call_id, &format!("balance fetch failed: {}", e));
+            return;
+        }
+    };
+    let day_start = chrono::Utc::now().timestamp() - 86_400;
+    let open = exec.db.count_open_positions().unwrap_or(0);
+    let daily = exec.db.sum_daily_buy_sol(day_start).unwrap_or(0.0);
+    let size = match crate::execution::derive_position_size_sol(
+        &exec.cfg,
+        &horizon_tag,
+        bal,
+        open,
+        daily,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                "spawn_buy call {} ({}) skipped: {} (bal={:.4} open={} daily={:.4})",
+                call_id, horizon_tag, e, bal, open, daily
+            );
+            let _ = exec.db.record_buy_failure(call_id, &format!("sizing skipped: {}", e));
+            return;
+        }
+    };
+    crate::execution::execute_buy_for_call(
+        &exec.http,
+        &exec.rpc,
+        &exec.db,
+        &exec.keypair,
+        call_id,
+        &mint,
+        size,
+        exec.cfg.slippage_bps,
+        exec.priority_fee_lamports,
+        exec.jito_tip_lamports,
+        price_usd,
+        mcap_usd,
+    )
+    .await;
 }

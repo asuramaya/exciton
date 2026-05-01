@@ -142,15 +142,64 @@ async fn main() -> Result<()> {
     // becomes a no-op).
     let publish_kick: publisher::PublishKick = Arc::new(tokio::sync::Notify::new());
 
+    // Trade-execution context. Built once at boot when both PHOTON_PRIVATE_KEY
+    // env var is present AND [execution] config block exists. Either missing
+    // means photon stays paper-only (no real swaps fire from auto-call paths).
+    // The cfg.enabled flag gates further — present keypair + config but
+    // enabled=false means the bundle is constructed for future use but
+    // calls.spawn_buy / settle.execute_sell short-circuit.
+    let executor_arc: Option<Arc<execution::ExecutionCtx>> = match config.execution.clone() {
+        Some(exec_cfg) => {
+            match execution::ExecutionCtx::from_env(
+                db.clone(),
+                rpc.clone(),
+                exec_cfg.clone(),
+                config.risk.priority_fee_lamports,
+                config.risk.jito_tip_lamports,
+            ) {
+                Ok(ctx) => {
+                    tracing::info!(
+                        "execution context loaded (enabled={}, wallet={}, daily_cap={:.4} SOL, max_open={})",
+                        exec_cfg.enabled,
+                        ctx.wallet_pubkey,
+                        exec_cfg.max_daily_position_sol,
+                        exec_cfg.max_simultaneous_positions
+                    );
+                    if !exec_cfg.enabled {
+                        tracing::warn!("execution disabled in config — paper-only mode");
+                    }
+                    Some(Arc::new(ctx))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "execution context init failed: {} — continuing in paper-only mode",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::info!("[execution] block absent — paper-only mode");
+            None
+        }
+    };
+
     let mut notifier_arc: Option<Arc<notifier::Notifier>> = None;
     if let Some(tg_cfg) = config.telegram.clone() {
         let cfg = tg_cfg;
         match notifier::Notifier::new(cfg.clone(), db.clone(), Some(publish_kick.clone())) {
-            Ok(n) => {
+            Ok(mut n) => {
                 let enabled = cfg.enabled;
                 tracing::info!("Telegram notifier configured (enabled={})", enabled);
+                if let Some(exec) = executor_arc.as_ref() {
+                    n = n.with_executor(exec.clone());
+                }
                 let arc = Arc::new(n);
                 scanner = scanner.with_notifier(arc.clone());
+                if let Some(exec) = executor_arc.as_ref() {
+                    scanner = scanner.with_executor(exec.clone());
+                }
                 notifier_arc = Some(arc);
 
                 // DM bot (long-poll) — started alongside the notifier when dm_enabled.

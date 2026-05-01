@@ -399,3 +399,260 @@ pub async fn sell(
     )
     .await
 }
+
+// ── Shared execution context ──────────────────────────────────────────────────
+//
+// Single Arc-clonable bundle carried by both Notifier (buy on call-fire)
+// and BackgroundScanner (sell on settle-decision). When None at the
+// component level, that component stays paper-only — buys/sells aren't
+// spawned. Construction happens once at boot in main.rs after the
+// keypair loads from PHOTON_PRIVATE_KEY; absence of the env var keeps
+// photon in safe paper mode.
+
+pub struct ExecutionCtx {
+    pub db: Arc<Db>,
+    pub rpc: Arc<RpcRouter>,
+    pub http: Client,
+    pub keypair: Keypair,
+    pub cfg: crate::config::ExecutionConfig,
+    pub priority_fee_lamports: u64,
+    pub jito_tip_lamports: u64,
+    /// Wallet pubkey as a string for balance queries.
+    pub wallet_pubkey: String,
+}
+
+impl std::fmt::Debug for ExecutionCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionCtx")
+            .field("enabled", &self.cfg.enabled)
+            .field("wallet_pubkey", &self.wallet_pubkey)
+            .field("priority_fee_lamports", &self.priority_fee_lamports)
+            .field("jito_tip_lamports", &self.jito_tip_lamports)
+            .finish()
+    }
+}
+
+impl ExecutionCtx {
+    /// Build from boot config. Loads PHOTON_PRIVATE_KEY env var; returns
+    /// Err when missing OR when the secret is malformed. Caller decides
+    /// whether to fail boot or continue in paper mode.
+    pub fn from_env(
+        db: Arc<Db>,
+        rpc: Arc<RpcRouter>,
+        cfg: crate::config::ExecutionConfig,
+        priority_fee_lamports: u64,
+        jito_tip_lamports: u64,
+    ) -> Result<Self> {
+        let keypair = load_keypair()?;
+        let wallet_pubkey = keypair.pubkey().to_string();
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("photon/0.1")
+            .build()?;
+        Ok(Self {
+            db,
+            rpc,
+            http,
+            keypair,
+            cfg,
+            priority_fee_lamports,
+            jito_tip_lamports,
+            wallet_pubkey,
+        })
+    }
+
+    /// Live SOL balance for the trading wallet. Wraps RPC in a tight
+    /// timeout so a degraded fleet can't block trade decisions.
+    pub async fn wallet_sol_balance(&self) -> Result<f64> {
+        let lamports = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.rpc.get_balance(&self.wallet_pubkey),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("get_balance timed out"))??;
+        Ok(lamports as f64 / 1_000_000_000.0)
+    }
+}
+
+// ── Call-aware adaptive wrappers ──────────────────────────────────────────────
+//
+// Higher-level wrappers that bind execution to a specific call_id, enforce the
+// adaptive sizing + daily/concurrent budgets, and write the result back to the
+// `calls` row. Used by notifier::process_token (buy on call-fire) and
+// scanner::settle_calls (sell on outcome-decision).
+//
+// All single-flight: re-entry on the same call_id is a no-op via DB-level
+// guards (mark_buy_attempt unique-flight, sell_signature null-check). Safe
+// across container restarts: state lives in the calls row.
+
+/// Pump.fun + most pumpswap-graduated tokens use 6 decimals. Hard-coded
+/// for now since `metadata.rs` doesn't expose decimals; if a non-pump
+/// token enters the call universe we'd need to pull decimals from the
+/// mint account.
+const DEFAULT_TOKEN_DECIMALS: u8 = 6;
+
+/// Compute the SOL size for a bucket given current wallet balance.
+/// Returns Ok(amount) when within all caps, Err with reason otherwise.
+pub fn derive_position_size_sol(
+    cfg: &crate::config::ExecutionConfig,
+    horizon_tag: &str,
+    wallet_sol_balance: f64,
+    open_positions: i64,
+    daily_buy_sol_so_far: f64,
+) -> Result<f64> {
+    if !cfg.enabled {
+        bail!("execution disabled");
+    }
+    if open_positions >= cfg.max_simultaneous_positions {
+        bail!(
+            "max_simultaneous_positions reached ({}/{})",
+            open_positions,
+            cfg.max_simultaneous_positions
+        );
+    }
+    if daily_buy_sol_so_far >= cfg.max_daily_position_sol {
+        bail!(
+            "max_daily_position_sol reached ({:.4}/{:.4})",
+            daily_buy_sol_so_far,
+            cfg.max_daily_position_sol
+        );
+    }
+    let pct = cfg.size_pct_for_horizon(horizon_tag);
+    let raw = wallet_sol_balance * pct / 100.0;
+    let capped_daily = (cfg.max_daily_position_sol - daily_buy_sol_so_far).max(0.0);
+    let size = raw.min(capped_daily);
+    if size < cfg.min_trade_sol {
+        bail!(
+            "size {:.6} SOL below min_trade_sol {:.6} (wallet {:.4} × {:.1}%)",
+            size,
+            cfg.min_trade_sol,
+            wallet_sol_balance,
+            pct
+        );
+    }
+    Ok(size)
+}
+
+/// Execute a buy bound to a call row. Idempotent: re-entry while a buy is
+/// already attempted/recorded is a no-op. Records buy_signature/sol_spent/
+/// token_received on success; records buy_failed_reason + voids the call
+/// on failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_buy_for_call(
+    http: &Client,
+    rpc: &Arc<RpcRouter>,
+    db: &Arc<Db>,
+    keypair: &Keypair,
+    call_id: i64,
+    mint: &str,
+    sol_amount: f64,
+    slippage_bps: u16,
+    priority_fee_lamports: u64,
+    jito_tip_lamports: u64,
+    price_usd: f64,
+    mcap_usd: f64,
+) {
+    let now = chrono::Utc::now().timestamp();
+    // Single-flight: only one task can take this call's buy slot.
+    match db.mark_buy_attempt(call_id, now) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!("execute_buy_for_call: call {} already attempted", call_id);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("execute_buy_for_call: mark_buy_attempt failed: {}", e);
+            return;
+        }
+    }
+    match buy(
+        http,
+        rpc,
+        db,
+        keypair,
+        mint,
+        sol_amount,
+        slippage_bps,
+        priority_fee_lamports,
+        jito_tip_lamports,
+        price_usd,
+        mcap_usd,
+    )
+    .await
+    {
+        Ok(res) => {
+            if let Err(e) = db.record_buy(call_id, &res.signature, res.sol_ui, res.token_ui) {
+                tracing::warn!("record_buy failed for call {}: {}", call_id, e);
+            } else {
+                tracing::info!(
+                    "execute_buy_for_call: call {} BUY filled {:.4} SOL → {:.2} tokens sig={}",
+                    call_id, res.sol_ui, res.token_ui, res.signature
+                );
+            }
+        }
+        Err(e) => {
+            let reason = format!("{}", e).chars().take(180).collect::<String>();
+            if let Err(db_err) = db.record_buy_failure(call_id, &reason) {
+                tracing::warn!("record_buy_failure failed for call {}: {}", call_id, db_err);
+            }
+            tracing::warn!("execute_buy_for_call: call {} BUY failed: {}", call_id, reason);
+        }
+    }
+}
+
+/// Execute a sell bound to a call row. Idempotent: re-entry while sell already
+/// recorded is a no-op. Increments sell_attempt_count on failure for the
+/// retry-cap logic in settle.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_sell_for_call(
+    http: &Client,
+    rpc: &Arc<RpcRouter>,
+    db: &Arc<Db>,
+    keypair: &Keypair,
+    call_id: i64,
+    mint: &str,
+    token_amount_ui: f64,
+    slippage_bps: u16,
+    priority_fee_lamports: u64,
+    jito_tip_lamports: u64,
+    price_usd: f64,
+    mcap_usd: f64,
+) -> Result<()> {
+    if db.call_has_sell(call_id).unwrap_or(false) {
+        return Ok(());
+    }
+    match sell(
+        http,
+        rpc,
+        db,
+        keypair,
+        mint,
+        token_amount_ui,
+        DEFAULT_TOKEN_DECIMALS,
+        slippage_bps,
+        priority_fee_lamports,
+        jito_tip_lamports,
+        price_usd,
+        mcap_usd,
+    )
+    .await
+    {
+        Ok(res) => {
+            if let Err(e) = db.record_sell(call_id, &res.signature, res.token_ui, res.sol_ui) {
+                tracing::warn!("record_sell failed for call {}: {}", call_id, e);
+            } else {
+                tracing::info!(
+                    "execute_sell_for_call: call {} SELL filled {:.2} tokens → {:.4} SOL sig={}",
+                    call_id, res.token_ui, res.sol_ui, res.signature
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let reason = format!("{}", e).chars().take(180).collect::<String>();
+            let _ = db.record_sell_failure(call_id, &reason);
+            tracing::warn!("execute_sell_for_call: call {} SELL failed: {}", call_id, reason);
+            Err(e)
+        }
+    }
+}

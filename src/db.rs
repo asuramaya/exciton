@@ -444,6 +444,24 @@ impl Db {
             [],
         );
 
+        // Trade-execution columns. NULL = not yet executed (or paper-only
+        // call). When execution.enabled is on, notifier spawns a buy on
+        // call-fire and writes the buy_* columns on confirmation; settle
+        // spawns a sell when the outcome is decided and writes sell_*
+        // before the row's status flips to withdrew/failed/expired. The
+        // call lifecycle stays paper-compatible — these columns are
+        // additive metadata. Pre-existing rows get NULL.
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN buy_signature TEXT", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN buy_sol_spent REAL", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN buy_token_received REAL", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN buy_attempted_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN buy_failed_reason TEXT", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_signature TEXT", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_token_sold REAL", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_sol_received REAL", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_attempt_count INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_last_error TEXT", []);
+
         // Bonding-curve observation snapshots. Pre-graduation pump.fun
         // tokens have no DexScreener pair, so token_snapshots can't hold
         // their state. We track them here from chain reads of the curve
@@ -2346,6 +2364,183 @@ impl Db {
                 }))
             }
         }
+    }
+
+    // ── Trade execution helpers ───────────────────────────────────────
+    //
+    // The trade columns on `calls` are additive: they record the on-chain
+    // result of the buy/sell against an existing call row, but the row's
+    // status is still owned by the paper lifecycle. Helpers below are
+    // idempotent — re-firing a buy or sell after a successful record is
+    // a no-op via the WHERE-clause guards.
+
+    /// Mark that we've attempted a buy on this call (so retries don't
+    /// double-fire). Sets `buy_attempted_at` to now. Returns false if
+    /// the call already has a buy_signature OR a buy_attempted_at
+    /// (single-flight).
+    pub fn mark_buy_attempt(&self, call_id: i64, ts: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE calls SET buy_attempted_at = ?2
+             WHERE id = ?1
+               AND buy_signature IS NULL
+               AND buy_attempted_at IS NULL",
+            rusqlite::params![call_id, ts],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record a successful buy. Idempotent — if buy_signature already set,
+    /// this is a no-op.
+    pub fn record_buy(
+        &self,
+        call_id: i64,
+        signature: &str,
+        sol_spent: f64,
+        token_received: f64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calls SET buy_signature = ?2,
+                              buy_sol_spent = ?3,
+                              buy_token_received = ?4,
+                              buy_failed_reason = NULL
+             WHERE id = ?1 AND buy_signature IS NULL",
+            rusqlite::params![call_id, signature, sol_spent, token_received],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed buy. The call row is also voided so the front-end
+    /// doesn't show a paper-positive call we never actually entered.
+    pub fn record_buy_failure(&self, call_id: i64, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calls SET buy_failed_reason = ?2,
+                              status = 'voided',
+                              exit_note = ?3
+             WHERE id = ?1 AND buy_signature IS NULL",
+            rusqlite::params![call_id, reason, format!("buy failed: {}", reason)],
+        )?;
+        Ok(())
+    }
+
+    /// Record a successful sell. Caller is responsible for then transitioning
+    /// the call status to withdrew/failed/expired via close_call/fail_call/
+    /// expire_call as the paper outcome dictates.
+    pub fn record_sell(
+        &self,
+        call_id: i64,
+        signature: &str,
+        token_sold: f64,
+        sol_received: f64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calls SET sell_signature = ?2,
+                              sell_token_sold = ?3,
+                              sell_sol_received = ?4,
+                              sell_last_error = NULL
+             WHERE id = ?1 AND sell_signature IS NULL",
+            rusqlite::params![call_id, signature, token_sold, sol_received],
+        )?;
+        Ok(())
+    }
+
+    /// Record a sell failure. Increments attempt counter so the settle
+    /// loop can decide when to give up and mark the call failed for
+    /// manual operator exit.
+    pub fn record_sell_failure(&self, call_id: i64, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calls SET sell_attempt_count = sell_attempt_count + 1,
+                              sell_last_error = ?2
+             WHERE id = ?1 AND sell_signature IS NULL",
+            rusqlite::params![call_id, reason],
+        )?;
+        Ok(())
+    }
+
+    /// Number of currently-active calls whose buy fired but sell hasn't.
+    /// Used to enforce max_simultaneous_positions.
+    pub fn count_open_positions(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calls
+             WHERE buy_signature IS NOT NULL
+               AND sell_signature IS NULL
+               AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Sum of SOL spent on buys in the last 24h. Used to enforce
+    /// max_daily_position cap.
+    pub fn sum_daily_buy_sol(&self, since: i64) -> Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let s: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(buy_sol_spent),0) FROM calls
+             WHERE buy_signature IS NOT NULL AND called_at >= ?1",
+            rusqlite::params![since],
+            |r| r.get(0),
+        )?;
+        Ok(s)
+    }
+
+    /// Look up the sell-amount source for a call: returns the token amount
+    /// we recorded at buy time. None if no buy was made (paper call).
+    pub fn get_buy_token_amount(&self, call_id: i64) -> Result<Option<f64>> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<f64> = conn
+            .query_row(
+                "SELECT buy_token_received FROM calls WHERE id = ?1",
+                rusqlite::params![call_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v)
+    }
+
+    /// Has this call's buy fired (signature present)? Used by settle
+    /// to gate sell attempts.
+    pub fn call_has_buy(&self, call_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT buy_signature FROM calls WHERE id = ?1",
+                rusqlite::params![call_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(v.is_some())
+    }
+
+    /// Has this call's sell fired? Single-flight guard for sell spawn.
+    pub fn call_has_sell(&self, call_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT sell_signature FROM calls WHERE id = ?1",
+                rusqlite::params![call_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(v.is_some())
+    }
+
+    /// Sell attempts so far on this call (for retry-cap enforcement).
+    pub fn get_sell_attempt_count(&self, call_id: i64) -> Result<i32> {
+        let conn = self.conn.lock().unwrap();
+        let n: i32 = conn.query_row(
+            "SELECT sell_attempt_count FROM calls WHERE id = ?1",
+            rusqlite::params![call_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 }
 
