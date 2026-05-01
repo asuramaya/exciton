@@ -849,6 +849,28 @@ impl BackgroundScanner {
             let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
             let age = now - call.called_at;
 
+            // Take-profit pct: use the higher of (market price, latest on-chain
+            // snapshot price) — DexScreener feeds lag during fast spikes by
+            // 30-90s, but analyze_token writes on-chain price into snapshots
+            // every cycle. HSBC peaked +31.3% on-chain but DexScreener never
+            // showed it before the dump → "scalp +30 done" never fired and we
+            // ate -79%. Stop-loss still uses market pct (be conservative on
+            // stops, liberal on takes).
+            let take_pct = self
+                .db
+                .get_latest_snapshot(&call.mint)
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    if s.price_usd > 0.0 && call.entry_price_usd > 0.0 {
+                        Some((s.price_usd / call.entry_price_usd - 1.0) * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .map(|snap_pct| pct.max(snap_pct))
+                .unwrap_or(pct);
+
             // Event-driven exits — final calibration after live observation
             // 2026-04-29:
             //   - dev_selling base rate is +10.5% / 30min (NOT bearish)
@@ -882,10 +904,27 @@ impl BackgroundScanner {
                 })
                 .unwrap_or(false);
 
-            let event_exit: Option<(&'static str, String)> = if severe_dev_selling {
+            // Event-exit gating is now horizon-aware. Goblin (LONG, called
+            // 2026-05-01) closed at -3.6% in 17min only because classification
+            // flipped — peak +0.5%, trough -5.4%. LONG horizon is supposed to
+            // be patient; firing on classification flip alone defeats it.
+            // Wish (LONG) banked +49.8% via "structural collapse" — right
+            // outcome for the wrong reason; could have been -50% just as
+            // easily. SCALP firing on flip is correct (it's a scalp); SHORT
+            // requires confirmation; LONG ignores the event-exit and respects
+            // only its own ladder (-50% / +tiers / 30d).
+            let event_exit: Option<(&'static str, String)> = if is_long {
+                None
+            } else if severe_dev_selling {
                 Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
             } else if terminal_class {
-                Some(("failed", format!("{:+.1}% · structural collapse", pct)))
+                if is_scalp {
+                    Some(("failed", format!("{:+.1}% · structural collapse", pct)))
+                } else if pct <= -10.0 {
+                    Some(("failed", format!("{:+.1}% · structural collapse", pct)))
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -904,10 +943,10 @@ impl BackgroundScanner {
                 //   - Added "stale-no-pump": if held >= 30min AND never reached
                 //     +15% AND currently red, exit. NICETRUMP (held 39min,
                 //     never +20, exited -97.6) was the textbook miss.
-                if pct >= 50.0 {
-                    Some(("withdrew", format!("{:+.1}% · scalp 1.5x", pct)))
-                } else if pct >= 30.0 {
-                    Some(("withdrew", format!("{:+.1}% · scalp +30 done", pct)))
+                if take_pct >= 50.0 {
+                    Some(("withdrew", format!("{:+.1}% · scalp 1.5x", take_pct)))
+                } else if take_pct >= 30.0 {
+                    Some(("withdrew", format!("{:+.1}% · scalp +30 done", take_pct)))
                 } else if pct <= -30.0 {
                     Some(("failed", format!("{:+.1}% · scalp stop", pct)))
                 } else if age >= 30 * 60 && pct < 0.0 {
@@ -931,24 +970,29 @@ impl BackgroundScanner {
                     None
                 }
             } else if is_long {
-                // LONG stop tightened from -70 → -50 (backtest: -50 stop adds
-                // +14% per call mean, since most -70 hits had already passed
-                // through -50 with no recovery). Tiered take-profits are
-                // handled at the +40/+80/+150 levels — first-tier here as a
-                // safety against runaway holds.
+                // LONG ladder now actually tiered. PsyopAnime peaked +68.9%,
+                // closed -20.1% — pure unrealized profit deleted. The +40/+80
+                // tiers were claimed in a comment but never implemented. Each
+                // tier just closes the call (we don't track partials at the
+                // call-row level today); operator-discretionary scaling is
+                // outside the auto-settle path.
                 if pct <= -50.0 {
                     Some(("failed", format!("{:+.1}% · thesis broke", pct)))
-                } else if pct >= 150.0 {
-                    Some(("withdrew", format!("{:+.1}% · 2.5x done", pct)))
+                } else if take_pct >= 150.0 {
+                    Some(("withdrew", format!("{:+.1}% · 2.5x done", take_pct)))
+                } else if take_pct >= 80.0 {
+                    Some(("withdrew", format!("{:+.1}% · long second take", take_pct)))
+                } else if take_pct >= 40.0 {
+                    Some(("withdrew", format!("{:+.1}% · long first take", take_pct)))
                 } else if age >= 30 * 86_400 {
                     Some(("expired", format!("{:+.1}% · 30d hold complete", pct)))
                 } else {
                     None
                 }
-            } else if pct >= 100.0 {
-                Some(("withdrew", format!("{:+.1}% · 2x done", pct)))
-            } else if pct >= 50.0 {
-                Some(("withdrew", format!("{:+.1}% · took the win", pct)))
+            } else if take_pct >= 100.0 {
+                Some(("withdrew", format!("{:+.1}% · 2x done", take_pct)))
+            } else if take_pct >= 50.0 {
+                Some(("withdrew", format!("{:+.1}% · took the win", take_pct)))
             } else if age <= 30 * 60 && pct <= -25.0 {
                 // Fast-fail: SHORT calls that drop ≥25% within the first 30
                 // minutes are dead. Memecoins don't recover from a -25% in
