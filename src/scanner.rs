@@ -833,6 +833,7 @@ impl BackgroundScanner {
             let h = horizon::parse(&call.note);
             let is_long = h.is_long();
             let is_scalp = h.is_scalp();
+            let is_moonshot = h.is_moonshot();
             // Try batch cache first; fall back to per-token fetch when
             // DexScreener doesn't return the mint (unindexed fresh-grad
             // edge case). Maintains correctness while keeping the fast path.
@@ -904,17 +905,26 @@ impl BackgroundScanner {
                 })
                 .unwrap_or(false);
 
-            // Event-exit gating is now horizon-aware. Goblin (LONG, called
+            // Event-exit gating is horizon-aware. Goblin (LONG, called
             // 2026-05-01) closed at -3.6% in 17min only because classification
             // flipped — peak +0.5%, trough -5.4%. LONG horizon is supposed to
             // be patient; firing on classification flip alone defeats it.
             // Wish (LONG) banked +49.8% via "structural collapse" — right
             // outcome for the wrong reason; could have been -50% just as
-            // easily. SCALP firing on flip is correct (it's a scalp); SHORT
-            // requires confirmation; LONG ignores the event-exit and respects
-            // only its own ladder (-50% / +tiers / 30d).
-            let event_exit: Option<(&'static str, String)> = if is_long {
-                None
+            // easily. MOONSHOT same patience — DEV→STAIRCASE flip is GOOD
+            // (the moonshot maturing); only UNSAFE/freeze/permdelegate +
+            // confirming price drop is fatal.
+            let event_exit: Option<(&'static str, String)> = if is_long || is_moonshot {
+                // LONG + MOONSHOT: only severe dev exit (rug-detect) and
+                // UNSAFE-class flips with confirming price drop ≥-20% can
+                // close. Lets the take/stop ladder own normal volatility.
+                if severe_dev_selling && pct <= -20.0 {
+                    Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
+                } else if terminal_class && pct <= -20.0 {
+                    Some(("failed", format!("{:+.1}% · structural collapse", pct)))
+                } else {
+                    None
+                }
             } else if severe_dev_selling {
                 Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
             } else if terminal_class {
@@ -966,6 +976,25 @@ impl BackgroundScanner {
                     }
                 } else if age >= 4 * 3600 {
                     Some(("expired", format!("{:+.1}% · scalp timeout", pct)))
+                } else {
+                    None
+                }
+            } else if is_moonshot {
+                // Bucket B — DEVELOPING-class right-tail capture. 397-entry
+                // backtest gave +29.7% mean realized EV with hold-to-stop
+                // (-60% / 72h / no upper take). 4.3% of entries hit peak
+                // ≥+1000% — that subset carries the EV. Single-position
+                // infra: no partials; full-take @ +500% balances right-
+                // tail capture against bird-in-hand variance reduction.
+                // Entries below +500 ride to either -60 stop or 72h
+                // expiration. Take_pct used so on-chain spike captures
+                // through DexScreener lag.
+                if pct <= -60.0 {
+                    Some(("failed", format!("{:+.1}% · moonshot stop", pct)))
+                } else if take_pct >= 500.0 {
+                    Some(("withdrew", format!("{:+.1}% · moonshot 6x", take_pct)))
+                } else if age >= 72 * 3600 {
+                    Some(("expired", format!("{:+.1}% · moonshot timeout", pct)))
                 } else {
                     None
                 }
@@ -1034,6 +1063,8 @@ impl BackgroundScanner {
                 "SCALP"
             } else if is_long {
                 "LONG"
+            } else if is_moonshot {
+                "MOONSHOT"
             } else {
                 "SHORT"
             };

@@ -16,11 +16,18 @@
 /// Scalp is a separate ultra-short bucket for shallow-mcap tokens that just
 /// printed a 1h+ move. Different gates (lower mcap floor) and different
 /// settle ladder (+30/+60/-30, 4h timeout) than Short.
+///
+/// Moonshot is the right-tail capture bucket: DEVELOPING-class entries at
+/// sub-$80k mcap with concentrated holders. The signal shape is the inverse
+/// of the SCALP/SHORT shape — high concentration + low confidence is the
+/// opportunity, not the threat. Backtest n=397 entries gave +29.7% mean EV
+/// vs +10.8% for SHORT. Held for 72h, take @ +200%, hard stop -60%.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Horizon {
     Scalp,
     Short,
     Long,
+    Moonshot,
     Unknown,
 }
 
@@ -35,12 +42,17 @@ impl Horizon {
         matches!(self, Horizon::Scalp)
     }
 
+    pub fn is_moonshot(self) -> bool {
+        matches!(self, Horizon::Moonshot)
+    }
+
     /// Display string for TG card headers. None means no badge shown.
     pub fn display(self) -> Option<&'static str> {
         match self {
             Horizon::Scalp => Some("SCALP"),
             Horizon::Short => Some("SHORT TERM"),
             Horizon::Long => Some("LONG TERM"),
+            Horizon::Moonshot => Some("MOONSHOT"),
             Horizon::Unknown => None,
         }
     }
@@ -52,6 +64,7 @@ impl Horizon {
             Horizon::Scalp => Some("horizon=SCALP"),
             Horizon::Short => Some("horizon=SHORT"),
             Horizon::Long => Some("horizon=LONG"),
+            Horizon::Moonshot => Some("horizon=MOONSHOT"),
             Horizon::Unknown => None,
         }
     }
@@ -61,7 +74,9 @@ impl Horizon {
 /// `horizon=SHORT` / `horizon=LONG` pattern — freeform mentions of
 /// "long" or "horizon" without the tag map to Unknown.
 pub fn parse(note: &str) -> Horizon {
-    if note.contains("horizon=SCALP") {
+    if note.contains("horizon=MOONSHOT") {
+        Horizon::Moonshot
+    } else if note.contains("horizon=SCALP") {
         Horizon::Scalp
     } else if note.contains("horizon=LONG") {
         Horizon::Long

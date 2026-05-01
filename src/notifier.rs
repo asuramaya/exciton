@@ -123,6 +123,42 @@ pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.40;
 pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 
 // =============================================================================
+// MOONSHOT GATES — DEVELOPING-class right-tail capture bucket.
+// =============================================================================
+// 2026-05-01: shipped. Backtest n=397 entries gave +29.7% mean realized EV
+// against hold-to-stop strategy (-60% stop, 72h timeout, no upper take).
+// 4.3% of entries hit peak ≥+1000% (best +3597%). 7.8% hit +300-1000%.
+// 15.4% hit +100-300%. The shape inverse to SCALP/SHORT — high-concentration
+// + low-confidence + sub-$80k mcap is the SIGNAL of organic accumulation,
+// not a threat.
+//
+// Position sizing critical because median is negative (~30% of entries lose
+// the full -60% stop). Right-tail carries the EV. Operator should size
+// MOONSHOT calls at 1/10th the position of Bucket A — the right tail
+// pays for the variance.
+//
+// Set MOONSHOT_ENABLED = false to disable the bucket without removing
+// constants (parallel to SCALP_ENABLED kill-switch convention).
+pub const MOONSHOT_ENABLED: bool = true;
+pub const MOONSHOT_REQUIRED_CLASS: &str = "DEVELOPING";
+pub const MOONSHOT_MIN_MCAP_USD: f64 = 5_000.0;
+pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
+// Top1 ceiling at 60% — the moonshot signal is concentrated holders
+// (early accumulation pattern), so we explicitly allow what SCALP/Bucket A
+// reject. Above 60% is honeypot territory (single wallet can dump).
+pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 60.0;
+pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 15;
+pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
+pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 50.0;
+// Forensics ceilings — even moonshots block on confirmed bundle/sniper
+// concentration. The shape we want is human-driven accumulation, not
+// programmatic launch-bot fills. Ceilings are looser than SHORT because
+// DEV-class tokens are pre-stabilization.
+pub const MOONSHOT_MAX_BUNDLE_PCT: f64 = 50.0;
+pub const MOONSHOT_MAX_SNIPER_PCT: f64 = 70.0;
+pub const MOONSHOT_MAX_INSIDER_PCT: f64 = 40.0;
+
+// =============================================================================
 // SCALP GATES — looser bucket for shallow tokens that just printed a 1h+ move.
 // Recalibrated 2026-04-29 from the 31-call backtest. Trump (+45.1, mcap 371k,
 // top1 9.3), ALEXCOIN (+44.8, mcap 115k, top1 11.7), BLIMP (+41.3, mcap 82k,
@@ -670,6 +706,73 @@ impl Notifier {
             && bs_ok
     }
 
+    /// Moonshot gate — Bucket B. DEVELOPING-class entries at sub-$80k mcap
+    /// where the SCALP/SHORT signal-shape is inverted: high concentration +
+    /// low confidence is the SIGNAL of organic accumulation, not the threat.
+    /// Backtest n=397 entries, +29.7% mean realized EV with hold-to-stop
+    /// (-60% / 72h, no upper take). Right-tail driven: 4.3% of entries hit
+    /// peak ≥+1000%, that subset carries the EV.
+    ///
+    /// Distinct gate path because the standard gate's holder/conf/class
+    /// constraints are inverse to what's wanted here.
+    pub fn should_moonshot_signal(
+        &self,
+        a: &TokenAnalysis,
+        meta: Option<&TokenMeta>,
+        first_seen: Option<i64>,
+    ) -> bool {
+        if !MOONSHOT_ENABLED {
+            return false;
+        }
+        if self.halted() {
+            return false;
+        }
+        let class = a.confidence.classification.as_str();
+        if class != MOONSHOT_REQUIRED_CLASS {
+            return false;
+        }
+        // Mcap window — the bonding-curve / fresh-grad zone where moonshots
+        // start. Above 80k they're already mid-pump; below 5k DexScreener
+        // hasn't indexed liquidity reliably.
+        let mcap_val = meta
+            .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+            .unwrap_or(0.0);
+        let mcap_ok = mcap_val >= MOONSHOT_MIN_MCAP_USD && mcap_val <= MOONSHOT_MAX_MCAP_USD;
+        // Holders 15-60 — under 15 is too thin to read the distribution,
+        // over 60 means the token already broke into a wider holder base
+        // and the next leg up is incremental, not exponential.
+        let holders_ok = (a.holder_count as i32) >= MOONSHOT_MIN_HOLDER_COUNT
+            && (a.holder_count as i32) <= MOONSHOT_MAX_HOLDER_COUNT;
+        // Top1 ceiling at 60% — explicit allowance for the concentrated-
+        // accumulation shape that SCALP/Bucket A reject. Above 60% is
+        // honeypot (single wallet can dump the whole supply).
+        let top1_ok = a.top_holder_pct < MOONSHOT_MAX_TOP_HOLDER_PCT;
+        // Velocity floor — moonshots have trading activity. A DEV-class
+        // token with no flow is just dead inventory.
+        let tx_rate_ok = a.tx_rate >= MOONSHOT_MIN_TX_RATE_PER_MIN;
+        // Forensics — looser than SHORT but still block confirmed bot-fill
+        // patterns (bundle/sniper/insider). Soft gate: unmeasured passes.
+        let bundle_ok = a.bundle_pct < MOONSHOT_MAX_BUNDLE_PCT;
+        let sniper_ok = a.sniper_pct < MOONSHOT_MAX_SNIPER_PCT;
+        let insider_ok = a.insider_pct < MOONSHOT_MAX_INSIDER_PCT;
+        // Age floor reused — token must exist long enough for organic
+        // distribution to form.
+        let now = chrono::Utc::now().timestamp();
+        let age_ok = first_seen.map_or(false, |fs| now - fs >= SIGNAL_MIN_TOKEN_AGE_SECS);
+        // No confidence floor — DEV-class median conf is 44 in the 50x+
+        // backtest cohort. Confidence is computed against post-stabilization
+        // shape; raw moonshot snapshots are pre-stabilization by definition.
+
+        mcap_ok
+            && holders_ok
+            && top1_ok
+            && tx_rate_ok
+            && bundle_ok
+            && sniper_ok
+            && insider_ok
+            && age_ok
+    }
+
     /// Decides when an open signal's verdict has collapsed.
     pub fn should_fail(&self, a: &TokenAnalysis, effective_conf: i32) -> bool {
         let class = a.confidence.classification.as_str();
@@ -1179,7 +1282,13 @@ impl Notifier {
                 let standard_pass = self.should_signal(a, effective_conf, meta.as_ref(), first_seen);
                 let scalp_pass = !standard_pass
                     && self.should_scalp_signal(a, meta.as_ref(), first_seen);
-                if !standard_pass && !scalp_pass {
+                // Moonshot gate fires only when the standard + scalp gates
+                // didn't (DEVELOPING class would never pass standard, since
+                // standard requires STAIRCASE/GRINDER/SPRING). Disjoint path.
+                let moonshot_pass = !standard_pass
+                    && !scalp_pass
+                    && self.should_moonshot_signal(a, meta.as_ref(), first_seen);
+                if !standard_pass && !scalp_pass && !moonshot_pass {
                     if let Some((gate, gap)) = self.classify_near_miss(a, effective_conf, meta.as_ref(), first_seen) {
                         let mom_delta = a.delta.as_ref().map(|d| d.momentum_delta);
                         let _ = self.db.insert_near_miss(
@@ -1258,7 +1367,9 @@ impl Notifier {
                 // are sit-on-it positions, not 6h swings. Without this tag,
                 // settle_calls() would expire ROTUS-class entries on its 6h
                 // SHORT timeout.
-                let auto_horizon = if scalp_pass {
+                let auto_horizon = if moonshot_pass {
+                    crate::horizon::Horizon::Moonshot
+                } else if scalp_pass {
                     crate::horizon::Horizon::Scalp
                 } else if mcap >= 1_000_000.0 {
                     crate::horizon::Horizon::Long
@@ -1290,6 +1401,7 @@ impl Notifier {
                         crate::horizon::Horizon::Scalp => 4 * 3600,
                         crate::horizon::Horizon::Short => 6 * 3600,
                         crate::horizon::Horizon::Long => 30 * 86_400,
+                        crate::horizon::Horizon::Moonshot => 72 * 3600,
                         crate::horizon::Horizon::Unknown => 14 * 86_400,
                     };
                     let expires = now + window_secs;

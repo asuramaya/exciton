@@ -1049,6 +1049,7 @@ impl DmBot {
             crate::horizon::Horizon::Scalp => 4 * 3600,
             crate::horizon::Horizon::Short => 6 * 3600,
             crate::horizon::Horizon::Long => 30 * 86_400,
+            crate::horizon::Horizon::Moonshot => 72 * 3600,
             crate::horizon::Horizon::Unknown => self.call_expiry_days.max(0) * 86_400,
         };
         let expires_at = if window_secs > 0 {
@@ -1189,6 +1190,7 @@ impl DmBot {
 
             let term = match crate::horizon::parse(&c.note) {
                 crate::horizon::Horizon::Long => " LONG",
+                crate::horizon::Horizon::Moonshot => " MOON",
                 _ => " SHORT", // Unknown defaults to SHORT (auto-call default)
             };
 
