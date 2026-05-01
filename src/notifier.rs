@@ -345,6 +345,98 @@ fn compact_usd(v: f64) -> String {
     }
 }
 
+/// Compose the structural narrative paragraph that backs every auto-fired
+/// call card on the public site. Reads the same shape signals the gate
+/// already saw (classification, confidence, h1 trend, mcap, holder
+/// distribution, tpm) and prints them in editorial order: what fired, why
+/// it passed, exit ladder, hold window. Operator-typed /call notes use a
+/// different path and override entirely. Forensics callouts only emit
+/// when measurably non-zero — clean tokens read clean.
+fn compose_auto_narrative(
+    a: &TokenAnalysis,
+    meta: Option<&TokenMeta>,
+    horizon: crate::horizon::Horizon,
+    mcap_usd: f64,
+    effective_conf: i32,
+) -> String {
+    let cls = a.confidence.classification.as_str();
+    let h1 = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
+    let liq = meta.and_then(|m| m.liquidity_usd).unwrap_or(0.0);
+
+    // Classification + numeric snapshot — the spine sentence.
+    let mut header = format!(
+        "{cls} conf {conf} fired at {mcap} mcap, top1 {top1:.1}%, {hc} holders, {tpm:.0}/min flow",
+        cls = cls,
+        conf = effective_conf,
+        mcap = compact_usd(mcap_usd),
+        top1 = a.top_holder_pct,
+        hc = a.holder_count,
+        tpm = a.tx_rate,
+    );
+    if h1.abs() >= 1.0 {
+        let h1_label = if h1 >= 0.0 {
+            format!("+{:.0}%", h1)
+        } else {
+            format!("{:.0}%", h1)
+        };
+        header.push_str(&format!(", h1 {}", h1_label));
+    }
+    if liq >= 1.0 {
+        header.push_str(&format!(", liq {}", compact_usd(liq)));
+    }
+    header.push('.');
+
+    // Forensics callout — only emit when measurable. Clean tokens skip
+    // the line entirely (no "0% bundle, 0% sniper" noise).
+    let mut forensics_bits = Vec::new();
+    if a.bundle_pct >= 5.0 {
+        forensics_bits.push(format!("bundle {:.0}%", a.bundle_pct));
+    }
+    if a.sniper_pct >= 5.0 {
+        forensics_bits.push(format!("sniper {:.0}%", a.sniper_pct));
+    }
+    if a.insider_pct >= 5.0 {
+        forensics_bits.push(format!("insider {:.0}%", a.insider_pct));
+    }
+    let forensics_line = if forensics_bits.is_empty() {
+        String::new()
+    } else {
+        format!(" Forensics: {}.", forensics_bits.join(", "))
+    };
+
+    // Bucket-specific shape line — names which gate fired and what it's
+    // betting on. Ladder line — exits + window. Both pinned to the
+    // constants in scanner::settle_calls so the card matches reality.
+    let (shape, ladder) = match horizon {
+        crate::horizon::Horizon::Moonshot => (
+            " Bucket B (right-tail capture): DEVELOPING zone with confirmed positive pre-DEV slope, \
+             concentrated holders read as early accumulation, not honeypot.",
+            " Take +250%, stop -25%, 72h hold.",
+        ),
+        crate::horizon::Horizon::Scalp => (
+            " SCALP corridor: shallow-mcap rip, tpm \u{2265}25/min, h1 pc \u{2208} [+100%, +300%]. \
+             Catching post-discovery before exhaustion.",
+            " Take +30%, stop -30%, 4h max.",
+        ),
+        crate::horizon::Horizon::Long => (
+            " Bucket A LONG: graduated zone, distribution clean, classification stable. \
+             Sized to ride beyond a 6h window.",
+            " Tiered exits +40%/+80%/+150%, stop -50%, 30d hold.",
+        ),
+        crate::horizon::Horizon::Short => (
+            " Bucket A SHORT: liquid mid-cap with clean concentration profile, \
+             passing the standard signal gate.",
+            " Take +50%/+100%, stop -40%, 6h max.",
+        ),
+        crate::horizon::Horizon::Unknown => (
+            "",
+            " Settle ladder defaults to SHORT.",
+        ),
+    };
+
+    format!("{}{}{}{}", header, forensics_line, shape, ladder).trim().to_string()
+}
+
 // -- Notifier core -----------------------------------------------------------
 
 pub struct Notifier {
@@ -1470,6 +1562,23 @@ impl Notifier {
                     crate::horizon::Horizon::Short
                 };
                 let auto_horizon_tag = auto_horizon.tag().unwrap_or("");
+                // Compose a structural narrative for the call note. The site
+                // renders the cleaned (tag-stripped) body as a thesis paragraph
+                // under the symbol — this is the front-page text that gives
+                // each card its PsyopAnime-style presence. Operator-typed
+                // /call notes override this path entirely (different code path).
+                let narrative = compose_auto_narrative(
+                    a,
+                    meta.as_ref(),
+                    auto_horizon,
+                    mcap,
+                    effective_conf,
+                );
+                let auto_note = if auto_horizon_tag.is_empty() {
+                    narrative
+                } else {
+                    format!("{} · {}", narrative, auto_horizon_tag)
+                };
                 let inserted = self.db.insert_call(
                     &a.address,
                     &sym,
@@ -1481,7 +1590,7 @@ impl Notifier {
                     liq,
                     a.top_holder_pct,
                     &dex,
-                    auto_horizon_tag,
+                    &auto_note,
                     "notifier",
                     a.tx_rate,
                 );
