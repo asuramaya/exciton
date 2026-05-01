@@ -210,7 +210,7 @@ struct CallStats {
     by_source: std::collections::HashMap<String, CallStatsBucket>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 struct CallsFile {
     active: Vec<CallSnapshot>,
     history: Vec<CallSnapshot>,
@@ -324,9 +324,18 @@ impl Publisher {
                 0.0
             }
         };
-        let sol_price_usd = fetch_sol_price()
-            .await
-            .unwrap_or(self.cfg.sol_price_fallback_usd);
+        // SOL-price fetch via CoinGecko — wrap in a short timeout so a
+        // single slow CG response can't eat the whole tick. Fallback is
+        // already plumbed.
+        let sol_price_usd = match tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_sol_price(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => self.cfg.sol_price_fallback_usd,
+        };
 
         // 2. Current holdings — used for positions + mark-to-market PnL.
         let holdings = match tokio::time::timeout(
@@ -525,25 +534,66 @@ impl Publisher {
         //     book doesn't accumulate zombie "active" rows.
         let _ = self.db.expire_stale_calls(now);
 
+        // Each remaining phase below has its own per-phase timeout. Without
+        // this, a single slow market::get_market or DexScreener fetch eats
+        // the outer 60s tick budget and aborts the whole tick. After the
+        // wallet swap this manifested as 100% tick-budget-exceeded failures
+        // because the per-call DexScreener fetches in build_calls_file
+        // weren't bounded individually. Per-phase timeouts let the tick
+        // gracefully degrade — one slow phase doesn't sink the rest.
+        const PHASE_BUDGET: Duration = Duration::from_secs(10);
+
         // 9. Calls: every active call + last N closed calls, each with
         //    live mark-to-market so the site shows pct-from-call honestly.
-        let calls_file = self.build_calls_file().await;
+        let calls_file = match tokio::time::timeout(
+            PHASE_BUDGET,
+            self.build_calls_file(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!(
+                    "publisher: build_calls_file timed out (>{}s) — using empty calls",
+                    PHASE_BUDGET.as_secs()
+                );
+                CallsFile::default()
+            }
+        };
 
         // 9b. One-shot scout receipts per active call — captures the
         //     evidence bundle close to call-time and keeps it public.
-        self.publish_call_scout_snapshots(&calls_file, &data_dir)
-            .await;
+        if tokio::time::timeout(
+            PHASE_BUDGET,
+            self.publish_call_scout_snapshots(&calls_file, &data_dir),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("publisher: publish_call_scout_snapshots timed out — skipping this tick");
+        }
 
-        // 9c. Per-call whale snapshots — makes trigger monitoring public.
-        //     A visitor can now load data/whales/<mint>.json and see
-        //     exactly the same top-10 flow we're watching in-session.
-        self.publish_whale_snapshots(&calls_file, &data_dir).await;
+        // 9c. Per-call whale snapshots.
+        if tokio::time::timeout(
+            PHASE_BUDGET,
+            self.publish_whale_snapshots(&calls_file, &data_dir),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("publisher: publish_whale_snapshots timed out — skipping this tick");
+        }
 
-        // 9d. Per-call detail JSON — full token_snapshots window for any
-        //     call (active + history). Drives the front-end's
-        //     `#call=<mint>` drill-in: classification timeline, journey
-        //     numbers, scout/whales/thesis links in one place.
-        self.publish_call_details(&calls_file, &data_dir).await;
+        // 9d. Per-call detail JSON for the front-end's #call=<mint> drill-in.
+        if tokio::time::timeout(
+            PHASE_BUDGET,
+            self.publish_call_details(&calls_file, &data_dir),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("publisher: publish_call_details timed out — skipping this tick");
+        }
 
         let health = Health {
             wallet: self.wallet.clone(),
