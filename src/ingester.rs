@@ -19,6 +19,12 @@ use std::time::Duration;
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single RPC endpoint with health tracking
+/// Sidelined endpoints get re-evaluated after this cooldown — without it
+/// a single rate-limit hour permanently retires a provider since
+/// sidelined endpoints see no traffic and never get a chance to call
+/// record_success(). 5 min matches typical free-tier rate-limit windows.
+const SIDELINE_COOLDOWN_SECS: u64 = 300;
+
 struct Endpoint {
     url: String,
     client: RpcClient,
@@ -29,6 +35,9 @@ struct Endpoint {
     /// Lifetime failure count — does not reset on transient successes.
     failure_total: AtomicU64,
     healthy: AtomicBool,
+    /// Unix-second timestamp when this endpoint was last marked unhealthy.
+    /// Compared against SIDELINE_COOLDOWN_SECS to time-bound the sideline.
+    sidelined_at: AtomicU64,
 }
 
 impl Endpoint {
@@ -46,6 +55,7 @@ impl Endpoint {
             success_total: AtomicU64::new(0),
             failure_total: AtomicU64::new(0),
             healthy: AtomicBool::new(true),
+            sidelined_at: AtomicU64::new(0),
         }
     }
 
@@ -53,6 +63,7 @@ impl Endpoint {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         self.success_total.fetch_add(1, Ordering::Relaxed);
         self.healthy.store(true, Ordering::Relaxed);
+        self.sidelined_at.store(0, Ordering::Relaxed);
     }
 
     fn record_error(&self) {
@@ -60,17 +71,51 @@ impl Endpoint {
         self.error_count.fetch_add(1, Ordering::Relaxed);
         self.failure_total.fetch_add(1, Ordering::Relaxed);
         if self.error_count.load(Ordering::Relaxed) > 3 {
-            self.healthy.store(false, Ordering::Relaxed);
+            if self.healthy.swap(false, Ordering::Relaxed) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.sidelined_at.store(now, Ordering::Relaxed);
+            }
         }
     }
 
+    /// Health check with auto-rehab. Endpoints sidelined more than
+    /// SIDELINE_COOLDOWN_SECS ago get a probationary reset — error
+    /// counter cleared, healthy flag flipped on. If the endpoint is
+    /// genuinely still down the next request will fail and re-sideline
+    /// it; if it's recovered we get capacity back without operator
+    /// intervention.
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        if self.healthy.load(Ordering::Relaxed) {
+            return true;
+        }
+        let sidelined_at = self.sidelined_at.load(Ordering::Relaxed);
+        if sidelined_at == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(sidelined_at) >= SIDELINE_COOLDOWN_SECS {
+            self.error_count.store(0, Ordering::Relaxed);
+            self.sidelined_at.store(0, Ordering::Relaxed);
+            self.healthy.store(true, Ordering::Relaxed);
+            tracing::info!(
+                "RPC endpoint {} cooldown elapsed — back in rotation",
+                mask_url(&self.url)
+            );
+            return true;
+        }
+        false
     }
 
     fn reset_errors(&self) {
         self.error_count.store(0, Ordering::Relaxed);
         self.healthy.store(true, Ordering::Relaxed);
+        self.sidelined_at.store(0, Ordering::Relaxed);
     }
 }
 
@@ -144,8 +189,14 @@ impl RpcRouter {
         if let Some(ep) = self.endpoints.get(idx) {
             ep.record_error();
             if is_rate_limited(error) {
-                ep.healthy.store(false, Ordering::Relaxed);
                 ep.error_count.store(4, Ordering::Relaxed);
+                if ep.healthy.swap(false, Ordering::Relaxed) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    ep.sidelined_at.store(now, Ordering::Relaxed);
+                }
                 tracing::warn!(
                     "RPC endpoint rate-limited, sidelining provider: {}",
                     mask_url(&ep.url)

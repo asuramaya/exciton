@@ -332,13 +332,12 @@ impl Db {
             "DELETE FROM curve_snapshots WHERE timestamp < strftime('%s','now') - 86400",
             [],
         );
-        // token_snapshots GC: 30-day retention. Matches LONG horizon's
-        // 30d timeout — any active call will still have its full lifetime
-        // history queryable. SHORT/SCALP calls close in hours so 30d is
-        // far more than they need. Backtest mining over 30d windows
-        // remains possible; deeper analysis would need a separate archive.
+        // token_snapshots GC: 7d retention. LONG-auto now timeouts at 6h,
+        // not 30d, so the old retention assumption is stale. 7d still
+        // covers operator-held positions beyond the auto window and is
+        // plenty for short-window calibration backtests.
         let _ = conn.execute(
-            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 30*86400",
+            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 7*86400",
             [],
         );
 
@@ -502,8 +501,12 @@ impl Db {
             "DELETE FROM curve_snapshots WHERE timestamp < strftime('%s','now') - 86400",
             [],
         )?;
+        // 7d retention (was 30d). Old comment claimed 30d "matches LONG
+        // horizon timeout"; LONG auto is now 6h and the longest operator
+        // hold rarely needs more than a week of pre-history. Steady-state
+        // size drops ~80% at the cohort write rate.
         deleted += conn.execute(
-            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 30*86400",
+            "DELETE FROM token_snapshots WHERE timestamp < strftime('%s','now') - 7*86400",
             [],
         )?;
         deleted += conn.execute(
@@ -516,6 +519,26 @@ impl Db {
         )?;
         deleted += conn.execute(
             "DELETE FROM alerts WHERE timestamp < strftime('%s','now') - 7*86400",
+            [],
+        )?;
+        // signal_near_misses: 7d retention. Each near-miss is a snapshot
+        // of why a token failed the gate at one moment in time — useful
+        // for short-window calibration, dust beyond a week.
+        deleted += conn.execute(
+            "DELETE FROM signal_near_misses WHERE timestamp < strftime('%s','now') - 7*86400",
+            [],
+        )?;
+        // tokens: 30d retention with active-call protection. The discovery
+        // queue accretes thousands of fresh-grad mints per day, most of
+        // which never become calls. Without this, the table grows linearly
+        // forever (169k rows / 22d at present). 30d window keeps recent
+        // discovery surface; anything older that wasn't called is dead
+        // inventory. Active calls + their snapshots lock referenced mints
+        // so we never prune anything still in motion.
+        deleted += conn.execute(
+            "DELETE FROM tokens WHERE first_seen < strftime('%s','now') - 30*86400
+             AND address NOT IN (SELECT mint FROM calls WHERE status='active')
+             AND address NOT IN (SELECT DISTINCT token_address FROM token_snapshots)",
             [],
         )?;
         Ok(deleted)
