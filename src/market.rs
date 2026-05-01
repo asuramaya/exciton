@@ -8,6 +8,8 @@ use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 /// Shared reqwest client. See metadata::HTTP for rationale — same trade-off,
 /// same gain. We use a single 8s timeout here (vs 5s in metadata) because
@@ -19,6 +21,35 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .expect("market::HTTP client init")
 });
+
+/// In-process per-mint market cache. publisher (per active call), settle_calls
+/// (per active call), and notifier::process_token (per analysis cycle) all hit
+/// get_market on the same mint within seconds. 30s TTL gives us order-of-mag
+/// fewer DexScreener calls without losing meaningful freshness — Phase 7.1
+/// from the superplan. Negative results (token not indexed) are NOT cached so
+/// we pick up freshly-graduated tokens within one cycle.
+const MARKET_CACHE_TTL: Duration = Duration::from_secs(30);
+static MARKET_CACHE: Lazy<RwLock<HashMap<String, (MarketData, Instant)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+async fn cache_lookup(mint: &str) -> Option<MarketData> {
+    let cache = MARKET_CACHE.read().await;
+    cache
+        .get(mint)
+        .filter(|(_, ts)| ts.elapsed() < MARKET_CACHE_TTL)
+        .map(|(data, _)| data.clone())
+}
+
+async fn cache_store(mint: &str, data: &MarketData) {
+    let mut cache = MARKET_CACHE.write().await;
+    cache.insert(mint.to_string(), (data.clone(), Instant::now()));
+    // Soft GC: when cache exceeds 2k entries, drop everything older than
+    // 2× TTL. Cheap to do under the write lock we already hold.
+    if cache.len() > 2_000 {
+        let cutoff = 2 * MARKET_CACHE_TTL;
+        cache.retain(|_, (_, ts)| ts.elapsed() < cutoff);
+    }
+}
 
 /// Normalized market snapshot returned to the signal pipeline. Zero-initialized
 /// fields mean "not reported by DexScreener"; callers decide how to treat that.
@@ -241,13 +272,20 @@ fn best_solana_pair(pairs: Vec<DsPair>) -> Option<DsPair> {
 /// record of the token — common for freshly-created pump.fun mints that
 /// haven't been indexed yet.
 pub async fn get_market(mint: &str) -> Result<Option<MarketData>> {
+    if let Some(cached) = cache_lookup(mint).await {
+        return Ok(Some(cached));
+    }
     let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
     let resp = HTTP.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("dexscreener status {}", resp.status());
     }
     let parsed: DsResponse = resp.json().await?;
-    Ok(best_solana_pair(parsed.pairs.unwrap_or_default()).map(pair_to_market))
+    let result = best_solana_pair(parsed.pairs.unwrap_or_default()).map(pair_to_market);
+    if let Some(ref data) = result {
+        cache_store(mint, data).await;
+    }
+    Ok(result)
 }
 
 /// Fetch market data for multiple Solana mints in a single DexScreener request.
@@ -258,9 +296,22 @@ pub async fn get_market_batch(mints: &[&str]) -> Result<HashMap<String, MarketDa
     if mints.is_empty() {
         return Ok(HashMap::new());
     }
+    // Pull anything fresh from cache first; only fetch the misses.
+    let mut result: HashMap<String, MarketData> = HashMap::new();
+    let mut to_fetch: Vec<&str> = Vec::with_capacity(mints.len());
+    for &mint in mints {
+        if let Some(cached) = cache_lookup(mint).await {
+            result.insert(mint.to_string(), cached);
+        } else {
+            to_fetch.push(mint);
+        }
+    }
+    if to_fetch.is_empty() {
+        return Ok(result);
+    }
     let url = format!(
         "https://api.dexscreener.com/latest/dex/tokens/{}",
-        mints.join(",")
+        to_fetch.join(",")
     );
     let resp = HTTP.get(&url).send().await?;
     if !resp.status().is_success() {
@@ -287,8 +338,13 @@ pub async fn get_market_batch(mints: &[&str]) -> Result<HashMap<String, MarketDa
         }
     }
 
-    Ok(by_mint
+    let fresh: HashMap<String, MarketData> = by_mint
         .into_iter()
         .map(|(mint, pair)| (mint, pair_to_market(pair)))
-        .collect())
+        .collect();
+    for (mint, data) in fresh.iter() {
+        cache_store(mint, data).await;
+    }
+    result.extend(fresh);
+    Ok(result)
 }
