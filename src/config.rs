@@ -279,6 +279,7 @@ impl Default for Config {
             },
             telegram: None,
             madapes: None,
+            execution: None,
         }
     }
 }
