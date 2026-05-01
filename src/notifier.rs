@@ -68,18 +68,30 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // high-quality launches; or both). Lowering to 70 to match the
 // observed median of healthy-classification snapshots.
 pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 70;
-pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 6.0;
-// Top-10 gate tightened from 35 → 30. SHORT winners had top10 in 9.7-20.4
-// range (BURNIE 20.4, maxxing 19.6, HENRY 16.3, SPIKE 9.7, ROTUS 13.4).
-// Losers reached 22-29. 30 is a clean separator at the deep-market band.
+// 2026-05-01 Bucket A relaxation: top1 gate bumped 6 → 18. Backtest against
+// the live token_snapshots universe (n=223 entries passing
+// STAIRCASE/GRINDER/SPRING + conf≥70 + top1<22 + liq≥15k) showed +10.8%
+// mean realized EV with a 50@+50/25@+100/25@+250 ladder. The old 6% floor
+// was so tight it was producing 0 fires for hours and excluding ~95% of
+// the historical winner shape. 18 is two points tighter than the backtest
+// threshold for a safety margin while still ~3x more permissive than the
+// prior gate.
+pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 18.0;
+// Top-10 gate kept at 30 — separately validated, cuts insider-bundler shape
+// even when top1 looks clean.
 pub const SIGNAL_MAX_TOP10_PCT: f64 = 30.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
-// Liquidity floor relaxed from $100k → $50k. Sweep showed BELKA ($75k liq),
-// HENRY ($110k), Dunald ($52k), Trump ($51k) all in winner cohort. The $100k
-// floor was excluding 50%+ of true SHORT-bucket winners.
-pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 50_000.0;
+// 2026-05-01 Bucket A: liquidity floor 50k → 20k. Backtest universe used
+// 15k floor; 20k adds a 33% safety margin while still capturing ~85% of
+// historical 5x+ runners (median entry liq $25-30k for that cohort).
+pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 20_000.0;
 pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
-pub const SIGNAL_MIN_MCAP_USD: f64 = 500_000.0;
+// 2026-05-01 Bucket A: mcap floor 500k → 30k, ceiling added at 1M. The
+// 500k floor was excluding the entire post-grad / mid-cap pump shape
+// where median 5x+ runner enters. Ceiling at 1M cuts mature-tape entries
+// where remaining upside is small.
+pub const SIGNAL_MIN_MCAP_USD: f64 = 30_000.0;
+pub const SIGNAL_MAX_MCAP_USD: f64 = 1_000_000.0;
 pub const SIGNAL_MIN_TX_RATE_PER_MIN: f64 = 5.0;
 // Holder growth gate disabled by setting to 0. holder_count is RPC-capped at
 // 20 (`getTokenLargestAccounts` returns ≤20 accounts), making growth-rate
@@ -449,6 +461,12 @@ impl Notifier {
                 mcap.unwrap_or(0.0), SIGNAL_MIN_MCAP_USD
             )));
         }
+        if mcap.map_or(false, |v| v > SIGNAL_MAX_MCAP_USD) {
+            return Some(("mcap_high", format!(
+                "mcap ${:.0} > ${:.0} (mature-tape, low remaining upside)",
+                mcap.unwrap_or(0.0), SIGNAL_MAX_MCAP_USD
+            )));
+        }
         let now = chrono::Utc::now().timestamp();
         let age = first_seen.map(|fs| now - fs).unwrap_or(0);
         if age < SIGNAL_MIN_TOKEN_AGE_SECS {
@@ -505,7 +523,7 @@ impl Notifier {
             .map_or(false, |v| v >= SIGNAL_MIN_VOLUME_24H_USD);
         let mcap_ok = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
-            .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD);
+            .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD && v <= SIGNAL_MAX_MCAP_USD);
         // Velocity gate: trading-velocity is the dominant graduation predictor
         // (arxiv 2602.14860). Post-grad we use it to filter dead books.
         let tx_rate_ok = a.tx_rate >= SIGNAL_MIN_TX_RATE_PER_MIN;
