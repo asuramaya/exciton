@@ -325,17 +325,17 @@ impl Publisher {
             }
         };
         // SOL-price fetch via CoinGecko — wrap in a short timeout so a
-        // single slow CG response can't eat the whole tick. Fallback is
-        // already plumbed.
-        let sol_price_usd = match tokio::time::timeout(
+        // single slow CG response can't eat the whole tick. fetch_sol_price
+        // returns Option<f64> (None on err), so timeout gives
+        // Result<Option<f64>, Elapsed>. Fallback covers both branches.
+        let sol_price_usd = tokio::time::timeout(
             Duration::from_secs(3),
             fetch_sol_price(),
         )
         .await
-        {
-            Ok(Ok(p)) => p,
-            _ => self.cfg.sol_price_fallback_usd,
-        };
+        .ok()
+        .flatten()
+        .unwrap_or(self.cfg.sol_price_fallback_usd);
 
         // 2. Current holdings — used for positions + mark-to-market PnL.
         let holdings = match tokio::time::timeout(
