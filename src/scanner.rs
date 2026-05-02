@@ -987,18 +987,33 @@ impl BackgroundScanner {
                 .unwrap_or(0.0);
             let peak_observed = snapshot_peak.max(take_pct).max(pct);
             let trail_floor = trailing_stop_floor(peak_observed, default_stop_for_horizon);
-            // Trail-stop trigger. When floor ≥ 0 we're locking a profit
-            // and the verdict is "withdrew" (a win, not a failure). When
-            // floor < 0 we're using the bucket's default_stop and the
-            // verdict is the bucket-specific failure label.
+            // Trail-stop trigger. When floor ≥ 0 we're SUPPOSED to be
+            // locking a profit ("withdrew"). But settle latency between
+            // snapshots can produce a fill that's materially below the
+            // floor — e.g. peak +42% sets floor at 0%, next snapshot is
+            // -97% → trigger fires, but tagging that as "withdrew" lies
+            // about the realized outcome. Only tag as a win when the
+            // fill landed within slip tolerance (5%) of the floor.
+            // Beyond that, the trail "missed" — fall through to the
+            // per-horizon block which labels it as a failure correctly.
+            const TRAIL_SLIP_TOLERANCE: f64 = 5.0;
             let trail_exit: Option<(&'static str, String)> = if pct <= trail_floor {
-                if trail_floor >= 0.0 {
+                if trail_floor > 0.0 && pct >= trail_floor - TRAIL_SLIP_TOLERANCE {
                     Some((
                         "withdrew",
                         format!("{:+.1}% · trailing stop @ +{:.0}% (peak {:+.0}%)", pct, trail_floor, peak_observed),
                     ))
+                } else if trail_floor == 0.0 && pct >= -TRAIL_SLIP_TOLERANCE {
+                    // Breakeven trail caught within slip — flat close.
+                    Some((
+                        "withdrew",
+                        format!("{:+.1}% · trailing stop @ breakeven (peak {:+.0}%)", pct, peak_observed),
+                    ))
                 } else {
-                    None // let the per-horizon block produce its own label
+                    // Trail "fired" but fill is past slip tolerance — the
+                    // realized exit is materially worse than the floor.
+                    // Don't pretend it was a win.
+                    None
                 }
             } else {
                 None
