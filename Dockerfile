@@ -7,7 +7,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
-COPY assets ./assets
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -17,12 +16,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
-COPY assets ./assets
 RUN cargo build --release --bin photon
 
 FROM debian:bookworm-slim
 
-RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         openssh-client         fonts-dejavu-core         fontconfig     && git config --global --add safe.directory /srv/MadApes.ai     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         openssh-client         fonts-dejavu-core         fontconfig         chromium         libnss3         libgbm1         libasound2         libatk1.0-0         libatk-bridge2.0-0         libcups2         libxkbcommon0         libxcomposite1         libxdamage1         libxfixes3         libxrandr2         libpango-1.0-0         libcairo2     && git config --global --add safe.directory /srv/MadApes.ai     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /data
 

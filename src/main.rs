@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 mod bonding_curve;
 mod bot;
-mod chart;
+mod chart_screenshot;
 mod config;
 mod db;
 mod discovery;

@@ -1476,20 +1476,29 @@ impl Notifier {
         self.bump_anchor().await;
     }
 
-    /// Build the calls-channel chart for a token. Looks up the recent
-    /// price history (since the call's first_seen — bounded to 6h to
-    /// keep the sparkline meaningful for moonshot windows). Falls back
-    /// to a placeholder when no history exists yet.
-    fn build_call_chart(
-        &self,
-        address: &str,
-        symbol: &str,
-        entry_price: f64,
-        since_ts: Option<i64>,
-    ) -> Option<Vec<u8>> {
-        let lookback = since_ts.unwrap_or_else(|| chrono::Utc::now().timestamp() - 6 * 3600);
-        let series = self.db.get_price_history(address, lookback).ok()?;
-        crate::chart::render_sparkline(&series, entry_price, symbol).ok()
+    /// Capture the live DexScreener chart embed for a token. Requires a
+    /// pair URL (from DexScreener metadata fetch). When absent, returns
+    /// None and the call publishes as text-only — that's preferable to
+    /// blocking on a missing chart.
+    ///
+    /// Replaced the plotters sparkline path 2026-05-02 PM: with only 2
+    /// snapshots in the price-history series the rendered line was a
+    /// straight diagonal that didn't communicate anything. The DexScreener
+    /// chart embed shows real candlesticks, volume, MCap axis, and the
+    /// live tape — same view a trader sees in the browser.
+    async fn build_call_chart(&self, pair_url: Option<&str>, label: &str) -> Option<Vec<u8>> {
+        let url = pair_url?;
+        let pair_addr = url.rsplit('/').next()?.split('?').next()?;
+        if pair_addr.is_empty() {
+            return None;
+        }
+        match crate::chart_screenshot::screenshot_pair(pair_addr, label).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!("chart screenshot failed for {}: {}", pair_addr, e);
+                None
+            }
+        }
     }
 
     /// sendMessage with optional preview URL. When `preview_url` is
@@ -1837,11 +1846,9 @@ impl Notifier {
                 let timeline = vec![TimelineEntry { ts: now, kind: "called".into(), line: call_line }];
                 let html = self.render_call_card(address, meta_ref, &timeline, "active", note, "");
                 let chart_png = self.build_call_chart(
-                    address,
+                    meta_ref.and_then(|m| m.pair_url.as_deref()),
                     meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?"),
-                    price.unwrap_or(0.0),
-                    None,
-                );
+                ).await;
                 let msg_id = match chart_png {
                     Some(png) => match self.send_photo(&chat_id, png, &html, Some(&kb)).await {
                         Ok(id) => id,
@@ -2294,11 +2301,9 @@ impl Notifier {
                     meta.as_ref().and_then(|m| m.pair_url.as_deref()),
                 );
                 let chart_png = self.build_call_chart(
-                    &a.address,
+                    meta.as_ref().and_then(|m| m.pair_url.as_deref()),
                     meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("?"),
-                    price.unwrap_or(0.0),
-                    None,
-                );
+                ).await;
                 let msg_id = match chart_png {
                     Some(png) => match self.send_photo(&chat_id, png, &ape_html, Some(&kb)).await {
                         Ok(id) => id,
