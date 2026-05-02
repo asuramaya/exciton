@@ -32,10 +32,12 @@ const CROP_H: u32 = 220;
 // regardless. Real wall-clock seconds.
 const RENDER_WAIT_SECS: u64 = 25;
 
-// Variance threshold for "loaded" vs "Loading pair…" state. Production
-// data shows the grey loading rectangle produces variance ~240, partial
-// loads ~580-865, fully rendered candles ~2000+.
-const VARIANCE_LOADED_THRESHOLD: f64 = 1500.0;
+// Variance threshold for "loaded" vs "Loading pair…" state. Updated
+// after CDP rewrite: with real 25s wait, fresh-migration tokens show
+// loaded charts at variance 795-931 (only 5-10 candles → less area
+// covered → less green-channel spread). The pure loading-pair grey
+// box produces ~240. 700 cleanly separates the two.
+const VARIANCE_LOADED_THRESHOLD: f64 = 700.0;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
