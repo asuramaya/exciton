@@ -92,6 +92,14 @@ async fn raw_screenshot(pair_address: &str, label: &str, virtual_time_budget_ms:
     let profile = format!("--user-data-dir={}", profile_dir().display());
     let screenshot = format!("--screenshot={}", out_path.display());
 
+    // virtual-time-budget alone exits as soon as the JS event loop
+    // drains, even when there's pending WS data the chart embed needs
+    // to render (production showed fast=587 → slow=239 in 5s, way under
+    // the 20s nominal budget). The companion flag
+    // --virtual-time-task-starvation-budget extends virtual time
+    // through idle waits — set to the same value as the budget so
+    // the embed actually gets the full window.
+    let starvation = format!("--virtual-time-task-starvation-budget={}", virtual_time_budget_ms);
     let mut cmd = Command::new("chromium");
     cmd.arg("--headless=new")
         .arg("--no-sandbox")
@@ -99,9 +107,11 @@ async fn raw_screenshot(pair_address: &str, label: &str, virtual_time_budget_ms:
         .arg("--disable-gpu")
         .arg("--hide-scrollbars")
         .arg("--disable-blink-features=AutomationControlled")
+        .arg("--enable-features=NetworkService,VirtualTime")
         .arg(format!("--user-agent={}", USER_AGENT))
         .arg(&window)
         .arg(&budget)
+        .arg(&starvation)
         .arg(&profile)
         .arg(&screenshot)
         .arg(&url)
