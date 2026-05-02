@@ -1294,12 +1294,22 @@ impl Notifier {
     /// Without this every fresh call rendered through compose_ape_entry,
     /// which is a deterministic template — two STAIRCASE/MOONSHOT calls
     /// at similar mcap printed identical thesis lines.
+    #[allow(clippy::too_many_arguments)]
     async fn claw_entry_line(
         &self,
         ticker: &str,
         horizon: crate::horizon::Horizon,
-        a: &TokenAnalysis,
         mcap_usd: f64,
+        top_holder_pct: f64,
+        top10_pct: f64,
+        classification: &str,
+        confidence: i32,
+        tx_rate: f64,
+        bundle_pct: f64,
+        sniper_pct: f64,
+        insider_pct: f64,
+        buys_h1: i32,
+        sells_h1: i32,
     ) -> anyhow::Result<String> {
         let horizon_label = match horizon {
             crate::horizon::Horizon::Scalp    => "SCALP (quick flip — +30 take, -30 stop)",
@@ -1308,8 +1318,8 @@ impl Notifier {
             crate::horizon::Horizon::Moonshot => "MOONSHOT (lottery shot — out at 3.5x or -25)",
             crate::horizon::Horizon::Unknown  => "open punt",
         };
-        let bs_ratio = if a.sells_h1 > 0 {
-            a.buys_h1 as f64 / a.sells_h1 as f64
+        let bs_ratio = if sells_h1 > 0 {
+            buys_h1 as f64 / sells_h1 as f64
         } else {
             0.0
         };
@@ -1350,14 +1360,14 @@ impl Notifier {
             ticker = ticker,
             horizon = horizon_label,
             mcap = compact_usd(mcap_usd),
-            top1 = a.top_holder_pct,
-            top10 = a.top10_pct,
-            class = a.confidence.classification,
-            conf = a.confidence.total,
-            tx = a.tx_rate,
-            bundle = a.bundle_pct,
-            sniper = a.sniper_pct,
-            insider = a.insider_pct,
+            top1 = top_holder_pct,
+            top10 = top10_pct,
+            class = classification,
+            conf = confidence,
+            tx = tx_rate,
+            bundle = bundle_pct,
+            sniper = sniper_pct,
+            insider = insider_pct,
             bs = bs_ratio,
         );
         let body = serde_json::json!({ "message": prompt });
@@ -2143,6 +2153,99 @@ impl Notifier {
         self.apply_outcome_card(address, outcome, exit_pct, exit_note, false).await
     }
 
+    /// Re-render an ACTIVE open-call card. Generates a fresh claw-authored
+    /// thesis line (using whatever current snapshot data we have) and
+    /// replaces both the chart photo and caption via editMessageMedia.
+    /// Used by the `refresh_card` MCP tool to upgrade cards that were
+    /// posted before the chromium-screenshot + claw-entry-line landed.
+    /// On total claw failure falls back to compose_ape_entry so the card
+    /// still gets a fresh chart even if voice generation hiccups.
+    pub async fn refresh_active_card(&self, address: &str) -> anyhow::Result<()> {
+        if !self.cfg.enabled {
+            return Ok(());
+        }
+        let channel = CALLS_CHANNEL;
+        let chat_id = self.cfg.signals_chat_id.clone();
+        let meta = crate::metadata::fetch(address).await.ok().flatten();
+        let meta_ref = meta.as_ref();
+        let pair_url = meta_ref.and_then(|m| m.pair_url.as_deref());
+        let ticker = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
+
+        let d = match self.db.get_active_delivery(address, channel)? {
+            Some(d) => d,
+            None => return Err(anyhow!("no delivery for {}", address)),
+        };
+
+        // Re-derive the horizon from the call row's note (which contains the
+        // horizon tag emitted at first publish), falling back to Unknown.
+        let call = self.db.get_call_by_mint(address).ok().flatten();
+        let entry_note = call.as_ref().map(|c| c.note.clone()).unwrap_or_default();
+        let (horizon, _) = crate::horizon::parse_with_clean(&entry_note);
+
+        // Snapshot the latest analysis-style metrics from token_snapshots
+        // for the claw prompt context. If no snapshot exists we keep the
+        // original entry-note text; otherwise re-ask claw with current
+        // metrics so the refresh reflects the live picture.
+        let snap = self.db.get_latest_snapshot(address).ok().flatten();
+        let mcap = meta_ref.and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+            .or_else(|| snap.as_ref().map(|s| s.mcap_usd))
+            .unwrap_or(0.0);
+
+        let narrative = if let Some(s) = snap.as_ref() {
+            match self.claw_entry_line(
+                ticker, horizon, mcap,
+                s.top_holder_pct, s.top10_pct, &s.classification, s.confidence,
+                s.tx_rate, s.bundle_pct, s.sniper_pct, s.insider_pct,
+                s.buys_h1, s.sells_h1,
+            ).await {
+                Ok(line) => {
+                    tracing::info!("claw entry refresh: {} → {}", address, line);
+                    line
+                }
+                Err(e) => {
+                    tracing::warn!("claw entry refresh fallback for {}: {}", address, e);
+                    entry_note.clone()
+                }
+            }
+        } else {
+            // No snapshot — use the original entry note text verbatim.
+            entry_note.clone()
+        };
+
+        let auto_horizon_tag = horizon.tag().unwrap_or("");
+        let auto_note = if auto_horizon_tag.is_empty() {
+            narrative.clone()
+        } else {
+            format!("{} · {}", narrative, auto_horizon_tag)
+        };
+
+        // Render the updated card (active state — no exit verdict yet).
+        let mut timeline: Vec<TimelineEntry> = serde_json::from_str(&d.timeline_json).unwrap_or_default();
+        if timeline.is_empty() {
+            timeline.push(TimelineEntry {
+                ts: chrono::Utc::now().timestamp(),
+                kind: "called".into(),
+                line: format!("auto · mc {}", compact_usd(mcap)),
+            });
+        }
+        let html = self.render_call_card(address, meta_ref, &timeline, "active", &auto_note, "");
+        let kb = self.token_keyboard(address, pair_url);
+
+        // Fresh chart screenshot via chromium.
+        let png = match self.build_call_chart(pair_url, ticker).await {
+            Some(p) => p,
+            None => return Err(anyhow!("chart screenshot failed for {}", address)),
+        };
+
+        self.edit_photo_media(&chat_id, d.message_id, png, &html, Some(&kb)).await?;
+        let timeline_json = serde_json::to_string(&timeline)?;
+        let _ = self.db.update_delivery(
+            d.id, "active", d.snapshot_conf, &d.snapshot_class,
+            d.snapshot_price, d.snapshot_top_holder, &timeline_json,
+        );
+        Ok(())
+    }
+
     /// Re-render a terminal delivery's card with a fresh outcome. Unlike
     /// `update_call_outcome`, this works on already-demoted rows — used
     /// by startup backfill to replay the outcome on cards that were
@@ -2581,7 +2684,13 @@ impl Notifier {
                 // thesis lines for similar tokens (the user flagged two
                 // MOONSHOT cards posting word-for-word the same body).
                 let ticker = meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("?");
-                let narrative = match self.claw_entry_line(ticker, auto_horizon, a, mcap).await {
+                let narrative = match self.claw_entry_line(
+                    ticker, auto_horizon, mcap,
+                    a.top_holder_pct, a.top10_pct,
+                    &a.confidence.classification, a.confidence.total,
+                    a.tx_rate, a.bundle_pct, a.sniper_pct, a.insider_pct,
+                    a.buys_h1, a.sells_h1,
+                ).await {
                     Ok(line) => {
                         tracing::info!("claw entry: {} → {}", a.address, line);
                         line

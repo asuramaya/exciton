@@ -61,6 +61,17 @@ pub struct BackfillCardsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefreshCardParams {
+    /// Comma-separated list of mints to refresh. For each: if the call is
+    /// active, re-renders the open card via claw_entry_line + fresh chart
+    /// screenshot via editMessageMedia. If closed, replays through
+    /// force_update_card (same path as backfill_cards). Use this to upgrade
+    /// recently-posted cards to the new chart-screenshot + claw-entry path
+    /// without waiting for natural close.
+    pub mints: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HistoryParams {
     /// Token mint address to analyze across stored snapshots.
     pub address: String,
@@ -1380,6 +1391,53 @@ impl PhotonServer {
             "note": "running in background — claw verdict + ape format applied per card",
         })
         .to_string()
+    }
+
+    /// Refresh specific cards by mint. Active calls re-render their open
+    /// card (new claw entry line + fresh chart screenshot via
+    /// editMessageMedia). Closed calls go through force_update_card (same
+    /// as backfill_cards). Use this to upgrade a handful of recent cards
+    /// to the latest renderer without scanning the full history window.
+    #[tool]
+    async fn refresh_card(&self, Parameters(params): Parameters<RefreshCardParams>) -> String {
+        let _ = self.db.audit_log("claude", "refresh_card", &params.mints);
+        let notifier = match self.notifier.as_ref() {
+            Some(n) => n.clone(),
+            None => return serde_json::json!({"error": "notifier not configured"}).to_string(),
+        };
+        let mints: Vec<String> = params
+            .mints
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if mints.is_empty() {
+            return serde_json::json!({"error": "no mints provided"}).to_string();
+        }
+        let mut results = Vec::new();
+        for mint in mints {
+            let call = self.db.get_call_by_mint(&mint).ok().flatten();
+            let status = call.as_ref().map(|c| c.status.clone()).unwrap_or_default();
+            let res = if status == "active" {
+                notifier.refresh_active_card(&mint).await
+            } else {
+                let exit_pct = call.as_ref().and_then(|c| {
+                    if c.entry_price_usd > 0.0 && c.exit_price_usd.unwrap_or(0.0) > 0.0 {
+                        Some((c.exit_price_usd.unwrap() - c.entry_price_usd) / c.entry_price_usd * 100.0)
+                    } else {
+                        None
+                    }
+                });
+                let exit_note = call.as_ref().and_then(|c| c.exit_note.clone()).unwrap_or_default();
+                notifier.force_update_card(&mint, &status, exit_pct, &exit_note).await
+            };
+            match res {
+                Ok(_) => results.push(serde_json::json!({"mint": mint, "status": status, "ok": true})),
+                Err(e) => results.push(serde_json::json!({"mint": mint, "status": status, "ok": false, "error": format!("{}", e)})),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        serde_json::json!({"results": results}).to_string()
     }
 
     /// Bump the lounge anchor — delete the previous copy of the
