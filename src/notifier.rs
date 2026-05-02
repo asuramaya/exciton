@@ -199,7 +199,16 @@ pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
 // Lifted from 50/min to 200/min after universe analysis: tpm 50-200
 // dragged hit-rate down. Above 200 tokens have enough genuine flow to
 // support a +200% leg before the dump.
-pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 200.0;
+// 2026-05-02 PM: 200 → 100. FURY (3yLxAR1U…) ran +12,000% but our
+// snapshots showed 25-115 tpm during the entire 10-min observation
+// window — every other moonshot gate passed (mcap $14-55k, top1
+// 17-33%, holders 20, bundle 34%, sniper 63%, age cleared at 20:38).
+// The 200 floor was a backtest-tuned hit-rate optimization that
+// excluded slow-accumulation moonshots like FURY entirely. Dropping
+// to 100 catches that shape; if hit-rate degrades materially over
+// the next 7d retune up. Keep the floor non-zero — sub-50 tpm is
+// genuinely dead-tape territory.
+pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 100.0;
 // Moonshot-specific age floor. The shared SIGNAL_MIN_TOKEN_AGE_SECS (900s)
 // excludes the entire moonshot opportunity window — DEVELOPING-class
 // snapshots typically last 15-60 seconds before classification rotates.
