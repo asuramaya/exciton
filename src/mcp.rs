@@ -61,6 +61,15 @@ pub struct BackfillCardsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CleanupLoungeAnchorParams {
+    /// Comma-separated list of message_ids in the lounge channel to
+    /// delete. Idempotent — already-missing messages are treated as a
+    /// no-op success. Use this to clear stale Safeguard verify forwards
+    /// left in the lounge from before the anchor moved to calls.
+    pub msg_ids: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefreshCardParams {
     /// Comma-separated list of mints to refresh. For each: if the call is
     /// active, re-renders the open card via claw_entry_line + fresh chart
@@ -1391,6 +1400,48 @@ impl PhotonServer {
             "note": "running in background — claw verdict + ape format applied per card",
         })
         .to_string()
+    }
+
+    /// Delete one or more stale forwards from the lounge channel. Used
+    /// to clean up Safeguard verify forwards left over from before the
+    /// anchor was moved to the calls channel. Idempotent.
+    #[tool]
+    async fn cleanup_lounge_anchor(
+        &self,
+        Parameters(params): Parameters<CleanupLoungeAnchorParams>,
+    ) -> String {
+        let _ = self.db.audit_log("claude", "cleanup_lounge_anchor", &params.msg_ids);
+        let notifier = match self.notifier.as_ref() {
+            Some(n) => n.clone(),
+            None => return serde_json::json!({"error": "notifier not configured"}).to_string(),
+        };
+        let ids: Vec<i64> = params
+            .msg_ids
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .collect();
+        if ids.is_empty() {
+            return serde_json::json!({"error": "no valid msg_ids"}).to_string();
+        }
+        let mut results = Vec::new();
+        for msg in ids {
+            match notifier.delete_lounge_message(msg).await {
+                Ok(_) => results.push(serde_json::json!({"msg_id": msg, "ok": true})),
+                Err(e) => {
+                    let s = format!("{}", e);
+                    let already_gone = s.contains("not found") || s.contains("can't be deleted");
+                    results.push(serde_json::json!({
+                        "msg_id": msg,
+                        "ok": already_gone,
+                        "note": if already_gone { "already gone" } else { "delete failed" },
+                        "error": s,
+                    }));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        serde_json::json!({"results": results}).to_string()
     }
 
     /// Refresh specific cards by mint. Active calls re-render their open

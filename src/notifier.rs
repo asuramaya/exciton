@@ -1713,6 +1713,52 @@ impl Notifier {
                 );
             }
         }
+
+        // Stale-lounge cleanup leg. The active anchor lives in the calls
+        // channel (dest_chat); any forward sitting in the lounge from
+        // before the channel flip is untracked by lounge_anchor_state and
+        // never removed by the regular cleanup. Operator sets
+        // `stale_lounge_anchor_msg_id` in config; we try to delete it from
+        // lounge_chat_id every bump until it's gone (idempotent — TG
+        // returns "message to delete not found" on subsequent attempts,
+        // which we treat as success). Logs the attempt so the operator
+        // can clear the config field once they're satisfied.
+        let stale = self.cfg.stale_lounge_anchor_msg_id;
+        if stale > 0 && !self.cfg.lounge_chat_id.is_empty() && self.cfg.lounge_chat_id != dest_chat {
+            match self.delete_message(&self.cfg.lounge_chat_id, stale).await {
+                Ok(_) => tracing::info!(
+                    "anchor-bump: cleaned stale lounge forward {}/{}",
+                    self.cfg.lounge_chat_id, stale
+                ),
+                Err(e) => {
+                    let s = format!("{}", e);
+                    if s.contains("message to delete not found")
+                        || s.contains("message can't be deleted")
+                    {
+                        tracing::debug!(
+                            "anchor-bump: stale lounge {}/{} already gone",
+                            self.cfg.lounge_chat_id, stale
+                        );
+                    } else {
+                        tracing::warn!(
+                            "anchor-bump: stale lounge cleanup {}/{} failed: {}",
+                            self.cfg.lounge_chat_id, stale, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Operator-callable: delete a single message from the lounge channel.
+    /// Used by the `cleanup_lounge_anchor` MCP tool when the operator
+    /// wants to remove a specific stale forward without rolling out a
+    /// config change.
+    pub async fn delete_lounge_message(&self, msg_id: i64) -> anyhow::Result<()> {
+        if self.cfg.lounge_chat_id.is_empty() {
+            return Err(anyhow!("lounge_chat_id not configured"));
+        }
+        self.delete_message(&self.cfg.lounge_chat_id, msg_id).await
     }
 
     /// Backward-compat shim — the lounge-only name was wired through MCP

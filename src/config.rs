@@ -193,6 +193,16 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub anchor_source_chat: String,
 
+    /// Stale lounge-side anchor msg_id to delete. The bump only tracks
+    /// ONE active anchor slot (the destination chat), so any forward
+    /// that landed in the lounge before the channel flip is never
+    /// cleaned up. Set this to the stale lounge msg_id; on next bump the
+    /// magic trick sweeps lounge_chat_id and zeroes the field on success.
+    /// Set back to 0 once cleaned (or leave non-zero — successive bumps
+    /// will keep no-oping on the missing message).
+    #[serde(default)]
+    pub stale_lounge_anchor_msg_id: i64,
+
     /// Enable the direct-message bot interface (long-poll loop for /commands).
     /// Separate switch from channel posting — can disable DM while keeping
     /// autonomous channel pipeline alive.
