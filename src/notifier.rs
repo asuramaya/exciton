@@ -1467,24 +1467,34 @@ impl Notifier {
         } else {
             self.cfg.anchor_source_chat.clone()
         };
-        // Drop the prior forward first so the new forward is unambiguously
-        // the bottom message. Soft-fail: if the prior was already deleted
-        // (or never existed) the delete errors and we proceed.
-        let prev = self.db.get_lounge_anchor_msg_id().unwrap_or(0);
-        if prev > 0 {
-            if let Err(e) = self.delete_message(&dest_chat, prev).await {
+        // Drop the prior forward first. Read which CHAT it lives in
+        // from DB so config flips (e.g. dest changed from lounge → calls)
+        // clean up the orphan in the old chat. Legacy rows (pre-migration)
+        // have empty chat_id — fall back to lounge_chat_id since that's
+        // where the original lounge-only implementation posted.
+        let (prev_chat_raw, prev_msg) = self.db.get_anchor_state().unwrap_or((String::new(), 0));
+        let prev_chat = if prev_chat_raw.is_empty() {
+            self.cfg.lounge_chat_id.clone()
+        } else {
+            prev_chat_raw
+        };
+        if prev_msg > 0 && !prev_chat.is_empty() {
+            if let Err(e) = self.delete_message(&prev_chat, prev_msg).await {
                 let s = format!("{}", e);
                 if !s.contains("message to delete not found")
                     && !s.contains("message can't be deleted")
                 {
-                    tracing::debug!("anchor-bump: delete prev {} failed: {}", prev, e);
+                    tracing::debug!("anchor-bump: delete prev {}/{} failed: {}", prev_chat, prev_msg, e);
                 }
             }
         }
         match self.forward_message(&dest_chat, &source_chat, anchor_msg).await {
             Ok(new_id) => {
-                let _ = self.db.set_lounge_anchor_msg_id(new_id);
-                tracing::debug!("anchor-bump: forwarded source {} → {} (prev was {})", anchor_msg, new_id, prev);
+                let _ = self.db.set_anchor_state(&dest_chat, new_id);
+                tracing::debug!(
+                    "anchor-bump: forwarded src {}/{} → {}/{} (prev was {}/{})",
+                    source_chat, anchor_msg, dest_chat, new_id, prev_chat, prev_msg
+                );
             }
             Err(e) => {
                 tracing::warn!(

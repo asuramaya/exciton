@@ -231,6 +231,15 @@ impl Db {
             "ALTER TABLE telegram_digests ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Track which chat the prior anchor forward lives in so a config
+        // flip (e.g. anchor moved from lounge → calls channel) can clean
+        // up the orphan in the old chat. Empty means legacy row — the
+        // bump path falls back to lounge_chat_id where pre-migration
+        // forwards lived.
+        let _ = conn.execute(
+            "ALTER TABLE lounge_anchor_state ADD COLUMN current_chat_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         // Market-data columns on token_snapshots (DexScreener integration).
         // Each ALTER is individually idempotent — SQLite returns "duplicate
@@ -2293,31 +2302,39 @@ impl Db {
         Ok(price)
     }
 
-    /// Read the current lounge-anchor copy's message_id. Zero means no
-    /// copy has ever been posted (or the row was just seeded).
-    pub fn get_lounge_anchor_msg_id(&self) -> Result<i64> {
+    /// Read the current anchor forward's (chat_id, message_id). Empty
+    /// chat_id means legacy row (pre-migration); empty/0 msg_id means
+    /// no forward has ever been posted.
+    pub fn get_anchor_state(&self) -> Result<(String, i64)> {
         let conn = self.conn.lock().unwrap();
-        let id: i64 = conn
+        let row: (String, i64) = conn
             .query_row(
-                "SELECT current_msg_id FROM lounge_anchor_state WHERE id = 1",
+                "SELECT current_chat_id, current_msg_id FROM lounge_anchor_state WHERE id = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or(0);
-        Ok(id)
+            .unwrap_or_else(|_| (String::new(), 0));
+        Ok(row)
     }
 
-    /// Persist the new lounge-anchor copy's message_id after a successful
-    /// copyMessage. Subsequent bumps will read it back and delete the
-    /// stale copy before posting fresh.
-    pub fn set_lounge_anchor_msg_id(&self, msg_id: i64) -> Result<()> {
+    /// Persist the new anchor forward's (chat_id, message_id) after a
+    /// successful forwardMessage. Subsequent bumps read it back to
+    /// know where to delete the prior orphan.
+    pub fn set_anchor_state(&self, chat_id: &str, msg_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
-            "UPDATE lounge_anchor_state SET current_msg_id = ?1, last_bump_at = ?2 WHERE id = 1",
-            params![msg_id, now],
+            "UPDATE lounge_anchor_state SET current_chat_id = ?1, current_msg_id = ?2, last_bump_at = ?3 WHERE id = 1",
+            params![chat_id, msg_id, now],
         )?;
         Ok(())
+    }
+
+    /// Back-compat shim — returns just the msg_id for the MCP tool's
+    /// "current_msg_id" return field. Drop when MCP gets a richer state
+    /// surface.
+    pub fn get_lounge_anchor_msg_id(&self) -> Result<i64> {
+        Ok(self.get_anchor_state()?.1)
     }
 
     /// Claim a mint for buyer-trace. Atomic: returns Ok(true) when the
