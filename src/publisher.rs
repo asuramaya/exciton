@@ -228,6 +228,8 @@ struct CallStatsBucket {
 struct CallStats {
     short: CallStatsBucket,
     long: CallStatsBucket,
+    moonshot: CallStatsBucket,
+    scalp: CallStatsBucket,
     overall: CallStatsBucket,
     /// Per-source buckets — track whether the bot's auto-calls
     /// (`source = "notifier"`) outperform operator manual calls
@@ -1412,10 +1414,12 @@ async fn fetch_sol_price() -> Option<f64> {
 fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
     let mut short_calls: Vec<f64> = Vec::new();
     let mut long_calls: Vec<f64> = Vec::new();
+    let mut moonshot_calls: Vec<f64> = Vec::new();
+    let mut scalp_calls: Vec<f64> = Vec::new();
     let mut all_calls: Vec<f64> = Vec::new();
-    let mut bucket_counts: [(usize, usize, usize, usize); 3] = [(0, 0, 0, 0); 3];
-    // bucket_counts[0]=short, [1]=long, [2]=overall.
+    // bucket_counts[0]=short, [1]=long, [2]=moonshot, [3]=scalp, [4]=overall.
     // Tuple: (count, wins, losses, expired).
+    let mut bucket_counts: [(usize, usize, usize, usize); 5] = [(0, 0, 0, 0); 5];
 
     // Per-source accumulator: source string → (pcts, counts). Built up
     // alongside the horizon axis so we can answer "do operator picks
@@ -1426,10 +1430,17 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
 
     for c in history {
         let Some(pct) = c.pct_from_call else { continue };
-        let is_long = crate::horizon::parse(&c.note).is_long();
-        let bucket_idx = if is_long { 1 } else { 0 };
-        // Update both per-horizon and overall buckets.
-        for &i in &[bucket_idx, 2] {
+        let h = crate::horizon::parse(&c.note);
+        // Bucket index per horizon. Unknown defaults to "short" for back-
+        // compat (legacy rows had no horizon tag and were short-shaped).
+        let bucket_idx = match h {
+            crate::horizon::Horizon::Long => 1,
+            crate::horizon::Horizon::Moonshot => 2,
+            crate::horizon::Horizon::Scalp => 3,
+            _ => 0,
+        };
+        // Update both per-horizon and overall (idx 4) buckets.
+        for &i in &[bucket_idx, 4] {
             bucket_counts[i].0 += 1;
             match c.outcome_type.as_str() {
                 "withdrew" => bucket_counts[i].1 += 1,
@@ -1438,10 +1449,11 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
                 _ => {}
             }
         }
-        if is_long {
-            long_calls.push(pct);
-        } else {
-            short_calls.push(pct);
+        match h {
+            crate::horizon::Horizon::Long => long_calls.push(pct),
+            crate::horizon::Horizon::Moonshot => moonshot_calls.push(pct),
+            crate::horizon::Horizon::Scalp => scalp_calls.push(pct),
+            _ => short_calls.push(pct),
         }
         all_calls.push(pct);
         // Bucket by source. Calls from before the source axis was
@@ -1500,7 +1512,9 @@ fn compute_call_stats(history: &[CallSnapshot]) -> CallStats {
     CallStats {
         short: mk(&short_calls, bucket_counts[0]),
         long: mk(&long_calls, bucket_counts[1]),
-        overall: mk(&all_calls, bucket_counts[2]),
+        moonshot: mk(&moonshot_calls, bucket_counts[2]),
+        scalp: mk(&scalp_calls, bucket_counts[3]),
+        overall: mk(&all_calls, bucket_counts[4]),
         by_source: by_source_out,
     }
 }
