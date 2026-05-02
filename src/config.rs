@@ -170,6 +170,20 @@ pub struct TelegramConfig {
     /// existing single-channel deploys keep working.
     #[serde(default)]
     pub lounge_chat_id: String,
+    /// Optional message_id of an "anchor" message in the lounge that
+    /// should always appear at the bottom of the channel — Telegram
+    /// only pins to the top, so the magic trick is: after every
+    /// photon-originated lounge send, delete the previous copy of the
+    /// anchor and copyMessage from the source again as a fresh post.
+    /// Source defaults to the lounge itself; override with
+    /// `lounge_anchor_chat` if the source lives in a different chat.
+    /// Set to 0 (or omit) to disable.
+    #[serde(default)]
+    pub lounge_anchor_msg_id: i64,
+    /// Source chat for the anchor message. Empty = use `lounge_chat_id`
+    /// (anchor is itself in the lounge — most common case).
+    #[serde(default)]
+    pub lounge_anchor_chat: String,
 
     /// Enable the direct-message bot interface (long-poll loop for /commands).
     /// Separate switch from channel posting — can disable DM while keeping

@@ -1384,6 +1384,109 @@ impl Notifier {
         Err(last_err.unwrap_or_else(|| anyhow!("zeroclaw verdict failed all {} attempts", MAX_ATTEMPTS)))
     }
 
+    /// deleteMessage — Telegram bot API. Used by the lounge-anchor bump
+    /// to drop the prior copy. Soft-fails on missing/already-deleted
+    /// messages so the bump is idempotent across restarts.
+    async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/deleteMessage",
+            self.cfg.bot_token
+        );
+        let form = vec![
+            ("chat_id", chat_id.to_string()),
+            ("message_id", message_id.to_string()),
+        ];
+        let resp = self.http.post(&url).form(&form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            return Err(anyhow!("deleteMessage failed: {}", body));
+        }
+        Ok(())
+    }
+
+    /// copyMessage — same-shape clone of a message into another chat
+    /// without the "Forwarded from" label. Used by the lounge-anchor
+    /// bump to re-post the source message at the bottom.
+    async fn copy_message(
+        &self,
+        chat_id: &str,
+        from_chat_id: &str,
+        message_id: i64,
+    ) -> Result<i64> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/copyMessage",
+            self.cfg.bot_token
+        );
+        let form = vec![
+            ("chat_id", chat_id.to_string()),
+            ("from_chat_id", from_chat_id.to_string()),
+            ("message_id", message_id.to_string()),
+        ];
+        let resp = self.http.post(&url).form(&form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            return Err(anyhow!("copyMessage failed: {}", body));
+        }
+        Ok(body["result"]["message_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("copyMessage missing result.message_id"))?)
+    }
+
+    /// "Always at the bottom" anchor in the lounge. Telegram pins go to
+    /// the TOP of a chat — the magic trick to keep a message at the
+    /// BOTTOM is: every time a new message arrives in the lounge, delete
+    /// the previous copy of the anchor and copyMessage from the source
+    /// fresh, which puts the new copy at the bottom of the channel.
+    /// Source defaults to the lounge itself when `lounge_anchor_chat` is
+    /// empty (the most common case — anchor is just a pinned-style
+    /// message that lives in the same channel).
+    ///
+    /// Caller spawns this in a detached task so the lounge-send hot path
+    /// doesn't block on the delete + copy round-trip. Failures are
+    /// logged and the next bump retries from scratch.
+    pub async fn bump_lounge_anchor(&self) {
+        if !self.cfg.enabled {
+            return;
+        }
+        let lounge_chat = self.cfg.lounge_chat_id.clone();
+        let anchor_msg = self.cfg.lounge_anchor_msg_id;
+        if lounge_chat.is_empty() || anchor_msg <= 0 {
+            return;
+        }
+        let source_chat = if self.cfg.lounge_anchor_chat.is_empty() {
+            lounge_chat.clone()
+        } else {
+            self.cfg.lounge_anchor_chat.clone()
+        };
+        // Drop the prior copy first so the new copy is unambiguously the
+        // bottom message. Soft-fail: if the prior copy was already
+        // deleted by the operator (or never existed) the delete errors
+        // and we proceed to the fresh copy.
+        let prev = self.db.get_lounge_anchor_msg_id().unwrap_or(0);
+        if prev > 0 {
+            if let Err(e) = self.delete_message(&lounge_chat, prev).await {
+                let s = format!("{}", e);
+                if !s.contains("message to delete not found")
+                    && !s.contains("message can't be deleted")
+                {
+                    tracing::debug!("anchor-bump: delete prev {} failed: {}", prev, e);
+                }
+            }
+        }
+        match self.copy_message(&lounge_chat, &source_chat, anchor_msg).await {
+            Ok(new_id) => {
+                let _ = self.db.set_lounge_anchor_msg_id(new_id);
+                tracing::debug!("anchor-bump: copied source {} → {} (prev was {})", anchor_msg, new_id, prev);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "anchor-bump: copy {} from {} → {} failed: {}",
+                    anchor_msg, source_chat, lounge_chat, e
+                );
+            }
+        }
+    }
+
     /// Build the calls-channel chart for a token. Looks up the recent
     /// price history (since the call's first_seen — bounded to 6h to
     /// keep the sparkline meaningful for moonshot windows). Falls back
@@ -1777,6 +1880,7 @@ impl Notifier {
                             address, LOUNGE_CHANNEL, lounge_msg_id, 0, "MANUAL",
                             price, None, &timeline_json,
                         );
+                        self.bump_lounge_anchor().await;
                     }
                 }
             }
@@ -2252,6 +2356,7 @@ impl Notifier {
                                 Some(a.top_holder_pct),
                                 &timeline_json,
                             );
+                            self.bump_lounge_anchor().await;
                         }
                         Err(e) => {
                             tracing::warn!(

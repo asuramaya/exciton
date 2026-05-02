@@ -1344,6 +1344,28 @@ impl PhotonServer {
         .to_string()
     }
 
+    /// Bump the lounge anchor — delete the previous copy of the
+    /// configured "always at the bottom" message and copyMessage from
+    /// the source again as a fresh post. Photon does this automatically
+    /// after every photon-originated lounge send; this tool lets
+    /// zeroclaw or the operator trigger it manually after posting to
+    /// the lounge through some path photon doesn't observe.
+    #[tool]
+    async fn bump_lounge_anchor(&self) -> String {
+        let _ = self.db.audit_log("claude", "bump_lounge_anchor", "");
+        let notifier = match self.notifier.as_ref() {
+            Some(n) => n.clone(),
+            None => {
+                return serde_json::json!({"error": "notifier not configured"}).to_string()
+            }
+        };
+        notifier.bump_lounge_anchor().await;
+        serde_json::json!({
+            "current_msg_id": self.db.get_lounge_anchor_msg_id().unwrap_or(0),
+        })
+        .to_string()
+    }
+
     /// List currently active calls. Use before firing a new one or when
     /// deciding which calls to close. Returns the same rows visible on the
     /// public site.

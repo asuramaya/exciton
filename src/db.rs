@@ -396,6 +396,18 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_wallet_obs_wallet ON wallet_observations(wallet);
             CREATE INDEX IF NOT EXISTS idx_wallet_obs_mint ON wallet_observations(mint);
+            -- Lounge anchor state — singleton row tracking the current
+            -- copy of the always-at-bottom message in the lounge.
+            -- After every photon-originated lounge send, bump_lounge_anchor
+            -- deletes the previous copy and re-copies the source. Row 1
+            -- holds the most recent copy message_id so deletes survive
+            -- a process restart. INSERT OR IGNORE seeds the singleton.
+            CREATE TABLE IF NOT EXISTS lounge_anchor_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                current_msg_id INTEGER NOT NULL DEFAULT 0,
+                last_bump_at INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO lounge_anchor_state (id, current_msg_id, last_bump_at) VALUES (1, 0, 0);
             -- Idempotency: tracks which mints we've already traced so the
             -- promotion trigger fires the buyer-walk exactly once.
             CREATE TABLE IF NOT EXISTS wallet_observation_traces (
@@ -2279,6 +2291,33 @@ impl Db {
             .query_row(params![address, since_ts, until_ts], |row| row.get(0))
             .ok();
         Ok(price)
+    }
+
+    /// Read the current lounge-anchor copy's message_id. Zero means no
+    /// copy has ever been posted (or the row was just seeded).
+    pub fn get_lounge_anchor_msg_id(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT current_msg_id FROM lounge_anchor_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(id)
+    }
+
+    /// Persist the new lounge-anchor copy's message_id after a successful
+    /// copyMessage. Subsequent bumps will read it back and delete the
+    /// stale copy before posting fresh.
+    pub fn set_lounge_anchor_msg_id(&self, msg_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE lounge_anchor_state SET current_msg_id = ?1, last_bump_at = ?2 WHERE id = 1",
+            params![msg_id, now],
+        )?;
+        Ok(())
     }
 
     /// Claim a mint for buyer-trace. Atomic: returns Ok(true) when the
