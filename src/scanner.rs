@@ -240,17 +240,19 @@ impl BackgroundScanner {
             .db
             .audit_log("scanner", "start", "Background scanner started");
 
-        // One-time startup cleanup + card backfill — spawned as a sibling
-        // task so the main scan loop can begin immediately. Backfill walks
-        // up to 200 closed calls editing TG cards at 2s/card pacing (~6+
-        // minutes) — used to block the scan loop on every restart, blanking
-        // the live ledger for 6 min just to re-render history that's already
-        // correct. Now both run concurrently with scanning.
+        // One-time startup orphan-cleanup spawned as a sibling task.
+        //
+        // backfill_terminal_deliveries was previously also called here as a
+        // migration tool to upgrade legacy card formats. Disabled 2026-05-02
+        // — it now actively harms the channel: every restart re-rendered all
+        // closed cards, wiping fresh claw verdicts written by the explicit
+        // backfill_cards MCP tool. Edit counts climbed to 90+ per card
+        // across the day's restart cadence. Manual backfill_cards now owns
+        // the re-render flow; nothing needs to fire automatically on boot.
         {
             let me = self.clone();
             tokio::spawn(async move {
                 me.cleanup_orphaned_calls().await;
-                me.backfill_terminal_deliveries().await;
             });
         }
 
