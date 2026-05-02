@@ -109,12 +109,14 @@ pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 0.0;
 // threshold; absence of data does NOT block (the auto-refresh will catch
 // up on the next analysis cycle).
 pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
-// 2026-05-02 PM: sniper ceiling 30 → 60. Live runner cohort sits at
-// median 52% sniper (p75=58.7%); the 30% gate killed 88% of runners vs
-// 76% of non-runners (net -12pp anti-signal). 60% still cuts the >60%
-// pure-bot-rug tail while letting the organic post-snipe accumulation
-// pattern through.
-pub const SIGNAL_MAX_SNIPER_PCT: f64 = 60.0;
+// 2026-05-02 PM: sniper gate is net-anti-signal (-12.3pp) — the runner
+// cohort literally clusters at higher sniper% than non-runners. Started
+// at 60 (cohort p75); live tape showed real-time STAIRCASE candidates
+// clip at sniper 70-100% (median 70%). Pushed to 95 — only blocks the
+// pure-saturated 100% bot-rug shape, lets everything else through. This
+// is essentially keeping the gate as a sanity floor only; bundle (which
+// has +1.8pp positive delta) does the real concentration filtering.
+pub const SIGNAL_MAX_SNIPER_PCT: f64 = 95.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
 // Buy/sell ratio gates. 2026-04-30: relaxed 1.10-1.30 → 1.05-1.40 to fire
