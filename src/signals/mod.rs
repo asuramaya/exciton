@@ -441,7 +441,13 @@ pub async fn analyze_token(
         .get_token_largest_accounts(mint_address)
         .await
         .with_context(|| format!("fetch largest accounts for {}", mint_address))?;
-    let holder_count = holders.len();
+    // Real holder count via Birdeye/Solscan (RPC's getTokenLargestAccounts
+    // is capped at 20). Falls back to the RPC-cap reading when API keys
+    // are absent or both providers fail. 60s cache so we don't hammer.
+    let holder_count: usize = match crate::holders::get_holder_count(mint_address).await {
+        Some(real) => real as usize,
+        None => holders.len(),
+    };
     let top_holder_pct = if !holders.is_empty() && supply_ui > 0.0 {
         (holders[0].ui_amount / supply_ui) * 100.0
     } else {

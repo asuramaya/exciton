@@ -7,6 +7,7 @@ mod bonding_curve;
 mod bot;
 mod chart_screenshot;
 mod config;
+mod holders;
 mod db;
 mod discovery;
 mod discovery_pollers;

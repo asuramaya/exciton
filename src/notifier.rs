@@ -203,8 +203,15 @@ pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
 // Cohort feature gradient confirmed: wins p75 top1=14, losses
 // p75=22, blowups p75=22+. 18 cleanly separates.
 pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 18.0;
-pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 15;
-pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
+// 2026-05-02 PM — was 15/60, calibrated against the broken RPC-capped
+// reading (always returned ≤20). Now that holder_count comes from
+// Birdeye/Solscan with real values, the range needs to reflect reality:
+// post-graduation pump.fun tokens at $5-80k mcap typically have
+// 30-500 holders; runners reach 1000+. Floor stays at 30 (above
+// dev+initial-snipers); ceiling lifted to 1000 so we don't veto
+// successful runs. FURY had 90 holders at first observation.
+pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 30;
+pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 1000;
 // Lifted from 50/min to 200/min after universe analysis: tpm 50-200
 // dragged hit-rate down. Above 200 tokens have enough genuine flow to
 // support a +200% leg before the dump.
