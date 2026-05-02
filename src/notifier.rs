@@ -1263,15 +1263,24 @@ impl Notifier {
             reason = reason,
         );
         let body = serde_json::json!({ "message": prompt });
-        // 12s timeout — zeroclaw → ChatGPT round-trips routinely take 4-8s
-        // under load (especially during a backfill run with sequential
-        // calls). 4s was timing out the majority of requests, dropping
-        // every card to the deterministic "small green, took it on a
-        // moonshot" line. Backfill runs in a detached task so a longer
-        // budget doesn't block any user-facing path.
+        // Stateless per-call session — without a unique X-Session-Id
+        // each request inherits the running ChatGPT conversation's
+        // entire prior context, blowing latency past any reasonable
+        // timeout and forcing the model to also reason about whatever
+        // /claw chats the operator was having. Verdict lines are pure
+        // styling tasks; a fresh chat per call is correct.
+        let session_id = format!(
+            "photon-verdict-{}-{}",
+            ticker,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let resp = self
             .http
             .post("http://zeroclaw:42617/webhook")
+            .header("X-Session-Id", session_id)
             .timeout(std::time::Duration::from_secs(12))
             .json(&body)
             .send()
