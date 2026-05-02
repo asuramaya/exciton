@@ -430,6 +430,20 @@ impl Db {
                 label TEXT NOT NULL DEFAULT '',
                 added_at INTEGER NOT NULL
             );
+            -- DexScreener paid-boost observations. The `amount` column is
+            -- the boost level the project paid for (10/50/100/500 etc.);
+            -- `source` is which feed it came from. Used as an early signal:
+            -- a token actively paying for promotion is a strong intent
+            -- marker even before classification + tape gates qualify.
+            CREATE TABLE IF NOT EXISTS token_boosts (
+                token_address TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                PRIMARY KEY (token_address, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_boosts_addr_time
+                ON token_boosts (token_address, observed_at DESC);
             -- Wallet ledger: every detected swap on the operating wallet,
             -- keyed by tx signature for idempotent replays. side = 'buy'
             -- when we gained the token, 'sell' when we exited.
@@ -665,6 +679,46 @@ impl Db {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Record a DexScreener boost observation for a token. Called from
+    /// the discovery poller when an item from boost feeds carries an
+    /// `amount` field. Idempotent on (token, observed_at) — repeated
+    /// polls of the same boost within the same second collapse.
+    pub fn record_token_boost(
+        &self,
+        token_address: &str,
+        amount: i64,
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR IGNORE INTO token_boosts (token_address, amount, source, observed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![token_address, amount, source, now],
+        )?;
+        Ok(())
+    }
+
+    /// Latest boost amount observed for a token within `lookback_secs`,
+    /// or 0 if none. Used by signal gates as an early-conviction marker.
+    pub fn latest_boost_within(
+        &self,
+        token_address: &str,
+        lookback_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - lookback_secs;
+        let amount: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(amount) FROM token_boosts
+                 WHERE token_address = ?1 AND observed_at >= ?2",
+                params![token_address, cutoff],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(amount.unwrap_or(0))
     }
 
     /// Trail-stop fakeout guard. NYAN (May 2): called at $60k mcap, took

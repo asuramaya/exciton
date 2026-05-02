@@ -999,6 +999,27 @@ impl Notifier {
             true // unknown current price → fall back to other gates
         };
 
+        // Boost override: a project paying DexScreener for promotion
+        // is real-money intent — strong early signal even when standard
+        // pattern gates are borderline. When the token has any boost
+        // observed in the last 4 hours, relax the holders + tx_rate +
+        // age gates (the most common moonshot-blockers for fresh
+        // boost-paid tokens that haven't built tape yet). Required gates
+        // still hold: class, mcap window, top1 ceiling, forensics.
+        let boost_amount = self
+            .db
+            .latest_boost_within(&a.address, 4 * 3600)
+            .unwrap_or(0);
+        if boost_amount > 0 {
+            if mcap_ok && top1_ok && bundle_ok && sniper_ok && insider_ok && pre_ok {
+                tracing::info!(
+                    "moonshot boost-override fire: {} boosted +{} → relaxed gates passing",
+                    a.address, boost_amount
+                );
+                return true;
+            }
+        }
+
         mcap_ok
             && holders_ok
             && top1_ok

@@ -89,6 +89,8 @@ impl DiscoveryPoller {
             anyhow::bail!("status {}", resp.status());
         }
         let items: Vec<DsTokenRef> = resp.json().await?;
+        let source_tag = short_url(url);
+        let is_boost_feed = source_tag.starts_with("ds:boosts");
         let mut added = 0;
         for item in items {
             if item.chain_id.as_deref() != Some("solana") {
@@ -97,6 +99,22 @@ impl DiscoveryPoller {
             let Some(mint) = item.token_address else {
                 continue;
             };
+            // Boost capture: any item from ds:boosts-* with a positive
+            // amount becomes a token_boosts row. Used by the signal
+            // gates as an early conviction marker — a project paying
+            // for promotion is real-money intent, even if our standard
+            // pattern gates haven't qualified the token yet.
+            if is_boost_feed {
+                if let Some(amount) = item.amount {
+                    if amount > 0 {
+                        if let Err(e) =
+                            self.db.record_token_boost(&mint, amount, source_tag)
+                        {
+                            tracing::debug!("discovery poll: record_boost {} failed: {}", mint, e);
+                        }
+                    }
+                }
+            }
             // Already known — leave it alone. The watchlist scanner
             // owns reanalysis cadence; we only seed new mints.
             if self
@@ -130,6 +148,9 @@ struct DsTokenRef {
     chain_id: Option<String>,
     #[serde(rename = "tokenAddress")]
     token_address: Option<String>,
+    /// Boost amount on `ds:boosts-*` endpoints. Absent on profile feed.
+    #[serde(default)]
+    amount: Option<i64>,
 }
 
 fn short_url(u: &str) -> &str {
