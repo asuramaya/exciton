@@ -20,7 +20,7 @@ RUN cargo build --release --bin photon
 
 FROM debian:bookworm-slim
 
-RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         openssh-client     && git config --global --add safe.directory /srv/MadApes.ai     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update     && apt-get install -y --no-install-recommends         ca-certificates         git         openssh-client         fonts-dejavu-core         fontconfig     && git config --global --add safe.directory /srv/MadApes.ai     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /data
 
