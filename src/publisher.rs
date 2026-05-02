@@ -933,17 +933,47 @@ impl Publisher {
             // and (closed_at or now). Lets the front end show "ran +210%
             // before settling at +50%" — the entry/exit pair alone hides
             // the swing magnitude. Skip when we can't compute a pct.
+            //
+            // Snapshot-gap floor (2026-05-02): token_snapshots cadence
+            // can drop to multi-minute gaps during fast runs (LMEOW had a
+            // 46-min gap during a +393% pump and the publisher reported
+            // peak +95% from the only snapshots that landed in window).
+            // Use the realized exit pct as a lower bound — the trail-stop
+            // ladder fires AT or near the run's peak, so exit ≤ peak by
+            // definition. Take max(snap_peak, exit_pct) so the journey
+            // never undersells the actual high-water mark.
             let (peak_pct, peak_at, trough_pct, trough_at) =
                 if row.entry_price_usd > 0.0 {
                     let until = row.closed_at.unwrap_or(now);
-                    match self.db.get_price_extremes(&row.mint, row.called_at, until) {
-                        Ok(Some(((hi, hi_ts), (lo, lo_ts)))) => (
-                            Some((hi / row.entry_price_usd - 1.0) * 100.0),
-                            Some(hi_ts),
-                            Some((lo / row.entry_price_usd - 1.0) * 100.0),
-                            Some(lo_ts),
+                    let snap_extremes = self.db.get_price_extremes(&row.mint, row.called_at, until);
+                    let exit_pct_floor = row.exit_price_usd.and_then(|exit| {
+                        if exit > 0.0 {
+                            Some((exit / row.entry_price_usd - 1.0) * 100.0)
+                        } else {
+                            None
+                        }
+                    });
+                    match snap_extremes {
+                        Ok(Some(((hi, hi_ts), (lo, lo_ts)))) => {
+                            let snap_peak_pct = (hi / row.entry_price_usd - 1.0) * 100.0;
+                            let snap_trough_pct = (lo / row.entry_price_usd - 1.0) * 100.0;
+                            let combined_peak = match exit_pct_floor {
+                                Some(f) if f > snap_peak_pct => f,
+                                _ => snap_peak_pct,
+                            };
+                            (
+                                Some(combined_peak),
+                                Some(hi_ts),
+                                Some(snap_trough_pct),
+                                Some(lo_ts),
+                            )
+                        }
+                        _ => (
+                            exit_pct_floor,
+                            row.closed_at,
+                            None,
+                            None,
                         ),
-                        _ => (None, None, None, None),
                     }
                 } else {
                     (None, None, None, None)
