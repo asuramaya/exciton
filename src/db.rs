@@ -623,6 +623,50 @@ impl Db {
         Ok(())
     }
 
+    /// Latest snapshot per mint matching watching criteria, used by the
+    /// publisher's stream "watching" tier. Pulls tokens currently
+    /// classified at conf >= conf_min in classes that fire calls
+    /// (STAIRCASE/GRINDER/SPRING/DEVELOPING) within `since_ts`. The
+    /// near-miss table only logs tokens that ALMOST fired on a single
+    /// gate; this surfaces the broader set the bot is actively analyzing.
+    pub fn get_active_watching_candidates(
+        &self,
+        since_ts: i64,
+        conf_min: i32,
+        limit: usize,
+    ) -> Result<Vec<(String, String, i32, f64, f64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.token_address, s.classification, s.confidence,
+                    s.top_holder_pct, s.top10_pct, s.timestamp
+             FROM token_snapshots s
+             INNER JOIN (
+               SELECT token_address, MAX(timestamp) AS max_ts
+               FROM token_snapshots
+               WHERE timestamp >= ?1 AND confidence >= ?2
+                 AND classification IN ('STAIRCASE','GRINDER','SPRING','DEVELOPING')
+               GROUP BY token_address
+             ) latest
+               ON latest.token_address = s.token_address
+              AND latest.max_ts = s.timestamp
+             ORDER BY s.confidence DESC, s.timestamp DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![since_ts, conf_min, limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i32>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_recent_near_misses(&self, limit: usize) -> Result<Vec<NearMiss>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

@@ -649,7 +649,18 @@ impl Publisher {
     }
 
     async fn build_stream_file(&self) -> StreamFile {
-        let mut events: Vec<StreamEvent> = Vec::new();
+        // Slot allocation per kind so the global newest-first cap doesn't
+        // drown call/trade events under alert volume. Production showed
+        // all 23 published events were `kind=alert` because alerts
+        // outpace call/trade timestamps (scanner emits alerts every
+        // 15s; calls fire ~2-5/hr; trades = 0 in paper mode). Each
+        // kind gets its own bucket; final stream is the merged sort.
+        const SLOT_ALERTS: usize = 18;
+        const SLOT_CALLS: usize = 16;
+        const SLOT_TRADES: usize = 10;
+        let mut alert_events: Vec<StreamEvent> = Vec::new();
+        let mut call_events: Vec<StreamEvent> = Vec::new();
+        let mut trade_events: Vec<StreamEvent> = Vec::new();
 
         // Recent scanner alerts — any with confidence >= 50 gets in. The
         // alert table stores the full mint inline in the message body for
@@ -693,8 +704,10 @@ impl Publisher {
             for (_, mut bucket) in by_key {
                 bucket.sort_by(|a, b| b.ts.cmp(&a.ts));
                 bucket.truncate(PER_KEY_KEEP);
-                events.extend(bucket);
+                alert_events.extend(bucket);
             }
+            alert_events.sort_by(|a, b| b.ts.cmp(&a.ts));
+            alert_events.truncate(SLOT_ALERTS);
         }
 
         // Recent wallet trades — every row the ledger detected.
@@ -704,7 +717,7 @@ impl Publisher {
             .unwrap_or_default();
         for (ts, mint, side, sig, tok, sol) in trades {
             let verb = if side == "buy" { "bought" } else { "cut" };
-            events.push(StreamEvent {
+            trade_events.push(StreamEvent {
                 ts,
                 kind: "trade".into(),
                 tag: side.to_uppercase(),
@@ -719,6 +732,8 @@ impl Publisher {
                 signature: Some(sig),
             });
         }
+        trade_events.sort_by(|a, b| b.ts.cmp(&a.ts));
+        trade_events.truncate(SLOT_TRADES);
 
         // Calls fired + closed, newest first.
         if let Ok(rows) = self.db.list_calls(false, 25) {
@@ -729,7 +744,7 @@ impl Publisher {
                     format!("${}", c.symbol)
                 };
                 match c.status.as_str() {
-                    "active" => events.push(StreamEvent {
+                    "active" => call_events.push(StreamEvent {
                         ts: c.called_at,
                         kind: "call".into(),
                         tag: "CALL FIRED".into(),
@@ -741,14 +756,15 @@ impl Publisher {
                         mint: Some(c.mint),
                         signature: None,
                     }),
-                    "closed" | "expired" => {
+                    "withdrew" | "failed" | "closed" | "expired" => {
                         if let Some(closed_ts) = c.closed_at {
-                            let tag_str = if c.status == "expired" {
-                                "CALL EXPIRED"
-                            } else {
-                                "CALL CLOSED"
+                            let tag_str = match c.status.as_str() {
+                                "expired" => "CALL EXPIRED",
+                                "withdrew" => "CALL WITHDREW",
+                                "failed" => "CALL FAILED",
+                                _ => "CALL CLOSED",
                             };
-                            events.push(StreamEvent {
+                            call_events.push(StreamEvent {
                                 ts: closed_ts,
                                 kind: "call".into(),
                                 tag: tag_str.into(),
@@ -766,10 +782,16 @@ impl Publisher {
                 }
             }
         }
+        call_events.sort_by(|a, b| b.ts.cmp(&a.ts));
+        call_events.truncate(SLOT_CALLS);
 
-        // Sort newest first, cap at 50.
+        // Merge slots, sort by timestamp newest-first, hard cap.
+        let mut events: Vec<StreamEvent> = Vec::new();
+        events.extend(alert_events);
+        events.extend(call_events);
+        events.extend(trade_events);
         events.sort_by(|a, b| b.ts.cmp(&a.ts));
-        events.truncate(50);
+        events.truncate(60);
 
         // Enrich each distinct mint with current market metadata. The
         // client uses this for the token-card header in the live feed —
@@ -818,37 +840,52 @@ impl Publisher {
             .filter_map(|e| e.mint.clone())
             .collect();
         let mut watching: Vec<WatchingEntry> = Vec::new();
-        if let Ok(rows) = self.db.get_recent_near_misses(120) {
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for r in rows {
-                if event_mints.contains(&r.token_address) {
+
+        // Watching tier source: latest snapshot per mint at conf>=60 in
+        // the firing classes (STAIRCASE/GRINDER/SPRING/DEVELOPING) within
+        // the last 30min. Replaces the prior near-miss-table source which
+        // only logged tokens that ALMOST fired on a single specific gate
+        // (production showed `watching: 0` despite 6 active candidates in
+        // DB). We still cross-reference the near-miss table to surface a
+        // single "blocking gate" hint per row when one exists.
+        let near_miss_by_mint: std::collections::HashMap<String, (String, String)> = self
+            .db
+            .get_recent_near_misses(200)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.timestamp >= now_ts - watch_window)
+            .map(|r| (r.token_address, (r.gate_that_failed, r.gap)))
+            .collect();
+
+        if let Ok(rows) = self
+            .db
+            .get_active_watching_candidates(now_ts - watch_window, 60, 30)
+        {
+            for (mint, classification, conf, top1, _top10, ts) in rows {
+                if event_mints.contains(&mint) {
                     continue;
                 }
-                if r.timestamp < now_ts - watch_window {
-                    continue;
-                }
-                if r.effective_confidence < 60 {
-                    continue;
-                }
-                if !seen.insert(r.token_address.clone()) {
-                    continue;
-                }
-                let age = now_ts - r.timestamp;
+                let r_token_address = mint.clone();
+                let age = now_ts - ts;
+                let (gate, gap) = near_miss_by_mint
+                    .get(&mint)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), String::new()));
                 let mut entry = WatchingEntry {
-                    mint: r.token_address.clone(),
+                    mint: mint.clone(),
                     symbol: None,
-                    classification: r.classification,
-                    confidence: r.effective_confidence,
-                    top_holder_pct: r.top_holder_pct,
+                    classification,
+                    confidence: conf,
+                    top_holder_pct: top1,
                     age_secs: age,
-                    gate: r.gate_that_failed,
-                    gap: r.gap,
-                    last_seen: r.timestamp,
+                    gate,
+                    gap,
+                    last_seen: ts,
                 };
                 // Symbol from market cache when available — same enrichment
                 // as the events list. Cheap because get_market is cached.
-                if !tokens.contains_key(&r.token_address) {
-                    if let Ok(Some(m)) = market::get_market(&r.token_address).await {
+                if !tokens.contains_key(&r_token_address) {
+                    if let Ok(Some(m)) = market::get_market(&r_token_address).await {
                         let info = StreamTokenInfo {
                             symbol: Some(m.symbol.clone()).filter(|s| !s.is_empty()),
                             name: Some(m.name.clone()).filter(|s| !s.is_empty()),
@@ -859,9 +896,9 @@ impl Publisher {
                             liquidity_usd: Some(m.liquidity_usd).filter(|v| *v > 0.0),
                         };
                         entry.symbol = info.symbol.clone();
-                        tokens.insert(r.token_address.clone(), info);
+                        tokens.insert(r_token_address.clone(), info);
                     }
-                } else if let Some(info) = tokens.get(&r.token_address) {
+                } else if let Some(info) = tokens.get(&r_token_address) {
                     entry.symbol = info.symbol.clone();
                 }
                 watching.push(entry);

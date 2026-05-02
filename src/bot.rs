@@ -369,7 +369,7 @@ impl DmBot {
         }
 
         let result = match cmd.as_str() {
-            "start" => self.cmd_start(chat_id, first_time).await,
+            "start" => self.cmd_start(chat_id, first_time, &args).await,
             "help" => self.cmd_help(chat_id, is_admin).await,
             "menu" => self.cmd_menu(chat_id).await,
             "scan" => self.cmd_scan(chat_id).await,
@@ -554,7 +554,15 @@ impl DmBot {
 
     // -- Command handlers --------------------------------------------------
 
-    async fn cmd_start(&self, chat_id: i64, first_time: bool) -> Result<()> {
+    async fn cmd_start(&self, chat_id: i64, first_time: bool, args: &str) -> Result<()> {
+        // Deep-link payload routing — call cards in the channel use
+        // [Details] buttons that open `t.me/<bot>?start=call_<address>`.
+        // Telegram delivers the suffix as the /start arg. Dispatch to a
+        // detail renderer so the user lands in DM with the full data
+        // sheet for that specific call.
+        if let Some(addr) = args.strip_prefix("call_") {
+            return self.cmd_call_details(chat_id, addr.trim()).await;
+        }
         let greeting = if first_time {
             "🤖 <b>Welcome</b>"
         } else {
@@ -574,6 +582,83 @@ impl DmBot {
         };
         // Clear any stale persistent reply keyboard from prior versions.
         self.send(chat_id, &body, Some(&clear_keyboard())).await?;
+        Ok(())
+    }
+
+    /// Render the full data dump for one call. Triggered from the
+    /// [Details] inline-keyboard button on channel cards
+    /// (deep-link `t.me/<bot>?start=call_<address>`). Pulls the call row,
+    /// latest snapshot, and forensics into one DM-only sheet so the
+    /// channel card stays minimal.
+    async fn cmd_call_details(&self, chat_id: i64, address: &str) -> Result<()> {
+        let call = self.db.get_call_by_mint(address).ok().flatten();
+        let call = match call {
+            Some(c) => c,
+            None => {
+                self.send(chat_id, "no call recorded for that mint.", None).await?;
+                return Ok(());
+            }
+        };
+        let snap = self.db.get_latest_snapshot(address).ok().flatten();
+        let mut lines: Vec<String> = Vec::new();
+        let sym = if call.symbol.is_empty() { "?".to_string() } else { format!("${}", call.symbol) };
+        lines.push(format!("<b>{sym}</b> · <code>{}</code>", address));
+        lines.push(format!(
+            "called {} · class {} · conf {} · src {}",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(call.called_at, 0)
+                .map(|d| d.format("%b %d %H:%M UTC").to_string())
+                .unwrap_or_default(),
+            call.classification,
+            call.confidence,
+            call.source,
+        ));
+        lines.push(format!(
+            "entry mc ${:.0}k · entry px ${:.8} · liq ${:.0}k · top1 {:.1}%",
+            call.entry_mcap_usd / 1000.0,
+            call.entry_price_usd,
+            call.entry_liquidity_usd / 1000.0,
+            call.entry_top_holder_pct,
+        ));
+        if let Some(s) = snap.as_ref() {
+            lines.push(String::new());
+            lines.push("<b>latest snapshot</b>".to_string());
+            lines.push(format!(
+                "px ${:.8} · mc ${:.0}k · liq ${:.0}k",
+                s.price_usd, s.mcap_usd, s.liquidity_usd
+            ));
+            lines.push(format!(
+                "top1 {:.1}% · top10 {:.1}% · holders {} · tx_rate {:.0}/min",
+                s.top_holder_pct, s.top10_pct, s.holder_count, s.tx_rate
+            ));
+            lines.push(format!(
+                "bundle {:.0}% · sniper {:.0}% · insider {:.0}% · smart_money {}",
+                s.bundle_pct, s.sniper_pct, s.insider_pct, s.smart_money_count
+            ));
+            lines.push(format!(
+                "mom {} · dist {} · spring {} · class {}",
+                s.momentum, s.distribution, s.spring, s.classification
+            ));
+        }
+        if !call.note.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("<b>thesis</b>\n<i>{}</i>", crate::notifier::html_escape(&call.note)));
+        }
+        if matches!(call.status.as_str(), "withdrew" | "failed" | "expired" | "closed") {
+            lines.push(String::new());
+            let exit_pct = if call.entry_price_usd > 0.0 && call.exit_price_usd.unwrap_or(0.0) > 0.0 {
+                Some((call.exit_price_usd.unwrap() - call.entry_price_usd) / call.entry_price_usd * 100.0)
+            } else {
+                None
+            };
+            lines.push(format!(
+                "<b>closed</b> · {}{}{}",
+                call.status,
+                exit_pct.map(|p| format!(" · {:+.1}%", p)).unwrap_or_default(),
+                call.exit_note.as_deref().map(|n| format!("\n{}", crate::notifier::html_escape(n))).unwrap_or_default(),
+            ));
+        }
+        let body = lines.join("\n");
+        self.send(chat_id, &body, None).await?;
         Ok(())
     }
 

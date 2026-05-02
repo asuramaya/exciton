@@ -324,7 +324,7 @@ struct TrapCandidate {
     severity: f64,
 }
 
-fn html_escape(s: &str) -> String {
+pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1052,6 +1052,30 @@ impl Notifier {
         let chart_url = pair_url
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("https://dexscreener.com/solana/{}", address));
+        // [Details] surfaces the full data dump in the public bot DM
+        // (top1/top10, conf, mom/dist/spring, snapshot trail, forensics) —
+        // keeps the channel card minimal while still letting curious
+        // readers click through. Falls back to the legacy 3-button row
+        // when public_bot_username isn't configured.
+        if !self.cfg.public_bot_username.is_empty() {
+            let details_url = format!(
+                "https://t.me/{}?start=call_{}",
+                self.cfg.public_bot_username, address
+            );
+            return serde_json::json!({
+                "inline_keyboard": [
+                    [
+                        { "text": "🔬 Details", "url": details_url },
+                        { "text": "📊 Dexscreener", "url": chart_url },
+                    ],
+                    [
+                        { "text": "🔍 Solscan", "url": format!("https://solscan.io/token/{}", address) },
+                        { "text": "📋 Addr", "copy_text": { "text": address } },
+                    ]
+                ]
+            })
+            .to_string();
+        }
         serde_json::json!({
             "inline_keyboard": [[
                 { "text": "📊 Chart", "url": chart_url },

@@ -193,6 +193,13 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub anchor_source_chat: String,
 
+    /// Bot username (no @) for the public bot — used to construct
+    /// deep-links on call cards: t.me/<username>?start=call_<address>.
+    /// When empty, the [Details] inline-keyboard button is omitted and
+    /// the legacy [Chart]/[Solscan]/[Addr] row renders instead.
+    #[serde(default)]
+    pub public_bot_username: String,
+
     /// Stale lounge-side anchor msg_id to delete. The bump only tracks
     /// ONE active anchor slot (the destination chat), so any forward
     /// that landed in the lounge before the channel flip is never
