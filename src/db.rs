@@ -2254,6 +2254,33 @@ impl Db {
         Ok(price)
     }
 
+    /// Most recent (top_holder_pct, top10_pct) pair from token_snapshots
+    /// where top_holder_pct > 0 (i.e. the read wasn't a getMultipleAccounts
+    /// partial). Used as a fallback when the current analysis came back
+    /// with top_holder=0 due to RPC degradation — better to gate on
+    /// last-known distribution than to silently skip the candidate.
+    /// Bounded by max_age_secs so we don't carry forward distribution
+    /// data that's already stale.
+    pub fn get_last_good_top_holder(
+        &self,
+        address: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<(f64, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let since_ts = chrono::Utc::now().timestamp() - max_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT top_holder_pct, top10_pct FROM token_snapshots
+             WHERE token_address = ?1 AND timestamp >= ?2 AND top_holder_pct > 0
+             ORDER BY timestamp DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![address, since_ts], |row| {
+                Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
+            })
+            .ok();
+        Ok(row)
+    }
+
     /// Return the (timestamp, price_usd) series for a token within a time
     /// window — used by the chart sparkline renderer. Excludes price=0
     /// snapshots (failed fetches). Sorted ascending by ts.

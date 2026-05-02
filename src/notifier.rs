@@ -80,9 +80,12 @@ pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
 // threshold for a safety margin while still ~3x more permissive than the
 // prior gate.
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 18.0;
-// Top-10 gate kept at 30 — separately validated, cuts insider-bundler shape
-// even when top1 looks clean.
-pub const SIGNAL_MAX_TOP10_PCT: f64 = 30.0;
+// Top-10 gate. 2026-05-02: bumped 30 → 33 after silence-window trace
+// surfaced multiple near-passers at top10 31-34% (notably $3h4F4V8v…
+// missed standard gate by 1-3pp on top10 across consecutive STAIRCASE
+// snapshots while passing every other criterion). 33 still cuts the
+// insider-bundler shape (loser cohort sat at 38-50%).
+pub const SIGNAL_MAX_TOP10_PCT: f64 = 33.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 // 2026-05-01 Bucket A: liquidity floor 50k → 20k. Backtest universe used
 // 15k floor; 20k adds a 33% safety margin while still capturing ~85% of
@@ -190,6 +193,14 @@ pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
 // dragged hit-rate down. Above 200 tokens have enough genuine flow to
 // support a +200% leg before the dump.
 pub const MOONSHOT_MIN_TX_RATE_PER_MIN: f64 = 200.0;
+// Moonshot-specific age floor. The shared SIGNAL_MIN_TOKEN_AGE_SECS (900s)
+// excludes the entire moonshot opportunity window — DEVELOPING-class
+// snapshots typically last 15-60 seconds before classification rotates.
+// 3-min floor still requires distribution to settle past the very-first
+// fills (creator + initial 5 bonding-curve buyers) but doesn't kill the
+// fresh-DEV play. 2026-05-02: shipped after silence-window trace showed
+// 11/13 passing-mints rejected purely on age.
+pub const MOONSHOT_MIN_TOKEN_AGE_SECS: i64 = 180;
 // Pre-DEV trajectory: look back 30min for the oldest snapshot price.
 // Reject only when we have CONFIRMED downward slope (price now < pre-price).
 // NULL data (genuinely fresh) passes — base rate still positive.
@@ -984,10 +995,11 @@ impl Notifier {
         let bundle_ok = a.bundle_pct < MOONSHOT_MAX_BUNDLE_PCT;
         let sniper_ok = a.sniper_pct < MOONSHOT_MAX_SNIPER_PCT;
         let insider_ok = a.insider_pct < MOONSHOT_MAX_INSIDER_PCT;
-        // Age floor reused — token must exist long enough for organic
-        // distribution to form.
+        // Moonshot age floor — looser (3min) than the standard gate's
+        // 15min. Standard floor was killing every DEVELOPING-class entry
+        // because the classification window only lasts 15-60 seconds.
         let now = chrono::Utc::now().timestamp();
-        let age_ok = first_seen.map_or(false, |fs| now - fs >= SIGNAL_MIN_TOKEN_AGE_SECS);
+        let age_ok = first_seen.map_or(false, |fs| now - fs >= MOONSHOT_MIN_TOKEN_AGE_SECS);
 
         // Pre-DEV slope filter. Look back MOONSHOT_PRE_LOOKBACK_SECS
         // (30min) and find the oldest snapshot price for this token. If
@@ -1272,13 +1284,14 @@ impl Notifier {
         );
         let body = serde_json::json!({ "message": prompt });
 
-        // Up to 3 attempts with brief backoff. The 7/50 fallbacks in the
-        // prior backfill were all "error sending request for url" —
-        // transient connection errors to zeroclaw, fully retryable.
-        // Stateless per-call session via unique X-Session-Id (without
-        // it each request inherits the running ChatGPT conversation's
-        // full prior context, ballooning latency).
-        const MAX_ATTEMPTS: u32 = 3;
+        // Up to 5 attempts with exponential backoff (0.5s, 1s, 2s, 4s, 8s).
+        // The 6/43 fallbacks in the prior backfill all hit "error sending
+        // request for url" repeatedly — sporadic connection issues at the
+        // zeroclaw side, not sustained outage. 500ms × 3 attempts wasn't
+        // enough; longer windows ride out whatever's happening. Stateless
+        // per-call session via unique X-Session-Id (without it each request
+        // inherits the running ChatGPT conversation's full prior context).
+        const MAX_ATTEMPTS: u32 = 5;
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let session_id = format!(
@@ -1303,7 +1316,10 @@ impl Notifier {
                 Err(e) => {
                     last_err = Some(anyhow!("attempt {}: {}", attempt, e));
                     if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Exponential backoff: 500ms × 2^(attempt-1).
+                        // attempts 1..4 sleep 0.5s, 1s, 2s, 4s before retry.
+                        let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
                     break;
@@ -1322,7 +1338,10 @@ impl Notifier {
                 Err(e) => {
                     last_err = Some(anyhow!("attempt {}: parse {}", attempt, e));
                     if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Exponential backoff: 500ms × 2^(attempt-1).
+                        // attempts 1..4 sleep 0.5s, 1s, 2s, 4s before retry.
+                        let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
                     break;
@@ -1989,19 +2008,39 @@ impl Notifier {
         if !self.cfg.enabled {
             return Ok(());
         }
-        // Defense against transient RPC data glitches. When getMultipleAccounts
-        // returns a partial response, top_holder_pct can come back 0.0 with
-        // holders > 0 — the analyzer then computes a low confidence and any
-        // existing card flips to FAILED (one-way demote) on what is actually
-        // a winning trade. TIME MACHINE was the canonical example: +126%
-        // recovery, frozen FAILED card. Skip this snapshot entirely.
-        if a.top_holder_pct == 0.0 && a.holder_count > 0 {
-            tracing::debug!(
-                "process_token: skipping {} — top_holder=0.0 with {} holders (data glitch)",
-                a.address, a.holder_count
-            );
-            return Ok(());
-        }
+        // Defense against transient RPC data glitches. When
+        // getMultipleAccounts returns a partial response, top_holder_pct
+        // comes back 0.0 with holders > 0. Old behavior: silently skip,
+        // which silenced the bot for hours during RPC degradation since
+        // every analysis hit this. New behavior: try to backfill from the
+        // last good snapshot of this mint within 5min; if none, skip with
+        // an info-level log so the silence is observable.
+        let analysis_local: TokenAnalysis;
+        let a: &TokenAnalysis = if a.top_holder_pct == 0.0 && a.holder_count > 0 {
+            match self.db.get_last_good_top_holder(&a.address, 300).ok().flatten() {
+                Some((top1, top10)) => {
+                    analysis_local = TokenAnalysis {
+                        top_holder_pct: top1,
+                        top10_pct: top10,
+                        ..a.clone()
+                    };
+                    tracing::info!(
+                        "process_token: data-glitch fallback for {} — using last-known top_holder={:.1}% / top10={:.1}%",
+                        a.address, top1, top10
+                    );
+                    &analysis_local
+                }
+                None => {
+                    tracing::info!(
+                        "process_token: skipping {} — top_holder=0 with {} holders, no recent fallback (RPC degraded?)",
+                        a.address, a.holder_count
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            a
+        };
         let channel = CALLS_CHANNEL; // legacy internal DB key — kept stable to preserve
                                  // existing telegram_deliveries rows across the rename.
         let chat_id = self.cfg.signals_chat_id.clone();
