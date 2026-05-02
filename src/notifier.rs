@@ -1263,10 +1263,16 @@ impl Notifier {
             reason = reason,
         );
         let body = serde_json::json!({ "message": prompt });
+        // 12s timeout — zeroclaw → ChatGPT round-trips routinely take 4-8s
+        // under load (especially during a backfill run with sequential
+        // calls). 4s was timing out the majority of requests, dropping
+        // every card to the deterministic "small green, took it on a
+        // moonshot" line. Backfill runs in a detached task so a longer
+        // budget doesn't block any user-facing path.
         let resp = self
             .http
             .post("http://zeroclaw:42617/webhook")
-            .timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(12))
             .json(&body)
             .send()
             .await?;
@@ -1432,58 +1438,61 @@ impl Notifier {
         let (horizon, narrative) = crate::horizon::parse_with_clean(entry_note);
         let exit_pct = parse_pct_prefix(exit_note);
         let peak_pct = parse_peak_pct(exit_note);
-
-        // Flat band: trail-at-breakeven closes (peak<20% AND |exit|<5%) are
-        // mechanically tagged "withdrew" by the scanner because the trail
-        // floor sits at 0%, but they're not real wins. Render them as ⚪
-        // flat so the channel doesn't brag on rounding noise. Threshold
-        // mirrors the trail's first activation tier (peak >= 20%).
         let pct_signed = exit_pct.unwrap_or(0.0);
         let peak_signed = peak_pct.unwrap_or(pct_signed.max(0.0));
-        let is_flat_close =
-            (status == "withdrew" || status == "closed")
-                && pct_signed.abs() < 5.0
-                && peak_signed < 20.0;
 
-        let header = if is_flat_close {
-            format!("⚪ {} — flat", ticker_name)
+        // Realized-pct bucket — source of truth for header + body voice.
+        // Mirrors the site's pctBucket(): scanner.status is a lifecycle
+        // tag (which exit branch fired), realized pct is the user-visible
+        // truth. A position tagged "withdrew" by the trail-at-breakeven
+        // trigger but exited at -97% is a loss, not a win. Flat is
+        // realized-flat regardless of peak.
+        let is_terminal = matches!(status, "withdrew" | "closed" | "failed" | "expired" | "voided");
+        let bucket: &str = if !is_terminal {
+            "active"
+        } else if exit_pct.is_none() {
+            "unknown"
+        } else if pct_signed >= 5.0 {
+            "won"
+        } else if pct_signed <= -5.0 {
+            "loss"
         } else {
-            match status {
-                "withdrew" | "closed" => {
-                    let mult_label = exit_pct
-                        .map(|p| {
-                            let m = 1.0 + p / 100.0;
-                            if m >= 2.0 { format!(" — {:.1}x ✊", m) }
-                            else { format!(" — {:+.0}%", p) }   // {:+} sign-formats; no double prefix
-                        })
-                        .unwrap_or_default();
-                    format!("🟢 {}{}", ticker_name, mult_label)
-                }
-                "failed" => {
-                    let label = exit_pct.map(|p| format!(" — {:+.0}%", p)).unwrap_or_default();
-                    format!("🔴 {}{}", ticker_name, label)
-                }
-                "expired" => format!("⏰ {} — flat", ticker_name),
-                "voided"  => format!("⚪ {} — voided", ticker_name),
-                _ => format!("📣 {} — new call", ticker_name),
-            }
+            "flat"
         };
 
-        // Body voice. Flat-band closes get a one-liner — no brag, no loss
-        // melodrama. Real wins/losses still go through the ape composer
-        // unless the caller supplied a claw-authored override.
-        let body = if is_flat_close {
-            "trail caught it at breakeven. flat exit.".to_string()
-        } else if let Some(b) = override_body {
+        let header = match (bucket, status) {
+            ("active", _) => format!("📣 {} — new call", ticker_name),
+            (_, "voided") => format!("⚪ {} — voided", ticker_name),
+            ("won", _) => {
+                let mult_label = exit_pct
+                    .map(|p| {
+                        let m = 1.0 + p / 100.0;
+                        if m >= 2.0 { format!(" — {:.1}x ✊", m) }
+                        else { format!(" — {:+.0}%", p) }
+                    })
+                    .unwrap_or_default();
+                format!("🟢 {}{}", ticker_name, mult_label)
+            }
+            ("loss", _) => {
+                let label = exit_pct.map(|p| format!(" — {:+.0}%", p)).unwrap_or_default();
+                format!("🔴 {}{}", ticker_name, label)
+            }
+            ("flat", _) => format!("⚪ {} — flat", ticker_name),
+            // expired or unknown bucket
+            (_, "expired") => format!("⏰ {} — no follow-through", ticker_name),
+            _ => format!("· {}", ticker_name),
+        };
+
+        // Body voice. Override (claw-authored) wins when present. Otherwise
+        // the deterministic composer maps from realized-pct bucket.
+        let body = if let Some(b) = override_body {
             b.to_string()
         } else {
-            match status {
-                "withdrew" | "closed" => {
-                    compose_ape_brag(pct_signed, peak_signed, horizon)
-                }
-                "failed" | "expired" => {
-                    compose_ape_loss(pct_signed, peak_signed, status)
-                }
+            match bucket {
+                "won"  => compose_ape_brag(pct_signed, peak_signed, horizon),
+                "loss" => compose_ape_loss(pct_signed, peak_signed, status),
+                "flat" => "trail caught it at breakeven. flat exit.".to_string(),
+                "active" => narrative.trim().to_string(),
                 _ => narrative.trim().to_string(),
             }
         };
@@ -1769,30 +1778,28 @@ impl Notifier {
             .map(|c| c.note)
             .unwrap_or_default();
 
-        // Ask zeroclaw to author the close verdict line. Skip when the
-        // call has no entry narrative (legacy pre-deploy fires — those
-        // get the deterministic header-only treatment per task #24).
-        // Skip the flat-band closes — they get a fixed "trail caught it
-        // at breakeven" line in the renderer. Skip the manual-close
-        // path where exit_note starts with "MANUAL".
+        // Ask zeroclaw to author the close verdict line. Bucket by
+        // realized pct (matches render_call_card and site logic):
+        //   |pct| < 5  → flat  (skip claw, fixed breakeven line)
+        //   pct >= 5   → won   (claw writes brag)
+        //   pct <= -5  → loss  (claw writes loss line)
+        // Bucket on realized pct alone — peak-gating was wrong since a
+        // runner-retrace is a loss in the user's wallet regardless of
+        // how high it printed. is_win for the prompt follows the
+        // realized bucket too, not the scanner's outcome tag.
         let exit_pct_val = exit_pct.unwrap_or(0.0);
         let peak_pct_val = parse_peak_pct(exit_note).unwrap_or(exit_pct_val.max(0.0));
-        let is_flat = (outcome == "withdrew" || outcome == "closed")
-            && exit_pct_val.abs() < 5.0
-            && peak_pct_val < 20.0;
+        let bucket = if exit_pct.is_none() { "unknown" }
+            else if exit_pct_val >= 5.0 { "won" }
+            else if exit_pct_val <= -5.0 { "loss" }
+            else { "flat" };
         let has_ape_narrative = !entry_note.trim().is_empty()
             && !entry_note.contains("FIRST CALL")
             && !entry_note.starts_with("manual");
-        let claw_body: Option<String> = if !is_flat
-            && has_ape_narrative
-            && (outcome == "withdrew" || outcome == "closed" || outcome == "failed" || outcome == "expired")
-        {
+        let claw_body: Option<String> = if (bucket == "won" || bucket == "loss") && has_ape_narrative {
             let (horizon, _) = crate::horizon::parse_with_clean(&entry_note);
             let ticker = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
-            let is_win = outcome == "withdrew" || outcome == "closed";
-            // Strip the leading pct prefix from exit_note for the reason
-            // field — model gets cleaner context from "trailing stop @
-            // +25% (peak +75%)" than "+22.1% · trailing stop @ +25%...".
+            let is_win = bucket == "won";
             let reason = exit_note
                 .splitn(2, " · ")
                 .nth(1)
@@ -1803,9 +1810,12 @@ impl Notifier {
                 .claw_verdict_line(ticker, horizon, exit_pct_val, peak_pct_val, &reason, is_win)
                 .await
             {
-                Ok(line) => Some(line),
+                Ok(line) => {
+                    tracing::info!("claw verdict ({}): {} → {}", bucket, address, line);
+                    Some(line)
+                }
                 Err(e) => {
-                    tracing::debug!("claw verdict fallback for {}: {}", address, e);
+                    tracing::warn!("claw verdict fallback for {} ({}): {}", address, bucket, e);
                     None
                 }
             }
