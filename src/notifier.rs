@@ -1235,75 +1235,119 @@ impl Notifier {
             crate::horizon::Horizon::Moonshot => "MOONSHOT (lottery shot)",
             crate::horizon::Horizon::Unknown  => "memecoin punt",
         };
+        let _ = is_win; // bucket already encoded by exit pct in prompt
         let mult = 1.0 + exit_pct / 100.0;
-        let outcome = if is_win { "won" } else { "lost" };
         let peak_clause = if peak_pct > exit_pct + 25.0 && peak_pct >= 50.0 {
             format!(" · peak {:+.0}% (trail caught a retrace)", peak_pct)
         } else {
             String::new()
         };
         let prompt = format!(
-            "You write one-line trade-close commentary in the voice of a Solana memecoin ape — \
-             first person, terse, no emojis, no hashtags, no exclamation marks, no preamble. \
-             Lowercase only. 100-180 chars. Speak as if telling a friend across the bar what \
-             just happened. Don't restate the numbers verbatim — color them. Vary your phrasing; \
-             don't repeat openers like \"small green\" or \"took it on a moonshot.\"\n\n\
+            "You write one-line trade-close commentary for a Telegram trading channel. \
+             Voice: human trader, factual, action-oriented. First person, lowercase, \
+             no emojis, no hashtags, no exclamation marks, no metaphors, no similes, \
+             no poetry, no \"like a ___\" comparisons. Just what happened: where you \
+             got in, what the price did, why you exited. State numbers when they matter. \
+             100-160 chars. Vary your phrasing across calls.\n\n\
              Context:\n\
              - ticker: ${ticker}\n\
              - horizon: {horizon}\n\
-             - outcome: {outcome} ({pct:+.0}%, multiplier {mult:.2}x){peak}\n\
+             - exit: {pct:+.0}% ({mult:.2}x){peak}\n\
              - reason: {reason}\n\n\
+             Examples of the voice (don't copy phrasing, just shape):\n\
+             - aped {ticker_eg1} at 40k, ran to +120, trailing stop took me out at +85.\n\
+             - in {ticker_eg2} at 12k, never moved, moonshot stop hit at -27.\n\
+             - scalp filled on {ticker_eg3}, +30 clean, walked.\n\
+             - {ticker_eg4} peaked +47 then bled, out -8 on the retrace.\n\
+             - stopped on {ticker_eg5} at -42, flow died at entry, no setup.\n\n\
              Reply with the line only. Nothing else.",
             ticker = ticker,
             horizon = horizon_label,
-            outcome = outcome,
             pct = exit_pct,
             mult = mult,
             peak = peak_clause,
             reason = reason,
+            ticker_eg1 = "$EG1", ticker_eg2 = "$EG2", ticker_eg3 = "$EG3",
+            ticker_eg4 = "$EG4", ticker_eg5 = "$EG5",
         );
         let body = serde_json::json!({ "message": prompt });
-        // Stateless per-call session — without a unique X-Session-Id
-        // each request inherits the running ChatGPT conversation's
-        // entire prior context, blowing latency past any reasonable
-        // timeout and forcing the model to also reason about whatever
-        // /claw chats the operator was having. Verdict lines are pure
-        // styling tasks; a fresh chat per call is correct.
-        let session_id = format!(
-            "photon-verdict-{}-{}",
-            ticker,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let resp = self
-            .http
-            .post("http://zeroclaw:42617/webhook")
-            .header("X-Session-Id", session_id)
-            .timeout(std::time::Duration::from_secs(12))
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("zeroclaw verdict {}", resp.status()));
+
+        // Up to 3 attempts with brief backoff. The 7/50 fallbacks in the
+        // prior backfill were all "error sending request for url" —
+        // transient connection errors to zeroclaw, fully retryable.
+        // Stateless per-call session via unique X-Session-Id (without
+        // it each request inherits the running ChatGPT conversation's
+        // full prior context, ballooning latency).
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let session_id = format!(
+                "photon-verdict-{}-{}-{}",
+                ticker,
+                attempt,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let send_result = self
+                .http
+                .post("http://zeroclaw:42617/webhook")
+                .header("X-Session-Id", session_id)
+                .timeout(std::time::Duration::from_secs(12))
+                .json(&body)
+                .send()
+                .await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow!("attempt {}: {}", attempt, e));
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            if !resp.status().is_success() {
+                last_err = Some(anyhow!("attempt {}: zeroclaw {}", attempt, resp.status()));
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                break;
+            }
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = Some(anyhow!("attempt {}: parse {}", attempt, e));
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let raw = data["response"].as_str().unwrap_or("").trim().to_string();
+            let cleaned = raw
+                .trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
+                .to_string();
+            if cleaned.is_empty() {
+                last_err = Some(anyhow!("attempt {}: empty response", attempt));
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                break;
+            }
+            let bounded = if cleaned.len() > 200 {
+                format!("{}…", &cleaned[..199])
+            } else {
+                cleaned
+            };
+            return Ok(bounded);
         }
-        let data: serde_json::Value = resp.json().await?;
-        let raw = data["response"].as_str().unwrap_or("").trim().to_string();
-        // Strip possible quote-wrapping or trailing newlines, cap length.
-        let cleaned = raw
-            .trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
-            .to_string();
-        if cleaned.is_empty() {
-            return Err(anyhow!("zeroclaw verdict empty"));
-        }
-        // Hard cap at 200 chars in case the model ignored the budget.
-        let bounded = if cleaned.len() > 200 {
-            format!("{}…", &cleaned[..199])
-        } else {
-            cleaned
-        };
-        Ok(bounded)
+        Err(last_err.unwrap_or_else(|| anyhow!("zeroclaw verdict failed all {} attempts", MAX_ATTEMPTS)))
     }
 
     /// Build the calls-channel chart for a token. Looks up the recent
