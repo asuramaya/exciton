@@ -170,20 +170,28 @@ pub struct TelegramConfig {
     /// existing single-channel deploys keep working.
     #[serde(default)]
     pub lounge_chat_id: String,
-    /// Optional message_id of an "anchor" message in the lounge that
-    /// should always appear at the bottom of the channel — Telegram
-    /// only pins to the top, so the magic trick is: after every
-    /// photon-originated lounge send, delete the previous copy of the
-    /// anchor and copyMessage from the source again as a fresh post.
-    /// Source defaults to the lounge itself; override with
-    /// `lounge_anchor_chat` if the source lives in a different chat.
-    /// Set to 0 (or omit) to disable.
+    /// Optional message_id of an "anchor" message that should always
+    /// appear at the bottom of `anchor_chat_id`. Telegram only pins to
+    /// the TOP of a chat — the magic trick is: after every photon-
+    /// originated send to the anchor chat, delete the previous forward
+    /// of the anchor and forwardMessage from the source again as a
+    /// fresh post. Set to 0 (or omit) to disable.
+    ///
+    /// Common use: keep a Safeguard "tap to verify" message permanently
+    /// visible at the bottom of the public calls channel so new joiners
+    /// always see it without having to scroll up.
     #[serde(default)]
-    pub lounge_anchor_msg_id: i64,
-    /// Source chat for the anchor message. Empty = use `lounge_chat_id`
-    /// (anchor is itself in the lounge — most common case).
+    pub anchor_msg_id: i64,
+    /// Destination chat for the anchor — where the bump fires after
+    /// every photon-originated send. Empty = use `signals_chat_id`
+    /// (calls channel — the most common case for a verify gate).
     #[serde(default)]
-    pub lounge_anchor_chat: String,
+    pub anchor_chat_id: String,
+    /// Source chat for the anchor message. Empty = same as
+    /// `anchor_chat_id` (the anchor lives in the channel where it's
+    /// being kept-at-bottom — most common case).
+    #[serde(default)]
+    pub anchor_source_chat: String,
 
     /// Enable the direct-message bot interface (long-poll loop for /commands).
     /// Separate switch from channel posting — can disable DM while keeping

@@ -1434,39 +1434,45 @@ impl Notifier {
             .ok_or_else(|| anyhow!("forwardMessage missing result.message_id"))?)
     }
 
-    /// "Always at the bottom" anchor in the lounge. Telegram pins go to
-    /// the TOP of a chat — the magic trick to keep a message at the
-    /// BOTTOM is: every time a new message arrives in the lounge, delete
-    /// the previous copy of the anchor and copyMessage from the source
+    /// "Always at the bottom" anchor. Telegram pins go to the TOP of a
+    /// chat — the magic trick to keep a message at the BOTTOM is:
+    /// every time a new message arrives in the target chat, delete the
+    /// previous forward of the anchor and forwardMessage from the source
     /// fresh, which puts the new copy at the bottom of the channel.
-    /// Source defaults to the lounge itself when `lounge_anchor_chat` is
-    /// empty (the most common case — anchor is just a pinned-style
-    /// message that lives in the same channel).
+    /// Destination defaults to `signals_chat_id` (calls channel — the
+    /// common case for a Safeguard-style verify gate). Source defaults
+    /// to the same channel.
     ///
-    /// Caller spawns this in a detached task so the lounge-send hot path
-    /// doesn't block on the delete + copy round-trip. Failures are
-    /// logged and the next bump retries from scratch.
-    pub async fn bump_lounge_anchor(&self) {
+    /// Uses forwardMessage rather than copyMessage to preserve the
+    /// source's inline keyboard (Safeguard's "tap to verify" URL
+    /// button); copyMessage strips reply_markup.
+    pub async fn bump_anchor(&self) {
         if !self.cfg.enabled {
             return;
         }
-        let lounge_chat = self.cfg.lounge_chat_id.clone();
-        let anchor_msg = self.cfg.lounge_anchor_msg_id;
-        if lounge_chat.is_empty() || anchor_msg <= 0 {
+        let anchor_msg = self.cfg.anchor_msg_id;
+        if anchor_msg <= 0 {
             return;
         }
-        let source_chat = if self.cfg.lounge_anchor_chat.is_empty() {
-            lounge_chat.clone()
+        let dest_chat = if self.cfg.anchor_chat_id.is_empty() {
+            self.cfg.signals_chat_id.clone()
         } else {
-            self.cfg.lounge_anchor_chat.clone()
+            self.cfg.anchor_chat_id.clone()
         };
-        // Drop the prior copy first so the new copy is unambiguously the
-        // bottom message. Soft-fail: if the prior copy was already
-        // deleted by the operator (or never existed) the delete errors
-        // and we proceed to the fresh copy.
+        if dest_chat.is_empty() {
+            return;
+        }
+        let source_chat = if self.cfg.anchor_source_chat.is_empty() {
+            dest_chat.clone()
+        } else {
+            self.cfg.anchor_source_chat.clone()
+        };
+        // Drop the prior forward first so the new forward is unambiguously
+        // the bottom message. Soft-fail: if the prior was already deleted
+        // (or never existed) the delete errors and we proceed.
         let prev = self.db.get_lounge_anchor_msg_id().unwrap_or(0);
         if prev > 0 {
-            if let Err(e) = self.delete_message(&lounge_chat, prev).await {
+            if let Err(e) = self.delete_message(&dest_chat, prev).await {
                 let s = format!("{}", e);
                 if !s.contains("message to delete not found")
                     && !s.contains("message can't be deleted")
@@ -1475,10 +1481,7 @@ impl Notifier {
                 }
             }
         }
-        // forwardMessage instead of copyMessage — preserves the
-        // source's inline keyboard (Safeguard's "tap to verify" URL
-        // button is the primary use case). copyMessage drops reply_markup.
-        match self.forward_message(&lounge_chat, &source_chat, anchor_msg).await {
+        match self.forward_message(&dest_chat, &source_chat, anchor_msg).await {
             Ok(new_id) => {
                 let _ = self.db.set_lounge_anchor_msg_id(new_id);
                 tracing::debug!("anchor-bump: forwarded source {} → {} (prev was {})", anchor_msg, new_id, prev);
@@ -1486,10 +1489,16 @@ impl Notifier {
             Err(e) => {
                 tracing::warn!(
                     "anchor-bump: forward {} from {} → {} failed: {}",
-                    anchor_msg, source_chat, lounge_chat, e
+                    anchor_msg, source_chat, dest_chat, e
                 );
             }
         }
+    }
+
+    /// Backward-compat shim — the lounge-only name was wired through MCP
+    /// and a few call sites. Keep the symbol; new code calls bump_anchor.
+    pub async fn bump_lounge_anchor(&self) {
+        self.bump_anchor().await;
     }
 
     /// Build the calls-channel chart for a token. Looks up the recent
@@ -1866,6 +1875,9 @@ impl Notifier {
                 };
                 let timeline_json = serde_json::to_string(&timeline)?;
                 self.db.insert_delivery(address, channel, msg_id, 0, "MANUAL", price, None, &timeline_json)?;
+                // Anchor bump fires after every NEW send to the calls
+                // channel — keeps the verify message at the bottom.
+                self.bump_anchor().await;
 
                 // Lounge mirror for manual calls — same dual-destination
                 // shape as auto-fired calls. Operator-typed note becomes
@@ -1885,7 +1897,6 @@ impl Notifier {
                             address, LOUNGE_CHANNEL, lounge_msg_id, 0, "MANUAL",
                             price, None, &timeline_json,
                         );
-                        self.bump_lounge_anchor().await;
                     }
                 }
             }
@@ -2330,6 +2341,9 @@ impl Notifier {
                     Some(a.top_holder_pct),
                     &timeline_json,
                 )?;
+                // Anchor bump fires after every NEW send to the calls
+                // channel — keeps the verify message at the bottom.
+                self.bump_anchor().await;
 
                 // Lounge mirror — heavy data card with full numbers/forensics
                 // + timeline blockquote. Soft-fail: if the lounge chat is the
@@ -2361,7 +2375,6 @@ impl Notifier {
                                 Some(a.top_holder_pct),
                                 &timeline_json,
                             );
-                            self.bump_lounge_anchor().await;
                         }
                         Err(e) => {
                             tracing::warn!(
