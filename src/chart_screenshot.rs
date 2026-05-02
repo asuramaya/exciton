@@ -38,12 +38,11 @@ const VIEWPORT_W: u32 = 900;
 // for more chart area.
 const VIEWPORT_H: u32 = 400;
 const CROP_H: u32 = 220;
-// Variance threshold for "loaded" vs "Loading pair…" state. The grey
-// loading rectangle has near-uniform color (variance < ~150 over the
-// sample region); a fully rendered chart with candles + grid + axes
-// produces variance well over 1500. Threshold 600 sits comfortably
-// between the two without false-positives on slow markets.
-const VARIANCE_LOADED_THRESHOLD: f64 = 600.0;
+// Variance threshold for "loaded" vs "Loading pair…" state. Production
+// data shows the grey loading rectangle produces variance ~240, partial
+// loads ~580, fully rendered candles ~2000+. 1500 sits cleanly above
+// the partial-load false-positive band.
+const VARIANCE_LOADED_THRESHOLD: f64 = 1500.0;
 
 const VIRTUAL_TIME_BUDGET_MS_FAST: u32 = 12_000;
 const VIRTUAL_TIME_BUDGET_MS_SLOW: u32 = 35_000;
