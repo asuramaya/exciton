@@ -1155,6 +1155,94 @@ impl Notifier {
             .ok_or_else(|| anyhow!("missing message_id"))?)
     }
 
+    /// sendPhoto with reply_to_message_id — used for win-verdict cards
+    /// that thread under the original entry card. The reader sees the
+    /// entry chart followed by the exit chart with the claw verdict line
+    /// as caption, both in the calls channel under one parent message.
+    async fn send_photo_reply(
+        &self,
+        chat_id: &str,
+        reply_to_msg_id: i64,
+        png: Vec<u8>,
+        caption: &str,
+        reply_markup: Option<&str>,
+    ) -> Result<i64> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendPhoto",
+            self.cfg.bot_token
+        );
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("chart.png")
+            .mime_str("image/png")?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("parse_mode", "HTML".to_string())
+            .text("caption", caption.to_string())
+            .text("reply_to_message_id", reply_to_msg_id.to_string())
+            .text("allow_sending_without_reply", "true".to_string())
+            .part("photo", part);
+        if let Some(kb) = reply_markup {
+            form = form.text("reply_markup", kb.to_string());
+        }
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            return Err(anyhow!("telegram sendPhoto (reply) failed: {}", body));
+        }
+        Ok(body["result"]["message_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("missing message_id"))?)
+    }
+
+    /// editMessageMedia — replaces both the photo and the caption in a
+    /// single API call. Used by the chart-screenshot backfill path: cards
+    /// whose original photo was the broken plotters sparkline get a fresh
+    /// chromium screenshot of the live DexScreener chart with the
+    /// claw-voiced verdict caption baked in.
+    async fn edit_photo_media(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        png: Vec<u8>,
+        caption: &str,
+        reply_markup: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/editMessageMedia",
+            self.cfg.bot_token
+        );
+        // InputMediaPhoto references the multipart attachment via
+        // attach://NAME. Caption + parse_mode go on the InputMedia object,
+        // not on the form fields.
+        let media = serde_json::json!({
+            "type": "photo",
+            "media": "attach://chart",
+            "caption": caption,
+            "parse_mode": "HTML",
+        });
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("chart.png")
+            .mime_str("image/png")?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("message_id", message_id.to_string())
+            .text("media", media.to_string())
+            .part("chart", part);
+        if let Some(kb) = reply_markup {
+            form = form.text("reply_markup", kb.to_string());
+        }
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            let desc = body["description"].as_str().unwrap_or("");
+            if desc.contains("not modified") {
+                return Ok(());
+            }
+            return Err(anyhow!("telegram editMessageMedia failed: {}", body));
+        }
+        Ok(())
+    }
+
     /// editMessageCaption — used when a calls-channel sendPhoto card
     /// closes (settle path). Replaces the caption text + keyboard while
     /// leaving the chart photo unchanged. The original entry chart still
@@ -2020,6 +2108,68 @@ impl Notifier {
             address, meta_ref, outcome, &entry_note, exit_note, claw_body.as_deref(),
         );
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
+
+        // Win-vs-loss surface split (the user's design call):
+        //   wins  → REPLY with a fresh DexScreener screenshot. Threads
+        //           cleanly under the original entry card; original stays
+        //           untouched. Two charts (entry + exit) tell the story.
+        //   loss  → EDIT the original card, replacing the photo media so
+        //           the new chromium screenshot replaces the prior plotters
+        //           sparkline. No new feed-noise for a loss; the card
+        //           absorbs the verdict silently.
+        //
+        // Backfill path: same logic — wins get a reply, losses get a media
+        // edit. Sends one update either way.
+        if bucket == "won" {
+            let label = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
+            if let Some(png) = self.build_call_chart(meta_ref.and_then(|m| m.pair_url.as_deref()), label).await {
+                match self.send_photo_reply(&chat_id, d.message_id, png, &html, Some(&kb)).await {
+                    Ok(_) => {
+                        let snap_price = d.snapshot_price;
+                        let snap_top = d.snapshot_top_holder;
+                        let timeline_json = serde_json::to_string(&timeline)?;
+                        let _ = self.db.update_delivery(
+                            d.id, "closed", d.snapshot_conf, &d.snapshot_class,
+                            snap_price, snap_top, &timeline_json,
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!("force_update_card: sendPhoto-reply failed for {}: {} — falling back to caption edit", address, e);
+                    }
+                }
+            }
+        } else if force {
+            // Loss/flat backfill: editMessageMedia on the original to
+            // swap the broken plotters chart for a fresh chromium one.
+            let label = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
+            if let Some(png) = self.build_call_chart(meta_ref.and_then(|m| m.pair_url.as_deref()), label).await {
+                match self.edit_photo_media(&chat_id, d.message_id, png, &html, Some(&kb)).await {
+                    Ok(_) => {
+                        let snap_price = d.snapshot_price;
+                        let snap_top = d.snapshot_top_holder;
+                        let timeline_json = serde_json::to_string(&timeline)?;
+                        let _ = self.db.update_delivery(
+                            d.id, "closed", d.snapshot_conf, &d.snapshot_class,
+                            snap_price, snap_top, &timeline_json,
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let s = format!("{}", e);
+                        if s.contains("message to edit not found") || s.contains("MESSAGE_ID_INVALID") {
+                            tracing::info!("force_update_card: msg_id {} no longer exists for {}, skipping", d.message_id, address);
+                            return Ok(());
+                        }
+                        tracing::warn!(
+                            "force_update_card: editMessageMedia failed for {}: {} — falling back to caption-only edit",
+                            address, s
+                        );
+                    }
+                }
+            }
+        }
+
         // Calls cards posted by the new pipeline are sendPhoto messages,
         // which require editMessageCaption (not editMessageText) to update.
         // Try caption first; on "no text in the message" or "no caption
