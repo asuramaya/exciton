@@ -190,15 +190,19 @@ pub const MOONSHOT_ENABLED: bool = true;
 pub const MOONSHOT_REQUIRED_CLASS: &str = "DEVELOPING";
 pub const MOONSHOT_MIN_MCAP_USD: f64 = 5_000.0;
 pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
-// 2026-05-02 PM final tune — universe-scale entry backtest of 5,148
-// tokens with full price history. Combined-feature sweep showed
-// `top1<15 AND sniper<35` produces:
-//   n=34 fires, mean realized +16.8%, median +5.5%, win 50%, rt 9%
-// vs the prior `top1<60` setting (n=776, mean +8.3%, win 20%).
-// Cohort feature gradient (wins p75 top1=14, big_wins p75=14.2)
-// validated at universe scale — top1<15 was the cleanest separator.
-// Trade-off: ~22x volume reduction but doubled mean and win rate.
-pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 15.0;
+// 2026-05-02 PM final tune — universe-scale entry backtest against
+// 5,148 tokens with forward price trails. Sweep showed:
+//   top1<60 (CURRENT): n=776, mean +8.3%, win 20%, rt 5%
+//   top1<22:           n=308, mean +9.2%, win 32%
+//   top1<18 (CHOSEN):  n=166, mean +11.7%, win 37%, rt 8%
+//   top1<15:           n=65,  mean +13.5%, win 45%, rt 8%
+//   top1<15 + snip<35: n=34,  mean +16.8%, win 50%, rt 9%  (best/sparse)
+// Last-24h regime check: top1<15+snip<35 → 0 fires (too tight on
+// current memecoin regime). top1<18 alone is the data-validated
+// balance: 4x volume of top1<15+snip<35, only 5pp mean delta.
+// Cohort feature gradient confirmed: wins p75 top1=14, losses
+// p75=22, blowups p75=22+. 18 cleanly separates.
+pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 18.0;
 pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 15;
 pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
 // Lifted from 50/min to 200/min after universe analysis: tpm 50-200
@@ -232,10 +236,13 @@ pub const MOONSHOT_MIN_PRE_PCT: f64 = 0.0;
 // programmatic launch-bot fills. Ceilings are looser than SHORT because
 // DEV-class tokens are pre-stabilization.
 pub const MOONSHOT_MAX_BUNDLE_PCT: f64 = 50.0;
-// 2026-05-02 PM final tune — was 70 (loose). Combined with top1<15
-// produces the universe sweet spot (n=34, mean +16.8%, win 50%).
-// Wins cluster at sniper 23%, losses at 44%; 35 cleanly separates.
-pub const MOONSHOT_MAX_SNIPER_PCT: f64 = 35.0;
+// 2026-05-02 PM tune — kept loose at 95 (effectively off). Universe
+// backtest showed adding sniper<35 to top1<18 actually REDUCED mean
+// realized (+11.7 → +7.0%) by eliminating right-tail catches. Cohort
+// gradient said wins clustered at sniper=23, losses at 44, but at
+// the universe level the sniper filter cut some legit early-momentum
+// runners. Top1 at 18 is doing the heavy lifting; sniper stays soft.
+pub const MOONSHOT_MAX_SNIPER_PCT: f64 = 95.0;
 pub const MOONSHOT_MAX_INSIDER_PCT: f64 = 40.0;
 
 // =============================================================================
