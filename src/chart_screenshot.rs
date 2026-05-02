@@ -44,9 +44,14 @@ const CROP_H: u32 = 220;
 // the partial-load false-positive band.
 const VARIANCE_LOADED_THRESHOLD: f64 = 1500.0;
 
-const VIRTUAL_TIME_BUDGET_MS_FAST: u32 = 12_000;
-const VIRTUAL_TIME_BUDGET_MS_SLOW: u32 = 35_000;
-const TIMEOUT_SECS: u64 = 50;
+// Fast pass at 20s catches most pairs on the first try; the prior 12s
+// was too tight for DexScreener's WS handshake + first OHLCV chunk
+// even with a healthy embed. Slow pass at 50s clears the long tail.
+// User feedback ("settings or something is timing out the charts bad")
+// — these budgets target the tail.
+const VIRTUAL_TIME_BUDGET_MS_FAST: u32 = 20_000;
+const VIRTUAL_TIME_BUDGET_MS_SLOW: u32 = 50_000;
+const TIMEOUT_SECS: u64 = 65;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 fn profile_dir() -> PathBuf {
@@ -56,9 +61,14 @@ fn profile_dir() -> PathBuf {
 /// DexScreener embed URL — strips chrome around the chart, dark theme,
 /// hides info/trades panels so the chart fills the viewport. `interval=1`
 /// requests 1-minute candles.
+///
+/// 2026-05-02 PM: dropped `loadChartSettings=0` after several pairs
+/// showed "Loading pair…" persistently. That flag tells the embed to
+/// skip applying saved chart settings — apparently delayed first
+/// render in some cases. Letting it default cuts hold time.
 fn embed_url(pair_address: &str) -> String {
     format!(
-        "https://dexscreener.com/solana/{}?embed=1&theme=dark&info=0&trades=0&loadChartSettings=0&chartLeftToolbar=0&interval=1",
+        "https://dexscreener.com/solana/{}?embed=1&theme=dark&info=0&trades=0&chartLeftToolbar=0&interval=1",
         pair_address
     )
 }
