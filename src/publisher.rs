@@ -801,10 +801,14 @@ impl Publisher {
 
         // Watching tier — "what the bot is considering right now". Pull
         // recent near-misses, dedupe per mint keeping the most recent
-        // observation, filter to last 5min + conf >= 60. Cap at 10
+        // observation, filter to last 30min + conf >= 60. Cap at 10
         // entries — beyond that the section becomes scroll-noise.
+        // 5min was too tight: near-miss cadence varies a lot with how
+        // many candidate tokens are passing classifier; quiet windows
+        // produce 0 entries even though the bot was thinking 18min ago.
+        // 30min always shows recent activity without going stale.
         let now_ts = chrono::Utc::now().timestamp();
-        let watch_window = 5 * 60;
+        let watch_window = 30 * 60;
         let mut watching: Vec<WatchingEntry> = Vec::new();
         if let Ok(rows) = self.db.get_recent_near_misses(120) {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
