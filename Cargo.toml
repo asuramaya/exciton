@@ -28,10 +28,14 @@ chrono = { version = "0.4", features = ["serde"] }
 bs58 = "0.5"
 base64 = "0.22"
 bincode = "1"
-# Sparkline chart renderer for the calls-channel cards. Bitmap-only —
-# no font/svg deps. Used by chart.rs to render token_snapshots price
-# history as PNG sent via Telegram sendPhoto.
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series"] }
+# Sparkline chart renderer for the calls-channel cards. Used by chart.rs
+# to render token_snapshots price history as PNG sent via Telegram
+# sendPhoto. The `ab_glyph` feature provides pure-Rust text rendering
+# (no system fontconfig/freetype deps) — chart.rs uses
+# `("sans-serif", 56).into_font()` for title/sub/header/pct labels, and
+# without a font feature into_font() returns a no-op that panics at
+# draw time. ab_glyph chosen over ttf to avoid pulling fontconfig-sys.
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "ab_glyph"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,8 +8,27 @@
 
 use anyhow::Result;
 use plotters::prelude::*;
+use plotters::style::register_font;
+use std::sync::Once;
 
 const W: u32 = 600;
+
+// ab_glyph backend has no system-font discovery — it needs every named
+// font registered with raw TTF bytes. We bundle DejaVuSans.ttf at build
+// time and register it as both "sans-serif" and "DejaVu Sans" on first
+// chart render. Without this, `("sans-serif", N).into_font()` returns a
+// no-op that panics at draw time with "The font implementation is unable
+// to draw text".
+const DEJAVU_SANS_TTF: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
+static FONT_INIT: Once = Once::new();
+fn ensure_font_registered() {
+    FONT_INIT.call_once(|| {
+        // register_font returns Err on duplicate registration; we ignore
+        // that since Once already guards us against re-entry.
+        let _ = register_font("sans-serif", FontStyle::Normal, DEJAVU_SANS_TTF);
+        let _ = register_font("DejaVu Sans", FontStyle::Normal, DEJAVU_SANS_TTF);
+    });
+}
 const H: u32 = 600;
 const BG: RGBColor = RGBColor(13, 14, 17);          // matches site --bg
 const FG_DIM: RGBColor = RGBColor(110, 110, 120);
@@ -26,6 +45,7 @@ pub fn render_sparkline(
     entry_price: f64,
     symbol: &str,
 ) -> Result<Vec<u8>> {
+    ensure_font_registered();
     let path = std::env::temp_dir().join(format!(
         "madapes_chart_{}_{}.png",
         symbol.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(),
