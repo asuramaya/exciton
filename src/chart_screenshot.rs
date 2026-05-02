@@ -3,69 +3,45 @@
 //!
 //! Why a real screenshot vs. our own plotters render: DexScreener's chart
 //! is what traders actually see. The candlesticks, volume, and live tape
-//! are pixel-identical to the user's reference. We could approximate with
-//! GeckoTerminal OHLCV + plotters candlesticks, but the brand recognition
-//! of the DexScreener UI carries weight in TG cards.
+//! are pixel-identical to the user's reference. We approximate nothing.
 //!
-//! Implementation: shell out to `chromium --headless=new` with a persistent
-//! user-data-dir so the Cloudflare clearance cookie is reused across calls.
-//! First request takes ~7s (CF challenge JS run); subsequent ~2-3s.
-//!
-//! Two post-processing steps after the raw chromium PNG comes back:
-//! 1. Variance-check the chart-canvas region. The "Loading pair…" mid-load
-//!    state is a low-variance grey rectangle in the center; loaded
-//!    candles are a high-variance mix of green/red/grid. If the variance
-//!    sits below threshold we retry once with a longer budget — virtual
-//!    time alone doesn't guarantee the chart's WebSocket subscription
-//!    has delivered its first OHLCV chunk by snapshot time.
-//! 2. Crop the bottom band. The DexScreener embed page lays out with
-//!    extra padding below the watermark; cropping to a tighter height
-//!    gives more chart area in the TG card. User has explicitly waived
-//!    the watermark for chart real estate.
+//! Implementation: drive headless Chromium via CDP using the
+//! `headless_chrome` crate. The earlier `chromium --screenshot=` CLI
+//! path was abandoned because `--virtual-time-budget` exits as soon as
+//! the JS event loop drains, regardless of pending WebSocket data —
+//! production logs showed budget=50000ms elapsed in 4-5s wall-clock with
+//! the chart still on "Loading pair…". CDP gives us real
+//! wait-for-element semantics so the chart actually finishes loading
+//! before snapshot.
 
 use anyhow::{anyhow, Context, Result};
+use headless_chrome::{Browser, LaunchOptions};
+use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use image::ImageReader;
+use std::ffi::OsStr;
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::time::Duration;
-use tokio::process::Command;
 
 const VIEWPORT_W: u32 = 900;
-// Chromium renders the embed at 400h so the chart canvas is fully
-// populated. We crop the result to CROP_H below — the watermark + chin
-// occupy the bottom ~200 rows and that's wasted real estate in the TG
-// card. The user explicitly OK'd dropping the DexScreener attribution
-// for more chart area.
 const VIEWPORT_H: u32 = 400;
 const CROP_H: u32 = 220;
+
+// Total budget we'll let a chart render take. Once `load` event fires,
+// we wait up to this for either (a) a `.tv-chart-container` selector
+// that has rendered children, or (b) the timeout — then snapshot
+// regardless. Real wall-clock seconds.
+const RENDER_WAIT_SECS: u64 = 25;
+
 // Variance threshold for "loaded" vs "Loading pair…" state. Production
 // data shows the grey loading rectangle produces variance ~240, partial
-// loads ~580, fully rendered candles ~2000+. 1500 sits cleanly above
-// the partial-load false-positive band.
+// loads ~580-865, fully rendered candles ~2000+.
 const VARIANCE_LOADED_THRESHOLD: f64 = 1500.0;
 
-// Fast pass at 20s catches most pairs on the first try; the prior 12s
-// was too tight for DexScreener's WS handshake + first OHLCV chunk
-// even with a healthy embed. Slow pass at 50s clears the long tail.
-// User feedback ("settings or something is timing out the charts bad")
-// — these budgets target the tail.
-const VIRTUAL_TIME_BUDGET_MS_FAST: u32 = 20_000;
-const VIRTUAL_TIME_BUDGET_MS_SLOW: u32 = 50_000;
-const TIMEOUT_SECS: u64 = 65;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
-
-fn profile_dir() -> PathBuf {
-    PathBuf::from("/var/cache/chromium-photon")
-}
 
 /// DexScreener embed URL — strips chrome around the chart, dark theme,
 /// hides info/trades panels so the chart fills the viewport. `interval=1`
 /// requests 1-minute candles.
-///
-/// 2026-05-02 PM: dropped `loadChartSettings=0` after several pairs
-/// showed "Loading pair…" persistently. That flag tells the embed to
-/// skip applying saved chart settings — apparently delayed first
-/// render in some cases. Letting it default cuts hold time.
 fn embed_url(pair_address: &str) -> String {
     format!(
         "https://dexscreener.com/solana/{}?embed=1&theme=dark&info=0&trades=0&chartLeftToolbar=0&interval=1",
@@ -73,83 +49,58 @@ fn embed_url(pair_address: &str) -> String {
     )
 }
 
-/// Shell out to chromium and return raw PNG bytes at the configured
-/// viewport. No post-processing here — caller variance-checks + crops.
-async fn raw_screenshot(pair_address: &str, label: &str, virtual_time_budget_ms: u32) -> Result<Vec<u8>> {
-    let _ = tokio::fs::create_dir_all(profile_dir()).await;
-    let out_path = std::env::temp_dir().join(format!(
-        "madapes_chart_{}_{}.png",
-        label.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
+/// Capture the chart via CDP. Real wall-clock wait — no virtual time.
+/// Returns raw PNG bytes (uncropped, full viewport).
+fn raw_screenshot_cdp(pair_address: &str, render_wait_secs: u64) -> Result<Vec<u8>> {
+    let user_data_dir = std::path::PathBuf::from("/var/cache/chromium-photon");
+    let _ = std::fs::create_dir_all(&user_data_dir);
 
+    // Stable args on top of headless_chrome defaults: no-sandbox for
+    // root-in-container, disable-dev-shm for small /dev/shm sizes,
+    // disable-blink-features=AutomationControlled to avoid CF challenge,
+    // user-agent override.
+    let extra: Vec<&OsStr> = vec![
+        OsStr::new("--no-sandbox"),
+        OsStr::new("--disable-dev-shm-usage"),
+        OsStr::new("--disable-gpu"),
+        OsStr::new("--hide-scrollbars"),
+        OsStr::new("--disable-blink-features=AutomationControlled"),
+    ];
+
+    let opts = LaunchOptions::default_builder()
+        .headless(true)
+        .sandbox(false)
+        .window_size(Some((VIEWPORT_W, VIEWPORT_H)))
+        .user_data_dir(Some(user_data_dir))
+        .args(extra)
+        .build()
+        .context("build chromium launch options")?;
+
+    let browser = Browser::new(opts).context("launch chromium")?;
+    let tab = browser.new_tab().context("new_tab")?;
+    tab.set_user_agent(USER_AGENT, None, None)
+        .context("set_user_agent")?;
     let url = embed_url(pair_address);
-    let window = format!("--window-size={},{}", VIEWPORT_W, VIEWPORT_H);
-    let budget = format!("--virtual-time-budget={}", virtual_time_budget_ms);
-    let profile = format!("--user-data-dir={}", profile_dir().display());
-    let screenshot = format!("--screenshot={}", out_path.display());
+    tab.navigate_to(&url).context("navigate")?;
+    tab.wait_until_navigated().context("wait_until_navigated")?;
 
-    // virtual-time-budget alone exits as soon as the JS event loop
-    // drains, even when there's pending WS data the chart embed needs
-    // to render (production showed fast=587 → slow=239 in 5s, way under
-    // the 20s nominal budget). The companion flag
-    // --virtual-time-task-starvation-budget extends virtual time
-    // through idle waits — set to the same value as the budget so
-    // the embed actually gets the full window.
-    let starvation = format!("--virtual-time-task-starvation-budget={}", virtual_time_budget_ms);
-    let mut cmd = Command::new("chromium");
-    cmd.arg("--headless=new")
-        .arg("--no-sandbox")
-        .arg("--disable-dev-shm-usage")
-        .arg("--disable-gpu")
-        .arg("--hide-scrollbars")
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--enable-features=NetworkService,VirtualTime")
-        .arg(format!("--user-agent={}", USER_AGENT))
-        .arg(&window)
-        .arg(&budget)
-        .arg(&starvation)
-        .arg(&profile)
-        .arg(&screenshot)
-        .arg(&url)
-        .kill_on_drop(true);
+    // Real wall-clock wait. We don't try to wait for a specific
+    // selector because DexScreener iframes its TradingView widget with
+    // shadow DOM that headless_chrome's `wait_for_element` can't see.
+    // A flat sleep is reliable and predictable.
+    std::thread::sleep(Duration::from_secs(render_wait_secs));
 
-    let run = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output())
-        .await
-        .map_err(|_| anyhow!("chromium screenshot timeout for {}", pair_address))?
-        .context("failed to spawn chromium")?;
+    let png = tab
+        .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
+        .context("capture_screenshot")?;
 
-    if !run.status.success() {
-        let stderr = String::from_utf8_lossy(&run.stderr);
-        return Err(anyhow!(
-            "chromium exit {}: {}",
-            run.status,
-            stderr.lines().take(5).collect::<Vec<_>>().join(" | ")
-        ));
-    }
-
-    let bytes = tokio::fs::read(&out_path)
-        .await
-        .with_context(|| format!("could not read screenshot {}", out_path.display()))?;
-    let _ = tokio::fs::remove_file(&out_path).await;
-
-    if bytes.len() < 4096 {
-        return Err(anyhow!(
-            "chromium output too small ({} bytes) — likely CF challenge or load failure",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
+    Ok(png)
 }
 
 /// Variance of the green channel over the chart-canvas region. The
 /// "Loading pair…" mid-load state is a near-uniform light-grey
 /// rectangle centered in the canvas; a loaded chart with candles + grid
-/// produces high color variance. We sample the green channel because
-/// red/green candles diverge most strongly there.
+/// produces high color variance.
 fn chart_variance(png_bytes: &[u8]) -> Result<f64> {
     let img = ImageReader::new(Cursor::new(png_bytes))
         .with_guessed_format()
@@ -157,9 +108,6 @@ fn chart_variance(png_bytes: &[u8]) -> Result<f64> {
         .decode()
         .context("decode png")?
         .to_rgb8();
-    // Sample a generous chunk of the canvas: skip the top toolbar (~30px)
-    // and bottom labels (~last 80px), and the outer 80px on each side
-    // so we don't catch axis text.
     let xs: Vec<u32> = (80u32..VIEWPORT_W - 80).step_by(8).collect();
     let ys: Vec<u32> = (40u32..VIEWPORT_H - 80).step_by(6).collect();
     let mut sum: f64 = 0.0;
@@ -168,7 +116,7 @@ fn chart_variance(png_bytes: &[u8]) -> Result<f64> {
     for &y in &ys {
         for &x in &xs {
             if x < img.width() && y < img.height() {
-                let p = img.get_pixel(x, y).0[1] as f64; // green channel
+                let p = img.get_pixel(x, y).0[1] as f64;
                 sum += p;
                 sum_sq += p * p;
                 n += 1.0;
@@ -183,9 +131,7 @@ fn chart_variance(png_bytes: &[u8]) -> Result<f64> {
     Ok(var)
 }
 
-/// Crop the screenshot to keep the top CROP_H rows and re-encode as PNG.
-/// Drops the DexScreener watermark + chin → the TG card uses the freed
-/// vertical space for the chart itself.
+/// Crop top CROP_H rows and re-encode as PNG.
 fn crop_top(png_bytes: &[u8]) -> Result<Vec<u8>> {
     let img = ImageReader::new(Cursor::new(png_bytes))
         .with_guessed_format()
@@ -201,41 +147,32 @@ fn crop_top(png_bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Capture the current chart for a pair. Returns processed PNG bytes
-/// (variance-checked + cropped). Tries fast budget first; on low-variance
-/// retries once with a longer budget so virtual time has more headroom
-/// for the embed's WS subscription to deliver the first OHLCV chunk.
+/// (variance-checked + cropped).
 pub async fn screenshot_pair(pair_address: &str, label: &str) -> Result<Vec<u8>> {
-    // Attempt 1: fast budget.
-    let fast = raw_screenshot(pair_address, label, VIRTUAL_TIME_BUDGET_MS_FAST).await?;
-    let var_fast = chart_variance(&fast).unwrap_or(0.0);
-    let chosen = if var_fast >= VARIANCE_LOADED_THRESHOLD {
-        tracing::debug!(
-            "chart screenshot {}: loaded on fast pass (variance {:.0})",
-            pair_address, var_fast
-        );
-        fast
-    } else {
-        // Attempt 2: slow budget. The first attempt looked stuck on
-        // "Loading pair…" — retry with longer virtual time so the WS
-        // handshake + first OHLCV frame finishes inside the budget.
-        tracing::info!(
-            "chart screenshot {}: fast pass low-variance ({:.0}), retrying with slow budget",
-            pair_address, var_fast
-        );
-        let slow = raw_screenshot(pair_address, label, VIRTUAL_TIME_BUDGET_MS_SLOW).await?;
-        let var_slow = chart_variance(&slow).unwrap_or(0.0);
-        if var_slow < VARIANCE_LOADED_THRESHOLD {
-            tracing::warn!(
-                "chart screenshot {}: still low-variance after slow pass ({:.0}) — sending anyway",
-                pair_address, var_slow
+    let pair_owned = pair_address.to_string();
+    let label_owned = label.to_string();
+    // headless_chrome is sync — run on a blocking task so we don't tie
+    // up a tokio worker for the full render window.
+    let png = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        // Single CDP attempt at the full render window. Real time, so
+        // there's no fast/slow-pass distinction needed — 25s of
+        // wall-clock is enough for any healthy DexScreener pair.
+        let raw = raw_screenshot_cdp(&pair_owned, RENDER_WAIT_SECS)?;
+        let var = chart_variance(&raw).unwrap_or(0.0);
+        if var >= VARIANCE_LOADED_THRESHOLD {
+            tracing::debug!(
+                "chart screenshot {}: loaded (variance {:.0})",
+                label_owned, var
             );
         } else {
-            tracing::debug!(
-                "chart screenshot {}: loaded on slow pass (variance {:.0})",
-                pair_address, var_slow
+            tracing::warn!(
+                "chart screenshot {}: low-variance after {}s wall ({:.0}) — sending anyway",
+                label_owned, RENDER_WAIT_SECS, var
             );
         }
-        slow
-    };
-    crop_top(&chosen)
+        crop_top(&raw)
+    })
+    .await
+    .context("blocking task panic")??;
+    Ok(png)
 }

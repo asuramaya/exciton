@@ -41,5 +41,14 @@ bincode = "1"
 # of the screenshot to remove the DexScreener watermark band + chin.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# `headless_chrome` for chart_screenshot.rs CDP control. The
+# `chromium --screenshot` CLI path exits as soon as the JS event loop
+# drains, regardless of pending WebSocket data. With DexScreener's
+# embed subscribing OHLCV via fire-and-forget WS callbacks, JS goes
+# idle before data arrives — even --virtual-time-budget=50000 elapsed
+# in 4s. CDP gives us proper wait-for-network-idle + wait-for-element
+# semantics so the chart actually finishes loading before snapshot.
+headless_chrome = "1.0"
+
 [dev-dependencies]
 tempfile = "3"
