@@ -46,6 +46,15 @@ pub struct ScoutParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BackfillCardsParams {
+    /// Trailing window in hours. Default 24. Caps at 168 (1 week) to
+    /// keep zeroclaw round-trips bounded — re-rendering many calls
+    /// each blocks on a 4s claw verdict.
+    #[serde(default)]
+    pub hours: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HistoryParams {
     /// Token mint address to analyze across stored snapshots.
     pub address: String,
@@ -1250,6 +1259,89 @@ impl PhotonServer {
             .to_string(),
             Err(e) => serde_json::json!({"error": format!("close failed: {}", e)}).to_string(),
         }
+    }
+
+    /// Re-render closed Telegram call cards in the current ape format.
+    /// Walks every closed call (withdrew/failed/expired/voided) within
+    /// the trailing window and triggers force_update_card on each — the
+    /// claws-channel card gets the new ape verdict + flat band + chart
+    /// preview, the lounge mirror gets the heavy data card.
+    ///
+    /// Sequential with 1.5s spacing between cards to stay under
+    /// Telegram's 30/min channel-edit cap and avoid hammering zeroclaw
+    /// with concurrent verdict requests. Default window 24h.
+    #[tool]
+    async fn backfill_cards(
+        &self,
+        Parameters(params): Parameters<BackfillCardsParams>,
+    ) -> String {
+        let hours = params.hours.unwrap_or(24).clamp(1, 168);
+        let _ = self
+            .db
+            .audit_log("claude", "backfill_cards", &format!("{}h", hours));
+
+        let notifier = match self.notifier.as_ref() {
+            Some(n) => n.clone(),
+            None => {
+                return serde_json::json!({"error": "notifier not configured"}).to_string()
+            }
+        };
+        let since = chrono::Utc::now().timestamp() - hours * 3600;
+        let closed: Vec<crate::db::CallRow> = self
+            .db
+            .list_calls(false, 200)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.status.as_str(),
+                    "withdrew" | "failed" | "expired" | "closed" | "voided"
+                ) && c.closed_at.unwrap_or(0) >= since
+            })
+            .collect();
+        let total = closed.len();
+
+        // Run the backfill in a detached task so the MCP call returns
+        // promptly. Even at 1.5s/card with claw blocking 4s/card, 24h
+        // of closes can take 2-3 minutes — too long to hold a claw
+        // round-trip open.
+        tokio::spawn(async move {
+            let mut ok = 0usize;
+            let mut skipped = 0usize;
+            for c in closed {
+                let exit_pct = if c.entry_price_usd > 0.0
+                    && c.exit_price_usd.unwrap_or(0.0) > 0.0
+                {
+                    Some(
+                        (c.exit_price_usd.unwrap() - c.entry_price_usd) / c.entry_price_usd
+                            * 100.0,
+                    )
+                } else {
+                    None
+                };
+                let exit_note = c.exit_note.clone().unwrap_or_default();
+                match notifier
+                    .force_update_card(&c.mint, &c.status, exit_pct, &exit_note)
+                    .await
+                {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::warn!("backfill {}: {}", c.mint, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+            tracing::info!("backfill_cards done: {} ok, {} skipped", ok, skipped);
+        });
+
+        serde_json::json!({
+            "queued": total,
+            "window_hours": hours,
+            "cadence_secs_per_card": 1.5,
+            "note": "running in background — claw verdict + ape format applied per card",
+        })
+        .to_string()
     }
 
     /// List currently active calls. Use before firing a new one or when

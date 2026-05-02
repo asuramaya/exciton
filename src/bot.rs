@@ -188,7 +188,6 @@ impl DmBot {
                 ("resume", "Resume the notifier"),
                 ("threshold", "Override signal threshold: /threshold <0-100>"),
                 ("stats", "Bot stats — users + commands"),
-                ("backfill_cards", "Re-render closed TG cards in new format: /backfill_cards [hours]"),
             ],
             Surface::Public => &[
                 ("help", "List available commands"),
@@ -407,7 +406,6 @@ impl DmBot {
             "resume" => self.cmd_admin_resume(chat_id, is_admin).await,
             "threshold" => self.cmd_admin_threshold(chat_id, is_admin, &args).await,
             "stats" => self.cmd_admin_stats(chat_id, is_admin).await,
-            "backfill_cards" => self.cmd_backfill_cards(chat_id, is_admin, &args).await,
             "claw" => self.cmd_claw(chat_id, username, &args).await,
             other => {
                 self.send(
@@ -1945,74 +1943,6 @@ impl DmBot {
     }
 
     // Admin commands — require is_admin flag on the user record
-
-    /// Walk recently-closed calls and re-render their TG cards in the
-    /// new ape format (claw verdict + flat band + multiplier header).
-    /// Sequential to avoid hammering zeroclaw — each card waits for the
-    /// previous force_update_card to finish (which itself awaits the
-    /// 4s claw call). Default 24h window, override via /backfill_cards <hours>.
-    async fn cmd_backfill_cards(&self, chat_id: i64, is_admin: bool, args: &str) -> Result<()> {
-        if !is_admin {
-            self.send(chat_id, "🚫 <i>Admin command — access denied</i>", None)
-                .await?;
-            return Ok(());
-        }
-        let hours: i64 = args.trim().parse().unwrap_or(24);
-        let since = chrono::Utc::now().timestamp() - hours * 3600;
-        // Pull all closed-status calls in the window. list_calls(false, ..)
-        // returns active+closed; filter to closed + since-timestamp here.
-        let closed: Vec<crate::db::CallRow> = self
-            .db
-            .list_calls(false, 200)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| {
-                matches!(c.status.as_str(), "withdrew" | "failed" | "expired" | "closed" | "voided")
-                    && c.closed_at.unwrap_or(0) >= since
-            })
-            .collect();
-
-        let n = closed.len();
-        self.send(
-            chat_id,
-            &format!("⏳ Backfilling {} closed cards from last {}h…", n, hours),
-            None,
-        )
-        .await?;
-
-        let mut ok = 0usize;
-        let mut skipped = 0usize;
-        for c in closed {
-            let exit_pct = if c.entry_price_usd > 0.0 && c.exit_price_usd.unwrap_or(0.0) > 0.0 {
-                Some((c.exit_price_usd.unwrap() - c.entry_price_usd) / c.entry_price_usd * 100.0)
-            } else {
-                None
-            };
-            let exit_note = c.exit_note.clone().unwrap_or_default();
-            match self
-                .notifier
-                .force_update_card(&c.mint, &c.status, exit_pct, &exit_note)
-                .await
-            {
-                Ok(_) => ok += 1,
-                Err(e) => {
-                    skipped += 1;
-                    tracing::warn!("backfill {}: {}", c.mint, e);
-                }
-            }
-            // Telegram channel-edit rate limit: 30/min for groups, ~1/sec
-            // sustained. Sleep 1.5s between cards to stay well under.
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        }
-
-        self.send(
-            chat_id,
-            &format!("✅ Backfill done — {} updated, {} skipped.", ok, skipped),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
 
     async fn cmd_admin_halt(&self, chat_id: i64, is_admin: bool) -> Result<()> {
         if !is_admin {
