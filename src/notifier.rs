@@ -190,10 +190,15 @@ pub const MOONSHOT_ENABLED: bool = true;
 pub const MOONSHOT_REQUIRED_CLASS: &str = "DEVELOPING";
 pub const MOONSHOT_MIN_MCAP_USD: f64 = 5_000.0;
 pub const MOONSHOT_MAX_MCAP_USD: f64 = 80_000.0;
-// Top1 ceiling at 60% — the moonshot signal is concentrated holders
-// (early accumulation pattern), so we explicitly allow what SCALP/Bucket A
-// reject. Above 60% is honeypot territory (single wallet can dump).
-pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 60.0;
+// 2026-05-02 PM final tune — universe-scale entry backtest of 5,148
+// tokens with full price history. Combined-feature sweep showed
+// `top1<15 AND sniper<35` produces:
+//   n=34 fires, mean realized +16.8%, median +5.5%, win 50%, rt 9%
+// vs the prior `top1<60` setting (n=776, mean +8.3%, win 20%).
+// Cohort feature gradient (wins p75 top1=14, big_wins p75=14.2)
+// validated at universe scale — top1<15 was the cleanest separator.
+// Trade-off: ~22x volume reduction but doubled mean and win rate.
+pub const MOONSHOT_MAX_TOP_HOLDER_PCT: f64 = 15.0;
 pub const MOONSHOT_MIN_HOLDER_COUNT: i32 = 15;
 pub const MOONSHOT_MAX_HOLDER_COUNT: i32 = 60;
 // Lifted from 50/min to 200/min after universe analysis: tpm 50-200
@@ -227,7 +232,10 @@ pub const MOONSHOT_MIN_PRE_PCT: f64 = 0.0;
 // programmatic launch-bot fills. Ceilings are looser than SHORT because
 // DEV-class tokens are pre-stabilization.
 pub const MOONSHOT_MAX_BUNDLE_PCT: f64 = 50.0;
-pub const MOONSHOT_MAX_SNIPER_PCT: f64 = 70.0;
+// 2026-05-02 PM final tune — was 70 (loose). Combined with top1<15
+// produces the universe sweet spot (n=34, mean +16.8%, win 50%).
+// Wins cluster at sniper 23%, losses at 44%; 35 cleanly separates.
+pub const MOONSHOT_MAX_SNIPER_PCT: f64 = 35.0;
 pub const MOONSHOT_MAX_INSIDER_PCT: f64 = 40.0;
 
 // =============================================================================
