@@ -1404,17 +1404,19 @@ impl Notifier {
         Ok(())
     }
 
-    /// copyMessage — same-shape clone of a message into another chat
-    /// without the "Forwarded from" label. Used by the lounge-anchor
-    /// bump to re-post the source message at the bottom.
-    async fn copy_message(
+    /// forwardMessage — preserves the source's inline keyboard (e.g.
+    /// Safeguard's "tap to verify" URL button), unlike copyMessage which
+    /// drops reply_markup. Adds a small "Forwarded from <chat>" header
+    /// in the destination, which is fine when the source IS the
+    /// destination channel (the most common anchor case).
+    async fn forward_message(
         &self,
         chat_id: &str,
         from_chat_id: &str,
         message_id: i64,
     ) -> Result<i64> {
         let url = format!(
-            "https://api.telegram.org/bot{}/copyMessage",
+            "https://api.telegram.org/bot{}/forwardMessage",
             self.cfg.bot_token
         );
         let form = vec![
@@ -1425,11 +1427,11 @@ impl Notifier {
         let resp = self.http.post(&url).form(&form).send().await?;
         let body: serde_json::Value = resp.json().await?;
         if body["ok"].as_bool() != Some(true) {
-            return Err(anyhow!("copyMessage failed: {}", body));
+            return Err(anyhow!("forwardMessage failed: {}", body));
         }
         Ok(body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("copyMessage missing result.message_id"))?)
+            .ok_or_else(|| anyhow!("forwardMessage missing result.message_id"))?)
     }
 
     /// "Always at the bottom" anchor in the lounge. Telegram pins go to
@@ -1473,14 +1475,17 @@ impl Notifier {
                 }
             }
         }
-        match self.copy_message(&lounge_chat, &source_chat, anchor_msg).await {
+        // forwardMessage instead of copyMessage — preserves the
+        // source's inline keyboard (Safeguard's "tap to verify" URL
+        // button is the primary use case). copyMessage drops reply_markup.
+        match self.forward_message(&lounge_chat, &source_chat, anchor_msg).await {
             Ok(new_id) => {
                 let _ = self.db.set_lounge_anchor_msg_id(new_id);
-                tracing::debug!("anchor-bump: copied source {} → {} (prev was {})", anchor_msg, new_id, prev);
+                tracing::debug!("anchor-bump: forwarded source {} → {} (prev was {})", anchor_msg, new_id, prev);
             }
             Err(e) => {
                 tracing::warn!(
-                    "anchor-bump: copy {} from {} → {} failed: {}",
+                    "anchor-bump: forward {} from {} → {} failed: {}",
                     anchor_msg, source_chat, lounge_chat, e
                 );
             }
