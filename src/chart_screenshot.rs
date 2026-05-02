@@ -17,10 +17,11 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const VIEWPORT_W: u32 = 900;
-// 440 trims the empty footer band below the DexScreener watermark — the
-// chart canvas itself ends around y=420, so 440 keeps the watermark
-// visible without the dead space below it.
-const VIEWPORT_H: u32 = 440;
+// Live chart user-feedback (2026-05-02 PM): 440 left a grey band below
+// the "Tracked by DEX SCREENER" watermark — wasted space that could be
+// chart. The watermark band ends ~y=400; dropping viewport to 400
+// keeps the watermark visible and gives the candle area the rest.
+const VIEWPORT_H: u32 = 400;
 // 25s budget — observed some pairs (lower-liq / fresh-migration) needed
 // 20+ s for the TradingView WS handshake + first OHLCV chunk to land
 // before the chart canvas drew. 18s caught some, missed others ("Loading
