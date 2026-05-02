@@ -7,6 +7,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
+COPY assets ./assets
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -16,6 +17,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
+COPY assets ./assets
 RUN cargo build --release --bin photon
 
 FROM debian:bookworm-slim
