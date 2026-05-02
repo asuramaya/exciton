@@ -34,5 +34,12 @@ bincode = "1"
 # producing an unreadable straight line. The chromium screenshot captures
 # the same chart traders see in DexScreener (real candles, volume, MCap).
 
+# `image` crate for two post-processing steps in chart_screenshot.rs:
+# (1) variance-check the chart-canvas region to detect mid-load
+# screenshots (the "Loading pair…" grey box has near-zero variance vs
+# loaded candles which are highly varied) and retry; (2) crop the bottom
+# of the screenshot to remove the DexScreener watermark band + chin.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [dev-dependencies]
 tempfile = "3"
