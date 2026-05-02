@@ -113,18 +113,19 @@ pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
-// Buy/sell ratio gates — relaxed 2026-04-30 from 1.10-1.30 to 1.05-1.40
-// after live observation that the tighter band caught zero candidates.
-// 2ssMotVbTUfR (GRINDER conf 74, top1 3.5%, top10 14.2%, mcap $2M) sat
-// at 1.05-1.09 bsr for an hour, perfect by every other measure but
-// blocked. The 1.05-1.40 band still excludes the bimodal failure modes
-// from the historical cohort (0.82/0.93 dumping, 3.48/3.70/3.77 FOMO
-// peak) while letting through borderline-organic flow.
+// Buy/sell ratio gates. 2026-04-30: relaxed 1.10-1.30 → 1.05-1.40 to fire
+// at all (tighter band caught zero candidates). 2026-05-02: relaxed upper
+// bound 1.40 → 3.0 after live observation showed STAIRCASE conf-75
+// runners ($WINNING / 5U7yW5CRQa…, ran ~1000% h1) blocked at b/s 3.2.
+// The 1.40-3.0 band was untested by the original cohort analysis — the
+// historical losers sat at 0.82/0.93 (dumping) and 3.48/3.70/3.77 (FOMO
+// peak). 3.0 keeps both failure modes filtered while letting through the
+// runners-mid-rip zone that was the actual false-negative source.
 //
-// Trade-off: chadhouse (1.37) historical loser slips back through.
-// Accepted given that nothing fires under the tighter band.
+// Trade-off: late-FOMO entries between 1.40-3.0 will sometimes slip; the
+// trailing-stop ladder is the safety net for those.
 pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.05;
-pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 1.40;
+pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 3.0;
 // Minimum sample size — below this the ratio is noise.
 pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
 
