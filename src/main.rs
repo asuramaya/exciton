@@ -309,6 +309,20 @@ async fn main() -> Result<()> {
                     if let Err(e) = sink_db.insert_token(&token.mint, 0) {
                         tracing::warn!("pumpportal-sink: insert_token {} failed: {}", token.mint, e);
                     }
+                    // Capture the actual deployer (creator) wallet — the
+                    // PumpPortal new-token event carries `traderPublicKey`
+                    // which IS the wallet that called the create
+                    // instruction on pump.fun. This is the cluster key
+                    // for deployer-history scoring. Earlier code stored
+                    // the top-1 holder here which is a different concept
+                    // (current owner ≠ creator) and produced 100%
+                    // one-shot deployer rows in the DB.
+                    if let Some(trader) = token.trader_public_key.as_deref() {
+                        if !trader.is_empty() {
+                            let initial = token.initial_buy.unwrap_or(0.0);
+                            let _ = sink_db.set_deployer_if_empty(&token.mint, trader, initial);
+                        }
+                    }
                     // Audit-log spam removed 2026-04-30: 68k of 130k
                     // audit_log rows were "pumpportal/new_token" entries
                     // from this hot path (~30/min). The DB tokens table

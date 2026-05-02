@@ -682,13 +682,15 @@ pub async fn analyze_token(
     };
 
     let delta = if let Some(db) = db {
-        // Record the deployer on first sight. The largest holder at the
-        // moment of first scan is a reliable proxy for the creator wallet
-        // on pump.fun-style launches, and the only information we need to
-        // track their future dumping behavior.
-        if let Some(top) = holders.first() {
-            let _ = db.set_deployer_if_empty(mint_address, &top.address, top.ui_amount);
-        }
+        // 2026-05-02 PM: removed the "top-1 holder = deployer" heuristic
+        // that lived here previously. Top holder is the largest CURRENT
+        // owner — that's not the creator wallet. The actual deployer is
+        // the wallet that called pump.fun's create instruction, which
+        // PumpPortal exposes as `traderPublicKey` on the new-token
+        // event; we now capture that in main.rs's pumpportal sink. The
+        // prior heuristic produced 100% one-shot deployer rows (each
+        // mint had a different "top holder"), making cluster scoring
+        // impossible.
 
         // First-time sniper cohort capture: the top-20 holders at first-scan
         // are our best proxy for the early-buyer cohort on a pump.fun mint

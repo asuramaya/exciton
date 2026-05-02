@@ -1035,6 +1035,28 @@ impl Notifier {
             }
         }
 
+        // Deployer track-record veto. Pump.fun rug clusters launch
+        // dozens of dud tokens from the same wallet (Arkham Q1-2025
+        // analysis: 12 clusters drove the bulk of rugs). When this
+        // token's deployer has launched ≥3 prior tokens AND ≥50% of
+        // them rugged, hard-skip regardless of pattern shape — even
+        // a clean tape from a known rugger is a setup, not a signal.
+        if let Ok(Some((deployer_addr, _bal))) = self.db.get_token_deployer(&a.address) {
+            if !deployer_addr.is_empty() {
+                if let Ok((prior, _runners, rugs)) =
+                    self.db.deployer_track_record(&deployer_addr, &a.address)
+                {
+                    if prior >= 3 && (rugs as f64 / prior as f64) >= 0.5 {
+                        tracing::info!(
+                            "moonshot deployer-veto: {} deployer {} has {}/{} prior rugs",
+                            a.address, deployer_addr, rugs, prior
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
         mcap_ok
             && holders_ok
             && top1_ok

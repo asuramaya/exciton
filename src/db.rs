@@ -681,6 +681,55 @@ impl Db {
         Ok(rows)
     }
 
+    /// Compute a deployer's track record from prior tokens. Returns
+    /// `(prior_count, runner_count, rug_count)`. A "runner" is any prior
+    /// token where token_snapshots ever recorded a price >=2x first
+    /// seen; "rug" is a token whose price collapsed >=80% from peak
+    /// within the snapshot window. Used by gates to relax for proven
+    /// deployers and harden against repeat ruggers.
+    pub fn deployer_track_record(&self, deployer: &str, exclude_mint: &str) -> Result<(i64, i64, i64)> {
+        if deployer.is_empty() { return Ok((0, 0, 0)); }
+        let conn = self.conn.lock().unwrap();
+        let prior_mints: Vec<String> = conn
+            .prepare("SELECT address FROM tokens WHERE deployer_address = ?1 AND address != ?2")?
+            .query_map(params![deployer, exclude_mint], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if prior_mints.is_empty() { return Ok((0, 0, 0)); }
+        let mut runners = 0i64;
+        let mut rugs = 0i64;
+        for mint in &prior_mints {
+            let row: Option<(f64, f64, f64)> = conn
+                .query_row(
+                    "SELECT MIN(price_usd), MAX(price_usd), price_usd FROM token_snapshots
+                     WHERE token_address = ?1 AND price_usd > 0",
+                    params![mint],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((lo, hi, _)) = row {
+                if lo > 0.0 {
+                    let peak_pct = (hi / lo - 1.0) * 100.0;
+                    if peak_pct >= 100.0 { runners += 1; }
+                    // Rug: latest price <= 20% of peak
+                    let latest: Option<f64> = conn
+                        .query_row(
+                            "SELECT price_usd FROM token_snapshots
+                             WHERE token_address = ?1 AND price_usd > 0
+                             ORDER BY timestamp DESC LIMIT 1",
+                            params![mint],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(latest_px) = latest {
+                        if hi > 0.0 && latest_px <= hi * 0.2 { rugs += 1; }
+                    }
+                }
+            }
+        }
+        Ok((prior_mints.len() as i64, runners, rugs))
+    }
+
     /// Record a DexScreener boost observation for a token. Called from
     /// the discovery poller when an item from boost feeds carries an
     /// `amount` field. Idempotent on (token, observed_at) — repeated
@@ -1016,6 +1065,24 @@ impl Db {
             })
             .optional()?;
         Ok(token)
+    }
+
+    /// Look up the deployer address + initial balance recorded for a
+    /// mint. Returns None when no deployer was captured (older rows
+    /// from before the pumpportal trader_public_key fix).
+    pub fn get_token_deployer(&self, address: &str) -> Result<Option<(String, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, f64)> = conn
+            .query_row(
+                "SELECT deployer_address, deployer_initial_balance FROM tokens WHERE address = ?1",
+                params![address],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((d, b)) if !d.is_empty() => Ok(Some((d, b))),
+            _ => Ok(None),
+        }
     }
 
     /// Record the deployer wallet for a token the first time we see it.
