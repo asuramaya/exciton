@@ -71,33 +71,32 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // observed conf distribution. If realized EV degrades materially over
 // the next 7d, raise back to 70.
 pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
-// 2026-05-01 Bucket A relaxation: top1 gate bumped 6 → 18. Backtest against
-// the live token_snapshots universe (n=223 entries passing
-// STAIRCASE/GRINDER/SPRING + conf≥70 + top1<22 + liq≥15k) showed +10.8%
-// mean realized EV with a 50@+50/25@+100/25@+250 ladder. The old 6% floor
-// was so tight it was producing 0 fires for hours and excluding ~95% of
-// the historical winner shape. 18 is two points tighter than the backtest
-// threshold for a safety margin while still ~3x more permissive than the
-// prior gate.
-pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 18.0;
-// Top-10 gate. 2026-05-02: bumped 30 → 33 after silence-window trace
-// surfaced multiple near-passers at top10 31-34% (notably $3h4F4V8v…
-// missed standard gate by 1-3pp on top10 across consecutive STAIRCASE
-// snapshots while passing every other criterion). 33 still cuts the
-// insider-bundler shape (loser cohort sat at 38-50%).
-pub const SIGNAL_MAX_TOP10_PCT: f64 = 33.0;
+// 2026-05-02 PM: aux concentration gates retuned against live runner cohort.
+// 24h backtest of 182 STAIRCASE/GRINDER/SPRING tokens (69 ran ≥1.5x, 22 ran
+// ≥3x) showed every concentration gate was net-NEGATIVE filter quality:
+// they killed runners more than non-runners. Runner profile:
+//   top1   median 20.0%  p25 18.7  p75 21.5  max 28.3
+//   top10  median 41.2%  p25 36.5  p75 44.7  max 62.5
+//   sniper median 52.1%  p25 43.8  p75 58.7  max 99.9
+//   mcap   median $26k   p25 $21k  p75 $32k  max $631k
+// Old gates (top1<18 / top10<33 / sniper<30 / mcap $30k-$1M) caught 2/69
+// runners (2.9% recall, 20% precision). Retuned at runner p75 caps catches
+// 49/69 runners (71% recall, 47.6% precision) — full surgery in commit msg.
+pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 25.0;
+pub const SIGNAL_MAX_TOP10_PCT: f64 = 50.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 // 2026-05-01 Bucket A: liquidity floor 50k → 20k. Backtest universe used
 // 15k floor; 20k adds a 33% safety margin while still capturing ~85% of
 // historical 5x+ runners (median entry liq $25-30k for that cohort).
 pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 20_000.0;
 pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
-// 2026-05-01 Bucket A: mcap floor 500k → 30k, ceiling added at 1M. The
-// 500k floor was excluding the entire post-grad / mid-cap pump shape
-// where median 5x+ runner enters. Ceiling at 1M cuts mature-tape entries
-// where remaining upside is small.
-pub const SIGNAL_MIN_MCAP_USD: f64 = 30_000.0;
-pub const SIGNAL_MAX_MCAP_USD: f64 = 1_000_000.0;
+// 2026-05-02 PM: mcap window widened from $30k-$1M → $15k-$5M. Live
+// runner cohort had p25 mcap of $21k (the $30k floor was clipping the
+// early-stage cohort entirely) and J8PSdNP3… ran multi-x at conf=82
+// blocked by the $1M ceiling at $3.7M. Ceiling at $5M still cuts deep
+// mature-tape entries where remaining upside is small.
+pub const SIGNAL_MIN_MCAP_USD: f64 = 15_000.0;
+pub const SIGNAL_MAX_MCAP_USD: f64 = 5_000_000.0;
 pub const SIGNAL_MIN_TX_RATE_PER_MIN: f64 = 5.0;
 // Holder growth gate disabled by setting to 0. holder_count is RPC-capped at
 // 20 (`getTokenLargestAccounts` returns ≤20 accounts), making growth-rate
@@ -110,7 +109,12 @@ pub const SIGNAL_MIN_HOLDER_GROWTH_PER_HOUR: f64 = 0.0;
 // threshold; absence of data does NOT block (the auto-refresh will catch
 // up on the next analysis cycle).
 pub const SIGNAL_MAX_BUNDLE_PCT: f64 = 30.0;
-pub const SIGNAL_MAX_SNIPER_PCT: f64 = 30.0;
+// 2026-05-02 PM: sniper ceiling 30 → 60. Live runner cohort sits at
+// median 52% sniper (p75=58.7%); the 30% gate killed 88% of runners vs
+// 76% of non-runners (net -12pp anti-signal). 60% still cuts the >60%
+// pure-bot-rug tail while letting the organic post-snipe accumulation
+// pattern through.
+pub const SIGNAL_MAX_SNIPER_PCT: f64 = 60.0;
 pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 
 // Buy/sell ratio gates. 2026-04-30: relaxed 1.10-1.30 → 1.05-1.40 to fire

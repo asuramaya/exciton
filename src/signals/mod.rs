@@ -153,13 +153,19 @@ impl Confidence {
             (distribution as f64 * 0.5) as i32
         };
 
-        // Total score: what matters is the combination
-        // Momentum (40%) — is something happening right now?
-        // Distribution (30%) — can this survive selling pressure?
-        // Spring (30%) — is this coiled for a move?
-        let mut total = ((momentum as f64 * 0.40)
-            + (distribution as f64 * 0.30)
-            + (spring as f64 * 0.30)) as i32;
+        // Total score. 2026-05-02 PM retune — backtest of 24h cohort
+        // (n=182 STAIRCASE/GRINDER/SPRING, 69 ran ≥1.5x) showed the old
+        // 40/30/30 weights structurally clipped runners at 60-67 because
+        // `spring` is largely a derivative of `distribution` (e.g.
+        // `dist*0.5 + mom*0.5` for STAIRCASE band) — 30% spring weight
+        // double-counted distribution and capped well-shaped patterns
+        // around 64. Rebalance:
+        //   Momentum     50% — the tape is the call
+        //   Distribution 40% — survival under selling pressure
+        //   Spring       10% — residual signal after de-duping with dist
+        let mut total = ((momentum as f64 * 0.50)
+            + (distribution as f64 * 0.40)
+            + (spring as f64 * 0.10)) as i32;
 
         // Exceptional distribution bonus: top_holder < 10% is rare and powerful
         // BFiGUx at 2% should score higher than a token at 25%
@@ -247,6 +253,16 @@ impl Confidence {
             "DEVELOPING".to_string()
         };
 
+        // Pattern-classification bonus. STAIRCASE/GRINDER/SPRING are
+        // structural pattern matches (mom>70 AND dist>50 etc.). A token
+        // that has cleared those branches has earned confidence beyond
+        // what the linear weights capture. +8 lifts the 60-67 cluster
+        // into the actionable band where the runner cohort actually
+        // lives. Applied AFTER classification is determined.
+        if matches!(classification.as_str(), "STAIRCASE" | "GRINDER" | "SPRING") {
+            total += 8;
+        }
+
         // UNSAFE vetoes override the total score — never let a risky token carry
         // confidence into downstream ranking.
         if classification.starts_with("UNSAFE") {
@@ -297,9 +313,9 @@ impl Confidence {
 
         // Decomposition — expose the breakdown so downstream can show WHY
         // the total landed where it did. Base = weighted sum before bonuses.
-        let base_total = ((momentum as f64 * 0.40)
-            + (distribution as f64 * 0.30)
-            + (spring as f64 * 0.30)) as i32;
+        let base_total = ((momentum as f64 * 0.50)
+            + (distribution as f64 * 0.40)
+            + (spring as f64 * 0.10)) as i32;
         let bonus_pct = if top_holder_score >= 90 {
             15
         } else if top_holder_score >= 75 {
