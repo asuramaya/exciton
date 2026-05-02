@@ -35,10 +35,13 @@ fn profile_dir() -> PathBuf {
 }
 
 /// DexScreener embed URL — strips chrome around the chart, dark theme,
-/// hides info/trades panels so the chart fills the viewport.
+/// hides info/trades panels so the chart fills the viewport. `interval=1`
+/// requests 1-minute candles; on a fresh-migration token the default 15m
+/// resolution rendered just one fat candle since the token only had a
+/// few minutes of price history.
 fn embed_url(pair_address: &str) -> String {
     format!(
-        "https://dexscreener.com/solana/{}?embed=1&theme=dark&info=0&trades=0&loadChartSettings=0&chartLeftToolbar=0",
+        "https://dexscreener.com/solana/{}?embed=1&theme=dark&info=0&trades=0&loadChartSettings=0&chartLeftToolbar=0&interval=1",
         pair_address
     )
 }
