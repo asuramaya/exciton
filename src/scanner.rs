@@ -979,8 +979,13 @@ impl BackgroundScanner {
             // catches it. peak comes from snapshots OR current take_pct
             // (whichever is larger) — the on-chain snapshot path captures
             // momentary spikes that DexScreener missed.
+            // 2026-05-02 PM tune — SCALP default stop tightened -30 → -25.
+            // 19-call SCALP cohort: 37% win rate, mean realized -21.6%
+            // (basically pinned at the -30 stop on losers). 11 of 19 hit
+            // scalp stop at -30. Tightening 5pp cuts loss-per-fire while
+            // keeping the take ladders identical.
             let default_stop_for_horizon = if is_moonshot { -25.0 }
-                else if is_scalp { -30.0 }
+                else if is_scalp { -25.0 }
                 else if is_long { -50.0 }
                 else { -40.0 };
             let snapshot_peak = self
@@ -1520,6 +1525,12 @@ impl BackgroundScanner {
 /// the profit." Tiers tuned against the live cohort: most peaked positions
 /// retraced 30-50% off peak before recovering or rugging, so each tier
 /// captures roughly half of the prior tier's gain.
+///
+/// 2026-05-02 PM tune — strategy review of 83 terminal calls. Peak band
+/// 30-50% had 4/13 wins, mean realized -25.7%; six positions hit the
+/// breakeven floor at +0% with peaks +22-42% (gave back the entire
+/// run). Inserted a +30→+10 tier so tokens that printed a real green
+/// but retraced lock in a small win instead of going flat.
 fn trailing_stop_floor(peak_pct: f64, default_stop: f64) -> f64 {
     if peak_pct >= 400.0 {
         200.0
@@ -1529,6 +1540,10 @@ fn trailing_stop_floor(peak_pct: f64, default_stop: f64) -> f64 {
         50.0
     } else if peak_pct >= 50.0 {
         25.0
+    } else if peak_pct >= 30.0 {
+        // Capture-the-green tier — peak +30 means the call printed real
+        // upside; lock in +10 so a retrace doesn't deliver a flat exit.
+        10.0
     } else if peak_pct >= 20.0 {
         // Breakeven floor — once the position has gained 20% it can never
         // be closed below entry. The "free ride" threshold.
