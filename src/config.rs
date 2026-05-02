@@ -126,6 +126,15 @@ pub struct MadapesConfig {
     /// event (one per note addition) so a slower tick keeps API calls low.
     #[serde(default = "default_image_interval")]
     pub image_interval_seconds: u64,
+    /// Featured-token mint — the project's own token, surfaced in a
+    /// pinned section at the top of the site with live market data and
+    /// the ape wallet's holding percentage. Empty disables the section.
+    #[serde(default)]
+    pub featured_mint: String,
+    /// Pump.fun coin URL for the buy-button on the featured section.
+    /// Optional; when empty, the button is hidden.
+    #[serde(default)]
+    pub featured_buy_url: String,
 }
 
 fn default_publish_interval() -> u64 {

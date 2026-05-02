@@ -99,6 +99,30 @@ struct ActivityFile {
     activity: Vec<Activity>,
 }
 
+/// Featured-token snapshot for the site's pinned section. Carries the
+/// project's own coin (mint configured via `featured_mint` in the
+/// MadApes section of config) plus the ape wallet's holding percentage
+/// and the never-selling pledge text.
+#[derive(Debug, Serialize, Default, Clone)]
+struct FeaturedFile {
+    mint: String,
+    symbol: String,
+    name: String,
+    price_usd: f64,
+    mcap_usd: f64,
+    liquidity_usd: f64,
+    price_change_h1: f64,
+    pair_dex: String,
+    pair_address: String,
+    ape_wallet: String,
+    ape_balance: f64,
+    ape_holding_pct: f64,
+    supply_est: f64,
+    buy_url: String,
+    pledge: String,
+    last_update: i64,
+}
+
 /// One entry in the live stream feed — the arena-style commentary scroll.
 /// Kinds: `alert` (scanner), `call` (fired/closed), `note` (hand-written),
 /// `trade` (wallet activity), `graduation`, `whale_buy`. Timestamp-ordered
@@ -635,6 +659,23 @@ impl Publisher {
         //     main site. Timestamp-sorted newest-first.
         let stream = self.build_stream_file().await;
 
+        // 11. Featured token — the project's own coin (configured via
+        //     featured_mint). Independent timeout: a slow DexScreener
+        //     fetch on this single mint should not abort the rest of the
+        //     publish cycle.
+        let featured = match tokio::time::timeout(
+            PHASE_BUDGET,
+            self.build_featured_file(),
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(_) => {
+                tracing::warn!("publisher: build_featured_file timed out — skipping featured this tick");
+                None
+            }
+        };
+
         write_json(&data_dir.join("health.json"), &health)?;
         write_json(&pnl_path, &pnl)?;
         write_json(
@@ -644,8 +685,66 @@ impl Publisher {
         write_json(&data_dir.join("activity.json"), &ActivityFile { activity })?;
         write_json(&data_dir.join("calls.json"), &calls_file)?;
         write_json(&data_dir.join("stream.json"), &stream)?;
+        if let Some(f) = featured {
+            write_json(&data_dir.join("featured.json"), &f)?;
+        }
 
         self.commit_and_push(&repo, now).await
+    }
+
+    /// Snapshot the featured token (the project's own coin) for the site
+    /// banner: live market data + the ape wallet's holding pct + the
+    /// "never selling" pledge text. Returns None when no featured_mint
+    /// is configured (banner stays hidden client-side).
+    async fn build_featured_file(&self) -> Option<FeaturedFile> {
+        let mint = if self.cfg.featured_mint.is_empty() {
+            return None;
+        } else {
+            self.cfg.featured_mint.clone()
+        };
+        // Live market — symbol/name/price/mcap/24h. Cached via market::get_market.
+        let market = market::get_market(&mint).await.ok().flatten();
+        // Ape wallet's MAAI balance via SPL token-accounts lookup.
+        let mut ape_balance: f64 = 0.0;
+        if let Ok(holdings) = self.rpc.get_wallet_token_holdings(&self.wallet).await {
+            if let Some((_, bal)) = holdings.iter().find(|(m, _)| m == &mint) {
+                ape_balance = *bal;
+            }
+        }
+        // Supply: derive from mcap/price (pump.fun = ~1B fixed supply but
+        // we don't hardcode that — derive from observable market data).
+        let (price_usd, mcap_usd) = market
+            .as_ref()
+            .map(|m| (m.price_usd, m.mcap_usd))
+            .unwrap_or((0.0, 0.0));
+        let supply_est = if price_usd > 0.0 {
+            mcap_usd / price_usd
+        } else {
+            0.0
+        };
+        let holding_pct = if supply_est > 0.0 {
+            (ape_balance / supply_est) * 100.0
+        } else {
+            0.0
+        };
+        Some(FeaturedFile {
+            mint: mint.clone(),
+            symbol: market.as_ref().map(|m| m.symbol.clone()).unwrap_or_default(),
+            name: market.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
+            price_usd,
+            mcap_usd,
+            liquidity_usd: market.as_ref().map(|m| m.liquidity_usd).unwrap_or(0.0),
+            price_change_h1: market.as_ref().map(|m| m.price_change_h1).unwrap_or(0.0),
+            pair_dex: market.as_ref().map(|m| m.pair_dex.clone()).unwrap_or_default(),
+            pair_address: market.as_ref().map(|m| m.pair_address.clone()).unwrap_or_default(),
+            ape_wallet: self.wallet.clone(),
+            ape_balance,
+            ape_holding_pct: holding_pct,
+            supply_est,
+            buy_url: self.cfg.featured_buy_url.clone(),
+            pledge: "Mad Apes wallet holds this and is never selling.".to_string(),
+            last_update: chrono::Utc::now().timestamp(),
+        })
     }
 
     async fn build_stream_file(&self) -> StreamFile {
