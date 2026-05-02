@@ -445,62 +445,11 @@ fn compose_ape_entry(
     format!("{opener}{warn} {plan}").trim().to_string()
 }
 
-/// Compose the brag line for a winning close. Multiplier-first so the
-/// channel reads "we hit 3.5x" not "+251.4%". Mentions peak only when it
-/// significantly exceeded the realized exit (the trail caught a runner
-/// retrace and we want the peak in the brag).
-fn compose_ape_brag(pct: f64, peak_pct: f64, horizon: crate::horizon::Horizon) -> String {
-    let mult = 1.0 + pct / 100.0;
-    let mult_str = if mult >= 2.0 {
-        format!("{:.1}x", mult)
-    } else {
-        // {:+} sign-formats directly. Concatenating "+" with a negative
-        // float yields "+-4%" — caller path passes pct unsigned but the
-        // composer must defend against either.
-        format!("{:+.0}%", pct)
-    };
-    let peak_str = if peak_pct > pct + 25.0 && peak_pct >= 50.0 {
-        let peak_mult = 1.0 + peak_pct / 100.0;
-        if peak_mult >= 2.0 {
-            format!(" (peaked {:.1}x — trail caught the retrace)", peak_mult)
-        } else {
-            format!(" (peaked +{:.0}%)", peak_pct)
-        }
-    } else {
-        String::new()
-    };
-    let phrase = if mult >= 5.0 {
-        "ate good"
-    } else if mult >= 3.0 {
-        "won this one"
-    } else if mult >= 2.0 {
-        "took the 2x"
-    } else if mult >= 1.3 {
-        "banked the run"
-    } else {
-        "small green, took it"
-    };
-    match horizon {
-        crate::horizon::Horizon::Moonshot => format!("{phrase} on a moonshot. {mult_str}{peak_str}."),
-        crate::horizon::Horizon::Scalp    => format!("{phrase}. quick scalp, {mult_str}{peak_str}."),
-        crate::horizon::Horizon::Long     => format!("{phrase}. thesis paid, {mult_str}{peak_str}."),
-        _                                  => format!("{phrase}. {mult_str}{peak_str}."),
-    }
-}
-
-/// Compose the loss/expire line. Honest, no whining, mentions the runner
-/// regret only when the trail let go of real green (peak > 30%, exit red).
-fn compose_ape_loss(pct: f64, peak_pct: f64, status: &str) -> String {
-    if peak_pct >= 30.0 && pct < peak_pct - 50.0 {
-        format!("had it green at +{:.0}%, gave it back. out {:+.0}%.", peak_pct, pct)
-    } else if status == "expired" {
-        format!("90min flat, didn't move. out {:+.0}%.", pct)
-    } else if pct <= -40.0 {
-        "stop hit hard. next.".to_string()
-    } else {
-        format!("out {:+.0}%. next.", pct)
-    }
-}
+// Note: compose_ape_brag / compose_ape_loss removed 2026-05-02. Closed-card
+// body lines come from claw alone — no deterministic prose. When claw
+// fails after retries the renderer emits an empty body so the card reads
+// header + price + track only. The claw is the voice; a canned phrase
+// undermines that.
 
 // -- Notifier core -----------------------------------------------------------
 
@@ -1236,11 +1185,11 @@ impl Notifier {
         Ok(())
     }
 
-    /// Ask zeroclaw to author a one-line close verdict in ape voice.
+    /// Ask zeroclaw to author a one-line close verdict.
     /// Routes through `http://zeroclaw:42617/webhook` (ChatGPT OAuth via
-    /// zeroclaw — no API key in photon). 4s timeout; on error/timeout
-    /// returns Err and the caller falls back to the deterministic
-    /// compose_ape_brag/loss line.
+    /// zeroclaw — no API key in photon). 30s timeout × 5 attempts; on
+    /// total failure returns Err and the caller renders an empty body.
+    /// There is no deterministic fallback — claw is the only voice.
     ///
     /// We deliberately use a tiny isolated prompt (NOT the giant
     /// CLAW_SYSTEM_PROMPT used by /claw) — this is a styling task, not
@@ -1270,23 +1219,29 @@ impl Notifier {
             String::new()
         };
         let prompt = format!(
-            "You write one-line trade-close commentary for a Telegram trading channel. \
-             Voice: human trader, factual, action-oriented. First person, lowercase, \
-             no emojis, no hashtags, no exclamation marks, no metaphors, no similes, \
-             no poetry, no \"like a ___\" comparisons. Just what happened: where you \
-             got in, what the price did, why you exited. State numbers when they matter. \
-             100-160 chars. Vary your phrasing across calls.\n\n\
+            "You write a one-line update on a closed memecoin trade for a Telegram \
+             channel. Voice: a friend in a chat, casual, like text-messaging — NOT \
+             a trade report. Reads like an `Edit:` appendix to an earlier call. \
+             First-person allowed but not required. Mix sentence shapes. Throw in \
+             personal opinion or a quick why when it fits — don't force a template. \
+             Keep it short, often very short (40-90 chars). Some calls don't even \
+             need numbers; some lean on them. No emojis, no hashtags, no exclamation \
+             marks, no metaphors/similes/poetry, no `i bought X at Y, it Zed` template.\n\n\
              Context:\n\
              - ticker: ${ticker}\n\
              - horizon: {horizon}\n\
              - exit: {pct:+.0}% ({mult:.2}x){peak}\n\
              - reason: {reason}\n\n\
-             Examples of the voice (don't copy phrasing, just shape):\n\
-             - aped {ticker_eg1} at 40k, ran to +120, trailing stop took me out at +85.\n\
-             - in {ticker_eg2} at 12k, never moved, moonshot stop hit at -27.\n\
-             - scalp filled on {ticker_eg3}, +30 clean, walked.\n\
-             - {ticker_eg4} peaked +47 then bled, out -8 on the retrace.\n\
-             - stopped on {ticker_eg5} at -42, flow died at entry, no setup.\n\n\
+             Reference voice (don't copy phrasing, just shape — these are from a real \
+             memecoin caller, mid-cycle):\n\
+             - 4x done, dev gave up but the run was clean\n\
+             - out -27, never moved off entry tho\n\
+             - sold for 1.3x, not great but not bad either\n\
+             - closed at +85, trail caught it on the retrace from peak\n\
+             - took the +30 scalp, momentum died right after\n\
+             - stop hit, dev wallet wasn't pretty, knew the risks\n\
+             - over 40x since the call, ride was crazy\n\
+             - didn't have the legs, out flat\n\n\
              Reply with the line only. Nothing else.",
             ticker = ticker,
             horizon = horizon_label,
@@ -1294,8 +1249,6 @@ impl Notifier {
             mult = mult,
             peak = peak_clause,
             reason = reason,
-            ticker_eg1 = "$EG1", ticker_eg2 = "$EG2", ticker_eg3 = "$EG3",
-            ticker_eg4 = "$EG4", ticker_eg5 = "$EG5",
         );
         let body = serde_json::json!({ "message": prompt });
 
@@ -1318,11 +1271,17 @@ impl Notifier {
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             );
+            // 30s per-call timeout. Observed zeroclaw → OpenAI round trip
+            // ranges 4-8s today (gpt-5.4-mini); 12s clipped the slow tail
+            // and produced false-failure retries. 30s gives the model
+            // headroom even on a contended OpenAI minute. Combined with
+            // 5 attempts, total budget is ~150s worst-case for a sliding
+            // outage; in practice attempt 1 succeeds for healthy claw.
             let send_result = self
                 .http
                 .post("http://zeroclaw:42617/webhook")
                 .header("X-Session-Id", session_id)
-                .timeout(std::time::Duration::from_secs(12))
+                .timeout(std::time::Duration::from_secs(30))
                 .json(&body)
                 .send()
                 .await;
@@ -1630,9 +1589,10 @@ impl Notifier {
 
     /// Variant that lets the caller supply a pre-composed body line —
     /// used by apply_outcome_card to inject a claw-authored verdict.
-    /// When `override_body` is None, falls back to the deterministic
-    /// compose_ape_brag/loss output. The override is responsible for
-    /// being safe to html_escape (the renderer escapes it).
+    /// When `override_body` is None for a won/loss bucket, the body
+    /// renders empty — claw is the only voice for closed-card prose.
+    /// Flat closes get a fixed mechanical line ("trail caught at
+    /// breakeven") since there's no story to tell.
     fn render_call_card_with_body(
         &self,
         address: &str,
@@ -1653,7 +1613,7 @@ impl Notifier {
         let exit_pct = parse_pct_prefix(exit_note);
         let peak_pct = parse_peak_pct(exit_note);
         let pct_signed = exit_pct.unwrap_or(0.0);
-        let peak_signed = peak_pct.unwrap_or(pct_signed.max(0.0));
+        let _peak_signed = peak_pct.unwrap_or(pct_signed.max(0.0));
 
         // Realized-pct bucket — source of truth for header + body voice.
         // Mirrors the site's pctBucket(): scanner.status is a lifecycle
@@ -1697,18 +1657,21 @@ impl Notifier {
             _ => format!("· {}", ticker_name),
         };
 
-        // Body voice. Override (claw-authored) wins when present. Otherwise
-        // the deterministic composer maps from realized-pct bucket.
-        let body = if let Some(b) = override_body {
-            b.to_string()
-        } else {
-            match bucket {
-                "won"  => compose_ape_brag(pct_signed, peak_signed, horizon),
-                "loss" => compose_ape_loss(pct_signed, peak_signed, status),
-                "flat" => "trail caught it at breakeven. flat exit.".to_string(),
-                "active" => narrative.trim().to_string(),
-                _ => narrative.trim().to_string(),
-            }
+        // Body voice. Claw-authored override is the ONLY descriptive line
+        // for won/loss closes — there's no deterministic fallback, the
+        // whole point of the claw is to give the calls a voice, and a
+        // canned phrase undermines that. When claw failed (override is
+        // None on a closed bucket), render header + price + track only.
+        // The header already conveys the multiplier; an empty body is
+        // honest about the fact that we couldn't write a story for it.
+        // Flat keeps its fixed mechanical line because there's nothing to
+        // tell — trail just caught at breakeven. Active/unknown use the
+        // entry narrative.
+        let body = match (override_body, bucket) {
+            (Some(b), _) => b.to_string(),
+            (None, "won") | (None, "loss") => String::new(),
+            (None, "flat") => "trail caught it at breakeven. flat exit.".to_string(),
+            (None, _) => narrative.trim().to_string(),
         };
 
         // Tiny price/mc line — single row, no liq/vol clutter.
