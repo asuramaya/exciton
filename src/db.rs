@@ -667,6 +667,37 @@ impl Db {
         Ok(rows)
     }
 
+    /// Trail-stop fakeout guard. NYAN (May 2): called at $60k mcap, took
+    /// a single 80-second wick to -28% (triggered moonshot stop at -25),
+    /// closed; then immediately recovered and ran to +147%. Mitigation:
+    /// before firing any stop-out, require that AT LEAST ONE prior
+    /// snapshot in the last 90s also priced below the floor — a single
+    /// live-fetch wick alone isn't proof of a real breach.
+    ///
+    /// Returns the count of snapshots in (now - 120s, now - 15s] whose
+    /// price is at or below `price_threshold`. Caller treats `>= 1` as
+    /// "confirmed breach", `== 0` as "wick — wait one more cycle".
+    pub fn count_recent_snapshots_below(
+        &self,
+        token_address: &str,
+        price_threshold: f64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let lo = now - 120;
+        let hi = now - 15;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM token_snapshots
+             WHERE token_address = ?1
+               AND timestamp BETWEEN ?2 AND ?3
+               AND price_usd > 0
+               AND price_usd <= ?4",
+            params![token_address, lo, hi, price_threshold],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn get_recent_near_misses(&self, limit: usize) -> Result<Vec<NearMiss>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

@@ -994,6 +994,28 @@ impl BackgroundScanner {
                 .unwrap_or(0.0);
             let peak_observed = snapshot_peak.max(take_pct).max(pct);
             let trail_floor = trailing_stop_floor(peak_observed, default_stop_for_horizon);
+
+            // Trail-stop fakeout guard. NYAN ran a single 80-second wick
+            // through our -25 moonshot stop, exited at -28, then
+            // immediately recovered and ran to +147%. Before firing any
+            // stop-out, require AT LEAST ONE prior snapshot in the last
+            // 15-120s also priced below the trail floor. A single live
+            // fetch wick alone doesn't trigger; we wait one more cycle.
+            // First-call grace: when fewer than 2 minutes have elapsed
+            // since the call we don't have enough snapshot history to
+            // confirm anyway, so skip the gate (worst case we eat the
+            // full -25% which is already capped).
+            let breach_confirmed = if pct <= trail_floor && call.entry_price_usd > 0.0 {
+                let price_floor = call.entry_price_usd * (1.0 + trail_floor / 100.0);
+                let prior_below = self
+                    .db
+                    .count_recent_snapshots_below(&call.mint, price_floor)
+                    .unwrap_or(0);
+                let age_now = chrono::Utc::now().timestamp() - call.called_at;
+                prior_below >= 1 || age_now < 120
+            } else {
+                false
+            };
             // Trail-stop trigger. When floor ≥ 0 we're SUPPOSED to be
             // locking a profit ("withdrew"). But settle latency between
             // snapshots can produce a fill that's materially below the
@@ -1004,7 +1026,7 @@ impl BackgroundScanner {
             // Beyond that, the trail "missed" — fall through to the
             // per-horizon block which labels it as a failure correctly.
             const TRAIL_SLIP_TOLERANCE: f64 = 5.0;
-            let trail_exit: Option<(&'static str, String)> = if pct <= trail_floor {
+            let trail_exit: Option<(&'static str, String)> = if pct <= trail_floor && breach_confirmed {
                 if trail_floor > 0.0 && pct >= trail_floor - TRAIL_SLIP_TOLERANCE {
                     Some((
                         "withdrew",
@@ -1046,9 +1068,10 @@ impl BackgroundScanner {
                     Some(("withdrew", format!("{:+.1}% · scalp 1.5x", take_pct)))
                 } else if take_pct >= 30.0 {
                     Some(("withdrew", format!("{:+.1}% · scalp +30 done", take_pct)))
-                } else if pct <= trail_floor {
+                } else if pct <= trail_floor && breach_confirmed {
                     // Default-stop case (peak hasn't activated trail tier).
                     // trail_exit covered the lock-profit case earlier.
+                    // Confirmation gate prevents single-wick stop-outs.
                     Some(("failed", format!("{:+.1}% · scalp stop", pct)))
                 } else if age >= 30 * 60 && pct < 0.0 && peak_observed <= 15.0 {
                     // No pump after 30min — peak never crossed the trail-stop
@@ -1072,7 +1095,7 @@ impl BackgroundScanner {
                 // at -25% trigger; lower take threshold doubles realized
                 // capture rate (11.3% of cohort hit ≥+200% peak vs 5.7%
                 // hitting ≥+500%).
-                if pct <= trail_floor {
+                if pct <= trail_floor && breach_confirmed {
                     Some(("failed", format!("{:+.1}% · moonshot stop", pct)))
                 } else if take_pct >= 250.0 {
                     Some(("withdrew", format!("{:+.1}% · moonshot 3.5x", take_pct)))
@@ -1091,7 +1114,7 @@ impl BackgroundScanner {
                 // tier just closes the call (we don't track partials at the
                 // call-row level today); operator-discretionary scaling is
                 // outside the auto-settle path.
-                if pct <= trail_floor {
+                if pct <= trail_floor && breach_confirmed {
                     Some(("failed", format!("{:+.1}% · thesis broke", pct)))
                 } else if take_pct >= 150.0 {
                     Some(("withdrew", format!("{:+.1}% · 2.5x done", take_pct)))
@@ -1110,12 +1133,13 @@ impl BackgroundScanner {
                 Some(("withdrew", format!("{:+.1}% · 2x done", take_pct)))
             } else if take_pct >= 50.0 {
                 Some(("withdrew", format!("{:+.1}% · took the win", take_pct)))
-            } else if age <= 30 * 60 && pct <= -25.0 {
+            } else if age <= 30 * 60 && pct <= -25.0 && breach_confirmed {
                 // Fast-fail: SHORT calls that drop ≥25% within the first 30
                 // minutes are dead. Memecoins don't recover from a -25% in
                 // half an hour. Faster than the trail floor's default -40%.
+                // Confirmation gate guards against single-wick stops.
                 Some(("failed", format!("{:+.1}% · early collapse", pct)))
-            } else if pct <= trail_floor {
+            } else if pct <= trail_floor && breach_confirmed {
                 Some(("failed", format!("{:+.1}% · thesis broke", pct)))
             } else if call.entry_tx_rate > 0.0
                 && self.detect_volume_collapse(&call.mint, call.entry_tx_rate)
