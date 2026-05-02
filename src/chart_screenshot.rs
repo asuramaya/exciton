@@ -21,11 +21,12 @@ const VIEWPORT_W: u32 = 900;
 // chart canvas itself ends around y=420, so 440 keeps the watermark
 // visible without the dead space below it.
 const VIEWPORT_H: u32 = 440;
-// 18s lets DexScreener's TradingView embed finish loading candles after
-// the initial WebSocket subscribe. With 9s the chart was rendering as
-// "No data here" because the OHLCV fetch hadn't completed yet.
-const VIRTUAL_TIME_BUDGET_MS: u32 = 18_000;
-const TIMEOUT_SECS: u64 = 35;
+// 25s budget — observed some pairs (lower-liq / fresh-migration) needed
+// 20+ s for the TradingView WS handshake + first OHLCV chunk to land
+// before the chart canvas drew. 18s caught some, missed others ("Loading
+// pair..." in the screenshot). 25s clears the longest tail seen so far.
+const VIRTUAL_TIME_BUDGET_MS: u32 = 25_000;
+const TIMEOUT_SECS: u64 = 45;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 /// Persistent profile dir. Chromium reuses CF cookies + cache from prior
