@@ -17,9 +17,15 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const VIEWPORT_W: u32 = 900;
-const VIEWPORT_H: u32 = 500;
-const VIRTUAL_TIME_BUDGET_MS: u32 = 9_000;
-const TIMEOUT_SECS: u64 = 30;
+// 440 trims the empty footer band below the DexScreener watermark — the
+// chart canvas itself ends around y=420, so 440 keeps the watermark
+// visible without the dead space below it.
+const VIEWPORT_H: u32 = 440;
+// 18s lets DexScreener's TradingView embed finish loading candles after
+// the initial WebSocket subscribe. With 9s the chart was rendering as
+// "No data here" because the OHLCV fetch hadn't completed yet.
+const VIRTUAL_TIME_BUDGET_MS: u32 = 18_000;
+const TIMEOUT_SECS: u64 = 35;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 /// Persistent profile dir. Chromium reuses CF cookies + cache from prior

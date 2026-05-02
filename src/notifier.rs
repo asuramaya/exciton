@@ -1289,6 +1289,153 @@ impl Notifier {
     /// CLAW_SYSTEM_PROMPT used by /claw) — this is a styling task, not
     /// a reasoning task, and the smaller prompt steers GPT toward
     /// actually following the format/length constraints.
+    /// Ask claw to author the OPEN-call thesis line. Same zeroclaw plumbing
+    /// as claw_verdict_line — retry × 5, 30s per attempt, stateless session.
+    /// Without this every fresh call rendered through compose_ape_entry,
+    /// which is a deterministic template — two STAIRCASE/MOONSHOT calls
+    /// at similar mcap printed identical thesis lines.
+    async fn claw_entry_line(
+        &self,
+        ticker: &str,
+        horizon: crate::horizon::Horizon,
+        a: &TokenAnalysis,
+        mcap_usd: f64,
+    ) -> anyhow::Result<String> {
+        let horizon_label = match horizon {
+            crate::horizon::Horizon::Scalp    => "SCALP (quick flip — +30 take, -30 stop)",
+            crate::horizon::Horizon::Short    => "SHORT (swing — +50/+100 ladder, -40 stop)",
+            crate::horizon::Horizon::Long     => "LONG (thesis hold — laddering takes, -50 stop)",
+            crate::horizon::Horizon::Moonshot => "MOONSHOT (lottery shot — out at 3.5x or -25)",
+            crate::horizon::Horizon::Unknown  => "open punt",
+        };
+        let bs_ratio = if a.sells_h1 > 0 {
+            a.buys_h1 as f64 / a.sells_h1 as f64
+        } else {
+            0.0
+        };
+        let prompt = format!(
+            "You write a one-line thesis for a fresh memecoin call going up on a \
+             Telegram channel. Voice: a friend in a chat, casual, like \
+             text-messaging — NOT a trade report. Reads like the FIRST message \
+             you'd send a buddy you trust about an entry you just took. \
+             First-person allowed but not required. Mix sentence shapes. \
+             Throw in your read of the tape or a quick why when it fits — \
+             don't force a template. Keep it short, often very short \
+             (50-110 chars). Some calls lean on numbers; some don't. No \
+             emojis, no hashtags, no exclamation marks, no metaphors/similes/poetry, \
+             no templated phrases like `holders look weird but the tape is the tape` \
+             or `flow stacking` — write something specific and not formulaic.\n\n\
+             Context for THIS call:\n\
+             - ticker: ${ticker}\n\
+             - horizon plan: {horizon}\n\
+             - mcap at entry: {mcap}\n\
+             - top1 holder: {top1:.0}%\n\
+             - top10 holders: {top10:.0}%\n\
+             - classification: {class}\n\
+             - confidence: {conf}/100\n\
+             - tx rate: {tx:.0}/min\n\
+             - bundle/sniper/insider %: {bundle:.0}/{sniper:.0}/{insider:.0}\n\
+             - buy/sell ratio (1h): {bs:.2}\n\n\
+             Reference voice (don't copy phrasing, just shape — these are \
+             from a real memecoin caller, mid-cycle):\n\
+             - fresh dev showed up, top1 still 17, taking a swing\n\
+             - graduated 4 mins ago, holders ramping, scalp shot\n\
+             - this one keeps holding the +25 zone, dist looks clean enough\n\
+             - weird shape but tape's holding, lottery shot\n\
+             - tx rate doubled in 10m, in for the quick flip\n\
+             - mcap pulled back to 60k, structure's still here, swing\n\
+             - back-to-back grinder waves, in before it gets too greedy\n\
+             - low cap, sniper-heavy but the buy pressure won't quit\n\n\
+             Reply with the line only. Nothing else.",
+            ticker = ticker,
+            horizon = horizon_label,
+            mcap = compact_usd(mcap_usd),
+            top1 = a.top_holder_pct,
+            top10 = a.top10_pct,
+            class = a.confidence.classification,
+            conf = a.confidence.total,
+            tx = a.tx_rate,
+            bundle = a.bundle_pct,
+            sniper = a.sniper_pct,
+            insider = a.insider_pct,
+            bs = bs_ratio,
+        );
+        let body = serde_json::json!({ "message": prompt });
+
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let session_id = format!(
+                "photon-entry-{}-{}-{}",
+                ticker,
+                attempt,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let send_result = self
+                .http
+                .post("http://zeroclaw:42617/webhook")
+                .header("X-Session-Id", session_id)
+                .timeout(std::time::Duration::from_secs(30))
+                .json(&body)
+                .send()
+                .await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(anyhow!("attempt {}: {}", attempt, e));
+                    if attempt < MAX_ATTEMPTS {
+                        let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            if !resp.status().is_success() {
+                last_err = Some(anyhow!("attempt {}: zeroclaw {}", attempt, resp.status()));
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                break;
+            }
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = Some(anyhow!("attempt {}: parse {}", attempt, e));
+                    if attempt < MAX_ATTEMPTS {
+                        let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let raw = data["response"].as_str().unwrap_or("").trim().to_string();
+            let cleaned = raw
+                .trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
+                .to_string();
+            if cleaned.is_empty() {
+                last_err = Some(anyhow!("attempt {}: empty response", attempt));
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                break;
+            }
+            let bounded = if cleaned.len() > 240 {
+                format!("{}…", &cleaned[..239])
+            } else {
+                cleaned
+            };
+            return Ok(bounded);
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("zeroclaw entry failed all {} attempts", MAX_ATTEMPTS)))
+    }
+
     async fn claw_verdict_line(
         &self,
         ticker: &str,
@@ -2427,7 +2574,23 @@ impl Notifier {
                     crate::horizon::Horizon::Short
                 };
                 let auto_horizon_tag = auto_horizon.tag().unwrap_or("");
-                let narrative = compose_ape_entry(a, auto_horizon, mcap);
+                // Ask claw to author the open-call thesis. Falls back to the
+                // deterministic compose_ape_entry only on total claw failure
+                // (5 retries × 30s exhausted) — without this fallback we'd
+                // drop the call. The deterministic path produced identical
+                // thesis lines for similar tokens (the user flagged two
+                // MOONSHOT cards posting word-for-word the same body).
+                let ticker = meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("?");
+                let narrative = match self.claw_entry_line(ticker, auto_horizon, a, mcap).await {
+                    Ok(line) => {
+                        tracing::info!("claw entry: {} → {}", a.address, line);
+                        line
+                    }
+                    Err(e) => {
+                        tracing::warn!("claw entry fallback for {}: {}", a.address, e);
+                        compose_ape_entry(a, auto_horizon, mcap)
+                    }
+                };
                 let auto_note = if auto_horizon_tag.is_empty() {
                     narrative.clone()
                 } else {
