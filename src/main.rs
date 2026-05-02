@@ -24,6 +24,7 @@ mod notifier;
 mod publisher;
 mod pumpportal;
 mod scanner;
+mod wallet_observer;
 mod scout;
 mod signals;
 mod templates;
@@ -197,6 +198,11 @@ async fn main() -> Result<()> {
             Ok(mut n) => {
                 let enabled = cfg.enabled;
                 tracing::info!("Telegram notifier configured (enabled={})", enabled);
+                let helius_key = config.rpc.helius_api_key();
+                if !helius_key.is_empty() {
+                    tracing::info!("wallet_observer: Helius key wired (len={})", helius_key.len());
+                    n = n.with_helius_api_key(helius_key);
+                }
                 if let Some(exec) = executor_arc.as_ref() {
                     n = n.with_executor(exec.clone());
                 }

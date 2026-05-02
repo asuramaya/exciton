@@ -224,6 +224,28 @@ pub struct RpcConfig {
     pub endpoints: Vec<String>,
 }
 
+impl RpcConfig {
+    /// Extract a Helius API key from the `endpoints` list, if present.
+    /// Helius URLs come in shape `https://mainnet.helius-rpc.com/?api-key=<KEY>`.
+    /// Returned key powers the wallet_observer (Helius enhanced txns API)
+    /// and any future Helius-specific feature without a duplicated config
+    /// field. Empty string when no Helius endpoint is configured.
+    pub fn helius_api_key(&self) -> String {
+        for url in &self.endpoints {
+            if url.contains("helius-rpc.com") || url.contains("helius.xyz") {
+                if let Some(idx) = url.find("api-key=") {
+                    let after = &url[idx + "api-key=".len()..];
+                    let key = after.split(|c: char| c == '&' || c == '#').next().unwrap_or("");
+                    if !key.is_empty() {
+                        return key.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WalletConfig {
     pub public_key: String,

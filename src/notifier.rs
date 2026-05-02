@@ -527,6 +527,10 @@ pub struct Notifier {
     /// has enabled=true. None = paper-only mode, the auto-call path
     /// inserts rows + posts cards but never signs trades.
     executor: Option<Arc<crate::execution::ExecutionCtx>>,
+    /// Helius API key extracted from rpc.endpoints. Powers wallet_observer
+    /// (Layer 1 of the smart-wallet curation system). Empty when no
+    /// Helius endpoint is configured — the observer no-ops silently.
+    helius_api_key: String,
 }
 
 impl Notifier {
@@ -546,7 +550,17 @@ impl Notifier {
             signal_threshold_override: Arc::new(AtomicI32::new(0)),
             publish_kick,
             executor: None,
+            helius_api_key: String::new(),
         })
+    }
+
+    /// Attach the Helius API key used by wallet_observer for buyer-trace.
+    /// When unset (no Helius endpoint configured), wallet_observer no-ops
+    /// silently and Layer 1 stops collecting — the rest of the system
+    /// stays correct.
+    pub fn with_helius_api_key(mut self, key: String) -> Self {
+        self.helius_api_key = key;
+        self
     }
 
     /// Attach trade-execution capability. Call once at boot when
@@ -2054,6 +2068,36 @@ impl Notifier {
             .ok()
             .flatten()
             .map(|t| t.first_seen);
+
+        // Layer 1 of the smart-wallet curation pipeline: when this mint
+        // crosses the viability threshold for the first time, walk back
+        // its first 20 buyers via Helius enhanced-txns and persist them.
+        // claim_observation_trace makes the per-mint trace single-fire
+        // across the process lifetime; spawn_trace is detached so the
+        // hot path doesn't block on an HTTP round-trip.
+        if !self.helius_api_key.is_empty() {
+            let mcap = meta
+                .as_ref()
+                .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+                .unwrap_or(0.0);
+            let liq = meta.as_ref().and_then(|m| m.liquidity_usd).unwrap_or(0.0);
+            let now_ts = chrono::Utc::now().timestamp();
+            let age = first_seen.map(|fs| now_ts - fs).unwrap_or(0);
+            if crate::wallet_observer::should_trace(
+                &a.confidence.classification,
+                age,
+                mcap,
+                liq,
+                a.holder_count as i64,
+            ) {
+                crate::wallet_observer::spawn_trace(
+                    self.db.clone(),
+                    self.http.clone(),
+                    self.helius_api_key.clone(),
+                    a.address.clone(),
+                );
+            }
+        }
 
         match existing {
             None => {

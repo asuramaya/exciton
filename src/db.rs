@@ -377,6 +377,33 @@ impl Db {
                 first_buy_ts INTEGER NOT NULL,
                 PRIMARY KEY (mint_address, owner_address)
             );
+            -- Wallet observations — early buyers captured per promoted mint.
+            -- Layer 1 of the self-evolving smart-wallet curation system.
+            -- Populated by wallet_observer on first promotion of a mint
+            -- (mint passes basic classifier + age + holder thresholds).
+            -- One row per (wallet, mint) — UNIQUE prevents duplicate inserts
+            -- if the buyer-trace runs twice. Layer 2 (outcomes) joins this
+            -- against token_snapshots to compute realized PnL per wallet.
+            CREATE TABLE IF NOT EXISTS wallet_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                buy_ts INTEGER NOT NULL,
+                buy_sol REAL NOT NULL DEFAULT 0,
+                observed_at INTEGER NOT NULL,
+                UNIQUE(wallet, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_obs_wallet ON wallet_observations(wallet);
+            CREATE INDEX IF NOT EXISTS idx_wallet_obs_mint ON wallet_observations(mint);
+            -- Idempotency: tracks which mints we've already traced so the
+            -- promotion trigger fires the buyer-walk exactly once.
+            CREATE TABLE IF NOT EXISTS wallet_observation_traces (
+                mint TEXT PRIMARY KEY,
+                traced_at INTEGER NOT NULL,
+                buyer_count INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS reference_mints (
                 mint_address TEXT PRIMARY KEY,
                 label TEXT NOT NULL DEFAULT '',
@@ -2252,6 +2279,59 @@ impl Db {
             .query_row(params![address, since_ts, until_ts], |row| row.get(0))
             .ok();
         Ok(price)
+    }
+
+    /// Claim a mint for buyer-trace. Atomic: returns Ok(true) when the
+    /// mint was newly inserted into wallet_observation_traces, Ok(false)
+    /// if a prior trace already exists. Used by wallet_observer to make
+    /// the per-mint trace fire exactly once across the lifetime of the
+    /// process (idempotency survives restart). Caller is responsible for
+    /// updating buyer_count + success after the trace completes.
+    pub fn claim_observation_trace(&self, mint: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO wallet_observation_traces
+                (mint, traced_at, buyer_count, success)
+             VALUES (?1, ?2, 0, 0)",
+            params![mint, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark a trace complete with realized buyer count. Called after the
+    /// buyer-walk finishes (success or partial). Failure path leaves
+    /// success=0 so a future operator inspection can find them.
+    pub fn finalize_observation_trace(&self, mint: &str, buyer_count: i64, success: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE wallet_observation_traces
+                SET buyer_count = ?2, success = ?3
+              WHERE mint = ?1",
+            params![mint, buyer_count, if success { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a (wallet, mint, rank) observation. UNIQUE(wallet,mint)
+    /// makes this idempotent — re-runs of a partial trace won't error.
+    pub fn insert_wallet_observation(
+        &self,
+        wallet: &str,
+        mint: &str,
+        rank: i64,
+        buy_ts: i64,
+        buy_sol: f64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR IGNORE INTO wallet_observations
+                (wallet, mint, rank, buy_ts, buy_sol, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![wallet, mint, rank, buy_ts, buy_sol, now],
+        )?;
+        Ok(())
     }
 
     /// Most recent (top_holder_pct, top10_pct) pair from token_snapshots
