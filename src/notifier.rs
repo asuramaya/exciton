@@ -442,7 +442,10 @@ fn compose_ape_brag(pct: f64, peak_pct: f64, horizon: crate::horizon::Horizon) -
     let mult_str = if mult >= 2.0 {
         format!("{:.1}x", mult)
     } else {
-        format!("+{:.0}%", pct)
+        // {:+} sign-formats directly. Concatenating "+" with a negative
+        // float yields "+-4%" — caller path passes pct unsigned but the
+        // composer must defend against either.
+        format!("{:+.0}%", pct)
     };
     let peak_str = if peak_pct > pct + 25.0 && peak_pct >= 50.0 {
         let peak_mult = 1.0 + peak_pct / 100.0;
@@ -1206,6 +1209,88 @@ impl Notifier {
         Ok(())
     }
 
+    /// Ask zeroclaw to author a one-line close verdict in ape voice.
+    /// Routes through `http://zeroclaw:42617/webhook` (ChatGPT OAuth via
+    /// zeroclaw — no API key in photon). 4s timeout; on error/timeout
+    /// returns Err and the caller falls back to the deterministic
+    /// compose_ape_brag/loss line.
+    ///
+    /// We deliberately use a tiny isolated prompt (NOT the giant
+    /// CLAW_SYSTEM_PROMPT used by /claw) — this is a styling task, not
+    /// a reasoning task, and the smaller prompt steers GPT toward
+    /// actually following the format/length constraints.
+    async fn claw_verdict_line(
+        &self,
+        ticker: &str,
+        horizon: crate::horizon::Horizon,
+        exit_pct: f64,
+        peak_pct: f64,
+        reason: &str,
+        is_win: bool,
+    ) -> anyhow::Result<String> {
+        let horizon_label = match horizon {
+            crate::horizon::Horizon::Scalp    => "SCALP (quick flip)",
+            crate::horizon::Horizon::Short    => "SHORT (swing)",
+            crate::horizon::Horizon::Long     => "LONG (thesis hold)",
+            crate::horizon::Horizon::Moonshot => "MOONSHOT (lottery shot)",
+            crate::horizon::Horizon::Unknown  => "memecoin punt",
+        };
+        let mult = 1.0 + exit_pct / 100.0;
+        let outcome = if is_win { "won" } else { "lost" };
+        let peak_clause = if peak_pct > exit_pct + 25.0 && peak_pct >= 50.0 {
+            format!(" · peak {:+.0}% (trail caught a retrace)", peak_pct)
+        } else {
+            String::new()
+        };
+        let prompt = format!(
+            "You write one-line trade-close commentary in the voice of a Solana memecoin ape — \
+             first person, terse, no emojis, no hashtags, no exclamation marks, no preamble. \
+             Lowercase only. 100-180 chars. Speak as if telling a friend across the bar what \
+             just happened. Don't restate the numbers verbatim — color them. Vary your phrasing; \
+             don't repeat openers like \"small green\" or \"took it on a moonshot.\"\n\n\
+             Context:\n\
+             - ticker: ${ticker}\n\
+             - horizon: {horizon}\n\
+             - outcome: {outcome} ({pct:+.0}%, multiplier {mult:.2}x){peak}\n\
+             - reason: {reason}\n\n\
+             Reply with the line only. Nothing else.",
+            ticker = ticker,
+            horizon = horizon_label,
+            outcome = outcome,
+            pct = exit_pct,
+            mult = mult,
+            peak = peak_clause,
+            reason = reason,
+        );
+        let body = serde_json::json!({ "message": prompt });
+        let resp = self
+            .http
+            .post("http://zeroclaw:42617/webhook")
+            .timeout(std::time::Duration::from_secs(4))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("zeroclaw verdict {}", resp.status()));
+        }
+        let data: serde_json::Value = resp.json().await?;
+        let raw = data["response"].as_str().unwrap_or("").trim().to_string();
+        // Strip possible quote-wrapping or trailing newlines, cap length.
+        let cleaned = raw
+            .trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
+            .to_string();
+        if cleaned.is_empty() {
+            return Err(anyhow!("zeroclaw verdict empty"));
+        }
+        // Hard cap at 200 chars in case the model ignored the budget.
+        let bounded = if cleaned.len() > 200 {
+            format!("{}…", &cleaned[..199])
+        } else {
+            cleaned
+        };
+        Ok(bounded)
+    }
+
     /// Build the calls-channel chart for a token. Looks up the recent
     /// price history (since the call's first_seen — bounded to 6h to
     /// keep the sparkline meaningful for moonshot windows). Falls back
@@ -1320,6 +1405,23 @@ impl Notifier {
         entry_note: &str,   // call.note — entry narrative (already ape-voiced for auto-fires)
         exit_note: &str,    // settle verdict ("-22.1% · moonshot stop") or empty
     ) -> String {
+        self.render_call_card_with_body(address, meta, status, entry_note, exit_note, None)
+    }
+
+    /// Variant that lets the caller supply a pre-composed body line —
+    /// used by apply_outcome_card to inject a claw-authored verdict.
+    /// When `override_body` is None, falls back to the deterministic
+    /// compose_ape_brag/loss output. The override is responsible for
+    /// being safe to html_escape (the renderer escapes it).
+    fn render_call_card_with_body(
+        &self,
+        address: &str,
+        meta: Option<&crate::metadata::TokenMeta>,
+        status: &str,
+        entry_note: &str,
+        exit_note: &str,
+        override_body: Option<&str>,
+    ) -> String {
         let ticker_name = match meta {
             Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
             None => {
@@ -1331,39 +1433,59 @@ impl Notifier {
         let exit_pct = parse_pct_prefix(exit_note);
         let peak_pct = parse_peak_pct(exit_note);
 
-        let header = match status {
-            "withdrew" | "closed" => {
-                let mult_label = exit_pct
-                    .map(|p| {
-                        let m = 1.0 + p / 100.0;
-                        if m >= 2.0 { format!(" — {:.1}x ✊", m) }
-                        else { format!(" — +{:.0}% ✊", p) }
-                    })
-                    .unwrap_or_default();
-                format!("🟢 {}{}", ticker_name, mult_label)
+        // Flat band: trail-at-breakeven closes (peak<20% AND |exit|<5%) are
+        // mechanically tagged "withdrew" by the scanner because the trail
+        // floor sits at 0%, but they're not real wins. Render them as ⚪
+        // flat so the channel doesn't brag on rounding noise. Threshold
+        // mirrors the trail's first activation tier (peak >= 20%).
+        let pct_signed = exit_pct.unwrap_or(0.0);
+        let peak_signed = peak_pct.unwrap_or(pct_signed.max(0.0));
+        let is_flat_close =
+            (status == "withdrew" || status == "closed")
+                && pct_signed.abs() < 5.0
+                && peak_signed < 20.0;
+
+        let header = if is_flat_close {
+            format!("⚪ {} — flat", ticker_name)
+        } else {
+            match status {
+                "withdrew" | "closed" => {
+                    let mult_label = exit_pct
+                        .map(|p| {
+                            let m = 1.0 + p / 100.0;
+                            if m >= 2.0 { format!(" — {:.1}x ✊", m) }
+                            else { format!(" — {:+.0}%", p) }   // {:+} sign-formats; no double prefix
+                        })
+                        .unwrap_or_default();
+                    format!("🟢 {}{}", ticker_name, mult_label)
+                }
+                "failed" => {
+                    let label = exit_pct.map(|p| format!(" — {:+.0}%", p)).unwrap_or_default();
+                    format!("🔴 {}{}", ticker_name, label)
+                }
+                "expired" => format!("⏰ {} — flat", ticker_name),
+                "voided"  => format!("⚪ {} — voided", ticker_name),
+                _ => format!("📣 {} — new call", ticker_name),
             }
-            "failed" => {
-                let label = exit_pct.map(|p| format!(" — {:+.0}%", p)).unwrap_or_default();
-                format!("🔴 {}{}", ticker_name, label)
-            }
-            "expired" => format!("⏰ {} — flat", ticker_name),
-            "voided"  => format!("⚪ {} — voided", ticker_name),
-            _ => format!("📣 {} — new call", ticker_name),
         };
 
-        // Body voice: ape entry on open, brag on win, loss on red close.
-        let body = match status {
-            "withdrew" | "closed" => {
-                let pct = exit_pct.unwrap_or(0.0);
-                let peak = peak_pct.unwrap_or(pct);
-                compose_ape_brag(pct, peak, horizon)
+        // Body voice. Flat-band closes get a one-liner — no brag, no loss
+        // melodrama. Real wins/losses still go through the ape composer
+        // unless the caller supplied a claw-authored override.
+        let body = if is_flat_close {
+            "trail caught it at breakeven. flat exit.".to_string()
+        } else if let Some(b) = override_body {
+            b.to_string()
+        } else {
+            match status {
+                "withdrew" | "closed" => {
+                    compose_ape_brag(pct_signed, peak_signed, horizon)
+                }
+                "failed" | "expired" => {
+                    compose_ape_loss(pct_signed, peak_signed, status)
+                }
+                _ => narrative.trim().to_string(),
             }
-            "failed" | "expired" => {
-                let pct = exit_pct.unwrap_or(0.0);
-                let peak = peak_pct.unwrap_or(pct.max(0.0));
-                compose_ape_loss(pct, peak, status)
-            }
-            _ => narrative.trim().to_string(),
         };
 
         // Tiny price/mc line — single row, no liq/vol clutter.
@@ -1646,7 +1768,54 @@ impl Notifier {
             .flatten()
             .map(|c| c.note)
             .unwrap_or_default();
-        let html = self.render_call_card(address, meta_ref, &timeline, outcome, &entry_note, exit_note);
+
+        // Ask zeroclaw to author the close verdict line. Skip when the
+        // call has no entry narrative (legacy pre-deploy fires — those
+        // get the deterministic header-only treatment per task #24).
+        // Skip the flat-band closes — they get a fixed "trail caught it
+        // at breakeven" line in the renderer. Skip the manual-close
+        // path where exit_note starts with "MANUAL".
+        let exit_pct_val = exit_pct.unwrap_or(0.0);
+        let peak_pct_val = parse_peak_pct(exit_note).unwrap_or(exit_pct_val.max(0.0));
+        let is_flat = (outcome == "withdrew" || outcome == "closed")
+            && exit_pct_val.abs() < 5.0
+            && peak_pct_val < 20.0;
+        let has_ape_narrative = !entry_note.trim().is_empty()
+            && !entry_note.contains("FIRST CALL")
+            && !entry_note.starts_with("manual");
+        let claw_body: Option<String> = if !is_flat
+            && has_ape_narrative
+            && (outcome == "withdrew" || outcome == "closed" || outcome == "failed" || outcome == "expired")
+        {
+            let (horizon, _) = crate::horizon::parse_with_clean(&entry_note);
+            let ticker = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
+            let is_win = outcome == "withdrew" || outcome == "closed";
+            // Strip the leading pct prefix from exit_note for the reason
+            // field — model gets cleaner context from "trailing stop @
+            // +25% (peak +75%)" than "+22.1% · trailing stop @ +25%...".
+            let reason = exit_note
+                .splitn(2, " · ")
+                .nth(1)
+                .unwrap_or(exit_note)
+                .trim()
+                .to_string();
+            match self
+                .claw_verdict_line(ticker, horizon, exit_pct_val, peak_pct_val, &reason, is_win)
+                .await
+            {
+                Ok(line) => Some(line),
+                Err(e) => {
+                    tracing::debug!("claw verdict fallback for {}: {}", address, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let html = self.render_call_card_with_body(
+            address, meta_ref, outcome, &entry_note, exit_note, claw_body.as_deref(),
+        );
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
         // Calls cards posted by the new pipeline are sendPhoto messages,
         // which require editMessageCaption (not editMessageText) to update.
