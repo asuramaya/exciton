@@ -803,16 +803,25 @@ impl Publisher {
         // recent near-misses, dedupe per mint keeping the most recent
         // observation, filter to last 30min + conf >= 60. Cap at 10
         // entries — beyond that the section becomes scroll-noise.
-        // 5min was too tight: near-miss cadence varies a lot with how
-        // many candidate tokens are passing classifier; quiet windows
-        // produce 0 entries even though the bot was thinking 18min ago.
-        // 30min always shows recent activity without going stale.
+        //
+        // ALSO skip mints that are already present in `events` —
+        // otherwise the same token shows up twice (once as a watching
+        // candidate, once as a CLASSIFICATION CHANGE / DEV SELLING /
+        // etc alert) and the feed feels duplicated. Watching is the
+        // "candidates not represented elsewhere" view.
         let now_ts = chrono::Utc::now().timestamp();
         let watch_window = 30 * 60;
+        let event_mints: std::collections::HashSet<String> = events
+            .iter()
+            .filter_map(|e| e.mint.clone())
+            .collect();
         let mut watching: Vec<WatchingEntry> = Vec::new();
         if let Ok(rows) = self.db.get_recent_near_misses(120) {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for r in rows {
+                if event_mints.contains(&r.token_address) {
+                    continue;
+                }
                 if r.timestamp < now_ts - watch_window {
                     continue;
                 }
