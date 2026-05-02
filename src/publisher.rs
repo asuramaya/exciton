@@ -129,12 +129,39 @@ struct StreamTokenInfo {
     liquidity_usd: Option<f64>,
 }
 
+/// Tokens in the "watching" tier — passed the classifier with non-trivial
+/// confidence within the last few minutes but didn't fire a call yet
+/// (missed one or more secondary gates: top1, top10, mcap window, etc).
+/// Surfaced in the LIVE FEED alongside alerts so the channel sees what
+/// the bot is *considering*, not just what it acted on.
+#[derive(Debug, Serialize, Clone)]
+struct WatchingEntry {
+    mint: String,
+    symbol: Option<String>,
+    classification: String,
+    confidence: i32,
+    top_holder_pct: f64,
+    age_secs: i64,
+    /// Which gate kept this from firing — "top_holder" / "top10" / "conf"
+    /// / "mcap" / "liq" etc. Empty when the row didn't record a single
+    /// blocker (rare).
+    gate: String,
+    /// Human-readable gap description from the near-miss row.
+    gap: String,
+    last_seen: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct StreamFile {
     events: Vec<StreamEvent>,
     /// mint → token info, populated for every distinct mint present in
-    /// `events`. Empty map when no mints were referenced.
+    /// `events` or `watching`. Empty map when no mints were referenced.
     tokens: std::collections::HashMap<String, StreamTokenInfo>,
+    /// Active "watching" candidates — top-N by confidence in the last
+    /// few minutes that the gate rejected. Lets the LIVE FEED show
+    /// what the bot is currently considering, not just historical
+    /// alerts. Empty array when nothing is at the gate.
+    watching: Vec<WatchingEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -772,7 +799,71 @@ impl Publisher {
             }
         }
 
-        StreamFile { events, tokens }
+        // Watching tier — "what the bot is considering right now". Pull
+        // recent near-misses, dedupe per mint keeping the most recent
+        // observation, filter to last 5min + conf >= 60. Cap at 10
+        // entries — beyond that the section becomes scroll-noise.
+        let now_ts = chrono::Utc::now().timestamp();
+        let watch_window = 5 * 60;
+        let mut watching: Vec<WatchingEntry> = Vec::new();
+        if let Ok(rows) = self.db.get_recent_near_misses(120) {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for r in rows {
+                if r.timestamp < now_ts - watch_window {
+                    continue;
+                }
+                if r.effective_confidence < 60 {
+                    continue;
+                }
+                if !seen.insert(r.token_address.clone()) {
+                    continue;
+                }
+                let age = now_ts - r.timestamp;
+                let mut entry = WatchingEntry {
+                    mint: r.token_address.clone(),
+                    symbol: None,
+                    classification: r.classification,
+                    confidence: r.effective_confidence,
+                    top_holder_pct: r.top_holder_pct,
+                    age_secs: age,
+                    gate: r.gate_that_failed,
+                    gap: r.gap,
+                    last_seen: r.timestamp,
+                };
+                // Symbol from market cache when available — same enrichment
+                // as the events list. Cheap because get_market is cached.
+                if !tokens.contains_key(&r.token_address) {
+                    if let Ok(Some(m)) = market::get_market(&r.token_address).await {
+                        let info = StreamTokenInfo {
+                            symbol: Some(m.symbol.clone()).filter(|s| !s.is_empty()),
+                            name: Some(m.name.clone()).filter(|s| !s.is_empty()),
+                            mcap_usd: if m.mcap_usd > 0.0 { Some(m.mcap_usd) } else { None },
+                            price_usd: Some(m.price_usd).filter(|p| *p > 0.0),
+                            price_change_1h: Some(m.price_change_h1).filter(|v| *v != 0.0),
+                            price_change_24h: None,
+                            liquidity_usd: Some(m.liquidity_usd).filter(|v| *v > 0.0),
+                        };
+                        entry.symbol = info.symbol.clone();
+                        tokens.insert(r.token_address.clone(), info);
+                    }
+                } else if let Some(info) = tokens.get(&r.token_address) {
+                    entry.symbol = info.symbol.clone();
+                }
+                watching.push(entry);
+                if watching.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        // Sort watching by confidence desc, then age asc (newest first
+        // among same-conf entries).
+        watching.sort_by(|a, b| {
+            b.confidence
+                .cmp(&a.confidence)
+                .then(a.age_secs.cmp(&b.age_secs))
+        });
+
+        StreamFile { events, tokens, watching }
     }
 
     async fn build_calls_file(&self) -> CallsFile {
