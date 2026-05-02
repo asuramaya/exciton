@@ -47,11 +47,17 @@ pub struct ScoutParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BackfillCardsParams {
-    /// Trailing window in hours. Default 24. Caps at 168 (1 week) to
-    /// keep zeroclaw round-trips bounded — re-rendering many calls
-    /// each blocks on a 4s claw verdict.
+    /// Trailing window in hours. Default 720 (30 days). Caps at 8760
+    /// (1 year). Each card costs ~5-30s of zeroclaw time so big windows
+    /// run as a long-tail background task.
     #[serde(default)]
     pub hours: Option<i64>,
+    /// Idempotency: skip cards whose Telegram delivery was edited within
+    /// this many minutes — those were almost certainly just re-rendered
+    /// by a recent backfill or settle close. Default 60. Set 0 to force
+    /// re-render of every card in the window.
+    #[serde(default)]
+    pub skip_if_edited_within_minutes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1275,10 +1281,13 @@ impl PhotonServer {
         &self,
         Parameters(params): Parameters<BackfillCardsParams>,
     ) -> String {
-        let hours = params.hours.unwrap_or(24).clamp(1, 168);
-        let _ = self
-            .db
-            .audit_log("claude", "backfill_cards", &format!("{}h", hours));
+        let hours = params.hours.unwrap_or(720).clamp(1, 8760);
+        let skip_minutes = params.skip_if_edited_within_minutes.unwrap_or(60).max(0);
+        let _ = self.db.audit_log(
+            "claude",
+            "backfill_cards",
+            &format!("{}h skip={}m", hours, skip_minutes),
+        );
 
         let notifier = match self.notifier.as_ref() {
             Some(n) => n.clone(),
@@ -1286,25 +1295,53 @@ impl PhotonServer {
                 return serde_json::json!({"error": "notifier not configured"}).to_string()
             }
         };
-        let since = chrono::Utc::now().timestamp() - hours * 3600;
-        let closed: Vec<crate::db::CallRow> = self
+        let now_ts = chrono::Utc::now().timestamp();
+        let since = now_ts - hours * 3600;
+        let skip_cutoff = now_ts - skip_minutes * 60;
+        // Pull a wide call set since long windows need it. list_calls
+        // returns newest-first; the time filter handles the trailing edge.
+        let candidates: Vec<crate::db::CallRow> = self
             .db
-            .list_calls(false, 200)
+            .list_calls(false, 2000)
             .unwrap_or_default()
             .into_iter()
             .filter(|c| {
                 matches!(
                     c.status.as_str(),
-                    "withdrew" | "failed" | "expired" | "closed" | "voided"
+                    "withdrew" | "failed" | "expired" | "closed"
                 ) && c.closed_at.unwrap_or(0) >= since
             })
             .collect();
+
+        // Idempotency: skip cards whose calls-channel delivery was
+        // edited within `skip_minutes` of now — almost certainly already
+        // re-rendered by a recent backfill / normal close path. Avoids
+        // burning claw quota on cards that already have a fresh voice.
+        let db = self.db.clone();
+        let (closed, recently_voiced): (Vec<_>, usize) = {
+            let mut keep = Vec::new();
+            let mut recent = 0usize;
+            for c in candidates {
+                let recently_edited = db
+                    .get_active_delivery(&c.mint, "winners")
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.last_edit_at)
+                    .map(|t| t >= skip_cutoff)
+                    .unwrap_or(false);
+                if recently_edited {
+                    recent += 1;
+                    continue;
+                }
+                keep.push(c);
+            }
+            (keep, recent)
+        };
         let total = closed.len();
 
         // Run the backfill in a detached task so the MCP call returns
-        // promptly. Even at 1.5s/card with claw blocking 4s/card, 24h
-        // of closes can take 2-3 minutes — too long to hold a claw
-        // round-trip open.
+        // promptly. Each card is up to ~150s with the new 30s × 5
+        // retries; long windows can run for many minutes.
         tokio::spawn(async move {
             let mut ok = 0usize;
             let mut skipped = 0usize;
@@ -1337,6 +1374,7 @@ impl PhotonServer {
 
         serde_json::json!({
             "queued": total,
+            "skipped_recently_voiced": recently_voiced,
             "window_hours": hours,
             "cadence_secs_per_card": 1.5,
             "note": "running in background — claw verdict + ape format applied per card",
