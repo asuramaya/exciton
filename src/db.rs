@@ -2254,6 +2254,29 @@ impl Db {
         Ok(price)
     }
 
+    /// Return the (timestamp, price_usd) series for a token within a time
+    /// window — used by the chart sparkline renderer. Excludes price=0
+    /// snapshots (failed fetches). Sorted ascending by ts.
+    pub fn get_price_history(
+        &self,
+        address: &str,
+        since_ts: i64,
+    ) -> Result<Vec<(i64, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, price_usd FROM token_snapshots
+             WHERE token_address = ?1 AND timestamp >= ?2 AND price_usd > 0
+             ORDER BY timestamp ASC",
+        )?;
+        let rows: Vec<(i64, f64)> = stmt
+            .query_map(params![address, since_ts], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
     /// Peak snapshot by confidence within a time window — used to measure
     /// collapse severity against a token's best state in recent memory.
     pub fn get_peak_snapshot(&self, address: &str, since_ts: i64) -> Result<Option<TokenSnapshot>> {

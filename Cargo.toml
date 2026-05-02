@@ -19,7 +19,7 @@ solana-transaction-status = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -28,6 +28,10 @@ chrono = { version = "0.4", features = ["serde"] }
 bs58 = "0.5"
 base64 = "0.22"
 bincode = "1"
+# Sparkline chart renderer for the calls-channel cards. Bitmap-only —
+# no font/svg deps. Used by chart.rs to render token_snapshots price
+# history as PNG sent via Telegram sendPhoto.
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -51,8 +51,11 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 // =============================================================================
 
 // Gates calibrated against the 31-call closed-call backtest (2026-04-22..28),
-// recalibrated via gate-sweep analysis (2026-04-29), and AGAIN lowered to
-// match live distribution (2026-04-30):
+// recalibrated via gate-sweep analysis (2026-04-29), AGAIN lowered to
+// match live distribution (2026-04-30), and ONCE MORE relaxed (2026-05-02)
+// after the trailing-stop ladder shipped — the safety net is now strong
+// enough that more permissive entries don't tank EV. Loss-side variance
+// is bounded by the trail; the question is winner-side capture.
 //
 // 6h DB sample 2026-04-30:
 //   conf >=80: 0 snapshots
@@ -61,13 +64,13 @@ pub fn effective_confidence(raw: i32, age_seconds: i64) -> i32 {
 //   conf 60-69: 37
 //   conf <60:   38
 //
-// The 76 floor was producing 0 fires for 5+ hours straight. Backtest
-// winners averaged conf 67-70 with brief 76-82 PEAKS — the current
-// pump.fun environment isn't producing those peaks at all (RPC
-// degradation possibly suppressing momentum scoring; or fewer
-// high-quality launches; or both). Lowering to 70 to match the
-// observed median of healthy-classification snapshots.
-pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 70;
+// 70-floor was producing slow-fire pace and excluding the bulk of the
+// healthy-classification mass (conf 60-69, 37/94 snapshots). Trailing
+// stop catches the losers; raising the catch rate on the borderline
+// 65-69 cohort is the lever. Drop to 65: ~50% more fires across the
+// observed conf distribution. If realized EV degrades materially over
+// the next 7d, raise back to 70.
+pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
 // 2026-05-01 Bucket A relaxation: top1 gate bumped 6 → 18. Backtest against
 // the live token_snapshots universe (n=223 entries passing
 // STAIRCASE/GRINDER/SPRING + conf≥70 + top1<22 + liq≥15k) showed +10.8%
@@ -345,104 +348,154 @@ fn compact_usd(v: f64) -> String {
     }
 }
 
-/// Compose the auto-fired call narrative in TG-caller voice. NOT a structural
-/// info-dump — reads like a person on the channel calling out a position.
-/// Three short pieces: the setup line, a shape observation, a punchy exit
-/// plan. Forensics callouts mention specific numbers only when they're
-/// actually concerning. The whole strategy is "abnormal signal influx,
-/// ride, exit green" — not multi-hour holds — so the language reflects
-/// minute-window plays.
-fn compose_auto_narrative(
+/// Parse the leading signed-percentage off a settle exit_note.
+/// Format examples: "+22.1% · trailing stop @ +25% (peak +75%)",
+/// "-66.8% · moonshot stop", "+30.5% · scalp +30 done". Returns None
+/// when the note doesn't start with a +/- pct (manual close strings).
+fn parse_pct_prefix(s: &str) -> Option<f64> {
+    let trimmed = s.trim_start();
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() || (bytes[0] != b'+' && bytes[0] != b'-') {
+        return None;
+    }
+    let pct_pos = trimmed.find('%')?;
+    trimmed[..pct_pos].parse::<f64>().ok()
+}
+
+/// Parse the peak-pct annotation when present. Format: "(peak +75%)".
+/// Returns None when absent — the brag composer falls back to exit pct
+/// in that case so it still produces a well-formed line.
+fn parse_peak_pct(s: &str) -> Option<f64> {
+    let needle = "peak ";
+    let pos = s.find(needle)?;
+    let after = &s[pos + needle.len()..];
+    let pct_pos = after.find('%')?;
+    let val = &after[..pct_pos];
+    let val = val.trim_start_matches('+');
+    val.parse::<f64>().ok()
+}
+
+/// Compose the entry narrative in the ape's own voice — first person,
+/// terse, no data dump. The reader sees the chart preview from the
+/// link, the price line below, and one paragraph of "here's why I aped
+/// and what I'm doing". Heavy data lives in the lounge mirror.
+fn compose_ape_entry(
     a: &TokenAnalysis,
-    meta: Option<&TokenMeta>,
     horizon: crate::horizon::Horizon,
     mcap_usd: f64,
-    _effective_conf: i32,
 ) -> String {
-    let cls = a.confidence.classification.as_str();
-    let h1 = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
-    let mcap_short = compact_usd(mcap_usd);
-    let h1_label = if h1.abs() >= 1.0 {
-        if h1 >= 0.0 {
-            format!("+{:.0}% h1", h1)
+    let mc = compact_usd(mcap_usd);
+
+    let tape = if a.tx_rate >= 500.0 {
+        "tape's screaming"
+    } else if a.tx_rate >= 200.0 {
+        "flow stacking"
+    } else if a.tx_rate >= 100.0 {
+        "flow's there"
+    } else {
+        "thin tape, watching"
+    };
+
+    let warn = if a.bundle_pct >= 25.0 || a.sniper_pct >= 40.0 || a.insider_pct >= 20.0 {
+        " holders look weird but the tape is the tape."
+    } else {
+        ""
+    };
+
+    let plan = match horizon {
+        crate::horizon::Horizon::Moonshot => "lottery shot — out at 3.5x or -25.",
+        crate::horizon::Horizon::Scalp    => "quick scalp — +30 take, -30 stop, 90min max.",
+        crate::horizon::Horizon::Long     => "thesis trade — laddering takes from +40, stop -50.",
+        crate::horizon::Horizon::Short    => "swing — +50/+100 ladder, stop -40.",
+        crate::horizon::Horizon::Unknown  => "riding the trail.",
+    };
+
+    let opener = match horizon {
+        crate::horizon::Horizon::Moonshot => format!(
+            "fresh DEV at {mc}. top1 {top:.0}%, {tape}.",
+            mc = mc, top = a.top_holder_pct, tape = tape,
+        ),
+        crate::horizon::Horizon::Scalp => format!(
+            "in at {mc} mc. {tape}, top holder under {top:.0}%.",
+            mc = mc, tape = tape, top = a.top_holder_pct.ceil(),
+        ),
+        crate::horizon::Horizon::Long => format!(
+            "graduated at {mc}, structure held. {tape}.",
+            mc = mc, tape = tape,
+        ),
+        crate::horizon::Horizon::Short => format!(
+            "in at {mc} mc, distribution clean. {tape}.",
+            mc = mc, tape = tape,
+        ),
+        crate::horizon::Horizon::Unknown => format!("aped at {mc} mc. {tape}.", mc = mc, tape = tape),
+    };
+
+    format!("{opener}{warn} {plan}").trim().to_string()
+}
+
+/// Compose the brag line for a winning close. Multiplier-first so the
+/// channel reads "we hit 3.5x" not "+251.4%". Mentions peak only when it
+/// significantly exceeded the realized exit (the trail caught a runner
+/// retrace and we want the peak in the brag).
+fn compose_ape_brag(pct: f64, peak_pct: f64, horizon: crate::horizon::Horizon) -> String {
+    let mult = 1.0 + pct / 100.0;
+    let mult_str = if mult >= 2.0 {
+        format!("{:.1}x", mult)
+    } else {
+        format!("+{:.0}%", pct)
+    };
+    let peak_str = if peak_pct > pct + 25.0 && peak_pct >= 50.0 {
+        let peak_mult = 1.0 + peak_pct / 100.0;
+        if peak_mult >= 2.0 {
+            format!(" (peaked {:.1}x — trail caught the retrace)", peak_mult)
         } else {
-            format!("{:.0}% h1", h1)
+            format!(" (peaked +{:.0}%)", peak_pct)
         }
     } else {
         String::new()
     };
-
-    // Tape phrase — caller-style flow read off tpm.
-    let tape = if a.tx_rate >= 500.0 {
-        "tape is loud"
-    } else if a.tx_rate >= 200.0 {
-        "flow's stacking"
-    } else if a.tx_rate >= 100.0 {
-        "decent flow"
+    let phrase = if mult >= 5.0 {
+        "ate good"
+    } else if mult >= 3.0 {
+        "won this one"
+    } else if mult >= 2.0 {
+        "took the 2x"
+    } else if mult >= 1.3 {
+        "banked the run"
     } else {
-        "thin tape"
+        "small green, took it"
     };
+    match horizon {
+        crate::horizon::Horizon::Moonshot => format!("{phrase} on a moonshot. {mult_str}{peak_str}."),
+        crate::horizon::Horizon::Scalp    => format!("{phrase}. quick scalp, {mult_str}{peak_str}."),
+        crate::horizon::Horizon::Long     => format!("{phrase}. thesis paid, {mult_str}{peak_str}."),
+        _                                  => format!("{phrase}. {mult_str}{peak_str}."),
+    }
+}
 
-    // Forensics — only mention when actually concerning. Otherwise skip
-    // entirely. Clean tokens just don't get the line.
-    let mut warnings = Vec::new();
-    if a.bundle_pct >= 15.0 {
-        warnings.push(format!("bundle {:.0}%", a.bundle_pct));
-    }
-    if a.sniper_pct >= 30.0 {
-        warnings.push(format!("sniper {:.0}%", a.sniper_pct));
-    }
-    if a.insider_pct >= 15.0 {
-        warnings.push(format!("insider {:.0}%", a.insider_pct));
-    }
-    let warn_line = if warnings.is_empty() {
-        String::new()
+/// Compose the loss/expire line. Honest, no whining, mentions the runner
+/// regret only when the trail let go of real green (peak > 30%, exit red).
+fn compose_ape_loss(pct: f64, peak_pct: f64, status: &str) -> String {
+    if peak_pct >= 30.0 && pct < peak_pct - 50.0 {
+        format!("had it green at +{:.0}%, gave it back. out {:+.0}%.", peak_pct, pct)
+    } else if status == "expired" {
+        format!("90min flat, didn't move. out {:+.0}%.", pct)
+    } else if pct <= -40.0 {
+        "stop hit hard. next.".to_string()
     } else {
-        format!(" {} but riding it.", warnings.join(" + "))
-    };
-
-    // Setup line — what we're playing, in caller voice. Each horizon has
-    // its own opener that matches the actual gate logic.
-    let setup = match horizon {
-        crate::horizon::Horizon::Moonshot => format!(
-            "moonshot punt on a fresh {mc} DEV with {top:.0}% top1",
-            mc = mcap_short,
-            top = a.top_holder_pct,
-        ),
-        crate::horizon::Horizon::Scalp => format!(
-            "clean {cls} running on {mc} mc{h1_part}, top holder under {top:.0}%",
-            cls = cls,
-            mc = mcap_short,
-            h1_part = if h1_label.is_empty() { String::new() } else { format!(", {}", h1_label) },
-            top = a.top_holder_pct,
-        ),
-        crate::horizon::Horizon::Long => format!(
-            "{cls} graduated at {mc} mc, structure looks held",
-            cls = cls,
-            mc = mcap_short,
-        ),
-        crate::horizon::Horizon::Short => format!(
-            "{cls} setup at {mc} mc{h1_part}, distribution clean",
-            cls = cls,
-            mc = mcap_short,
-            h1_part = if h1_label.is_empty() { String::new() } else { format!(" after {}", h1_label) },
-        ),
-        crate::horizon::Horizon::Unknown => format!("{cls} signal at {mcap_short} mc"),
-    };
-
-    // Exit plan in colloquial form. Pinned to scanner::settle_calls.
-    let plan = match horizon {
-        crate::horizon::Horizon::Moonshot => "Aping in — +250 take, -25 stop, ~90min if it doesn't move",
-        crate::horizon::Horizon::Scalp => "Riding the move — +30 take, -30 stop, ~90min window",
-        crate::horizon::Horizon::Long => "Worth a longer ride — +40/+80/+150 ladder, -50 stop",
-        crate::horizon::Horizon::Short => "Bucket A swing — +50/+100 ladder, -40 stop, ~90min window",
-        crate::horizon::Horizon::Unknown => "Riding it — see settle ladder",
-    };
-
-    format!("{setup}, {tape}.{warn_line} {plan}.").trim().to_string()
+        format!("out {:+.0}%. next.", pct)
+    }
 }
 
 // -- Notifier core -----------------------------------------------------------
+
+/// Internal DB key for the calls-channel delivery row. Stable string —
+/// renaming would orphan every existing row in production.
+const CALLS_CHANNEL: &str = "winners";
+/// Internal DB key for the lounge-mirror delivery row. New as of the
+/// dual-destination split. Tokens fired before this change have no
+/// lounge row; lookups must tolerate None.
+const LOUNGE_CHANNEL: &str = "lounge";
 
 pub struct Notifier {
     cfg: TelegramConfig,
@@ -1078,18 +1131,125 @@ impl Notifier {
         text: &str,
         reply_markup: Option<&str>,
     ) -> Result<i64> {
+        self.send_message_full(chat_id, text, reply_markup, None).await
+    }
+
+    /// sendPhoto with a multipart-uploaded PNG buffer + HTML caption.
+    /// Returns the new message_id. Caption max 1024 chars (TG limit).
+    /// Used for the calls-channel ape card so each new call lands with
+    /// a real chart screenshot above it. Edits go through editMessageCaption.
+    async fn send_photo(
+        &self,
+        chat_id: &str,
+        png: Vec<u8>,
+        caption: &str,
+        reply_markup: Option<&str>,
+    ) -> Result<i64> {
         let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
+            "https://api.telegram.org/bot{}/sendPhoto",
+            self.cfg.bot_token
+        );
+        let part = reqwest::multipart::Part::bytes(png)
+            .file_name("chart.png")
+            .mime_str("image/png")?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("parse_mode", "HTML".to_string())
+            .text("caption", caption.to_string())
+            .part("photo", part);
+        if let Some(kb) = reply_markup {
+            form = form.text("reply_markup", kb.to_string());
+        }
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            return Err(anyhow!("telegram sendPhoto failed: {}", body));
+        }
+        Ok(body["result"]["message_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("missing message_id"))?)
+    }
+
+    /// editMessageCaption — used when a calls-channel sendPhoto card
+    /// closes (settle path). Replaces the caption text + keyboard while
+    /// leaving the chart photo unchanged. The original entry chart still
+    /// gives readers the visual context of where we entered.
+    async fn edit_photo_caption(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        caption: &str,
+        reply_markup: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/editMessageCaption",
             self.cfg.bot_token
         );
         let mut form = vec![
             ("chat_id", chat_id.to_string()),
+            ("message_id", message_id.to_string()),
+            ("caption", caption.to_string()),
+            ("parse_mode", "HTML".to_string()),
+        ];
+        if let Some(kb) = reply_markup {
+            form.push(("reply_markup", kb.to_string()));
+        }
+        let resp = self.http.post(&url).form(&form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            let desc = body["description"].as_str().unwrap_or("");
+            if desc.contains("not modified") {
+                return Ok(());
+            }
+            return Err(anyhow!("telegram editMessageCaption failed: {}", body));
+        }
+        Ok(())
+    }
+
+    /// Build the calls-channel chart for a token. Looks up the recent
+    /// price history (since the call's first_seen — bounded to 6h to
+    /// keep the sparkline meaningful for moonshot windows). Falls back
+    /// to a placeholder when no history exists yet.
+    fn build_call_chart(
+        &self,
+        address: &str,
+        symbol: &str,
+        entry_price: f64,
+        since_ts: Option<i64>,
+    ) -> Option<Vec<u8>> {
+        let lookback = since_ts.unwrap_or_else(|| chrono::Utc::now().timestamp() - 6 * 3600);
+        let series = self.db.get_price_history(address, lookback).ok()?;
+        crate::chart::render_sparkline(&series, entry_price, symbol).ok()
+    }
+
+    /// sendMessage with optional preview URL. When `preview_url` is
+    /// Some, Telegram fetches that page's OG image and renders it above
+    /// the card (DexScreener pair URLs serve a chart screenshot as their
+    /// OG image — that's the call-card chart). When None, link previews
+    /// are suppressed.
+    async fn send_message_full(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_markup: Option<&str>,
+        preview_url: Option<&str>,
+    ) -> Result<i64> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            self.cfg.bot_token
+        );
+        let preview = match preview_url {
+            Some(u) => format!(
+                r#"{{"url":"{}","prefer_large_media":true,"show_above_text":true}}"#,
+                u.replace('"', "\\\"")
+            ),
+            None => r#"{"is_disabled":true}"#.to_string(),
+        };
+        let mut form = vec![
+            ("chat_id", chat_id.to_string()),
             ("text", text.to_string()),
             ("parse_mode", "HTML".to_string()),
-            (
-                "link_preview_options",
-                r#"{"is_disabled":true}"#.to_string(),
-            ),
+            ("link_preview_options", preview),
         ];
         if let Some(kb) = reply_markup {
             form.push(("reply_markup", kb.to_string()));
@@ -1146,69 +1306,19 @@ impl Notifier {
 
     // -- Card rendering -----------------------------------------------------
 
-    /// Compose a signal card per the style guide:
-    ///   Line 1 — badge + subject (ticker/name)
-    ///   Line 2 — italic "why it fired" with concrete triggering metrics
-    ///   Body   — metric rows from templates::render_card_body
-    ///   Timeline — wrapped in <blockquote expandable> for tap-to-reveal history
-    fn render_signal_with_timeline(
-        &self,
-        a: &TokenAnalysis,
-        meta: Option<&TokenMeta>,
-        timeline: &[TimelineEntry],
-        status: &str,
-        effective_conf: i32,
-        _prev_class_on_fail: Option<&str>,
-    ) -> String {
-        let ticker_name = match meta {
-            Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
-            None => format!(
-                "<code>{}…{}</code>",
-                &a.address[..6],
-                &a.address[a.address.len() - 5..]
-            ),
-        };
-
-        let header = match status {
-            "failed" => format!("❌ <b>FAILED</b> · {}", ticker_name),
-            _ => format!("📊 <b>SIGNAL</b> · {}", ticker_name),
-        };
-
-        // Caller voice paragraph — what the bot would *say* about this
-        // token. No horizon on signal cards (auto-fired = SHORT by gate).
-        let paragraph = templates::caller_paragraph(a, meta, None);
-
-        // Collapsed numbers block — all internal scoring lives here.
-        let numbers = templates::numbers_block(a, meta, effective_conf);
-
-        let mut html = format!("{}\n{}\n\n{}", header, paragraph, numbers);
-
-        if !timeline.is_empty() {
-            html.push_str("\n<blockquote expandable>▾ history");
-            for e in timeline {
-                let t = chrono::DateTime::from_timestamp(e.ts, 0)
-                    .map(|dt| dt.format("%H:%M UTC").to_string())
-                    .unwrap_or_else(|| e.ts.to_string());
-                html.push_str(&format!("\n{} <b>{:<7}</b> {}", t, e.kind, e.line));
-            }
-            html.push_str("</blockquote>");
-        }
-
-        if html.len() > 4000 {
-            html.truncate(4000);
-            html.push_str("\n…[truncated]");
-        }
-        html
-    }
-
+    /// Render the public call-channel card — ape voice, no data dump.
+    /// Layout: header (status + ticker + multiplier) → ape paragraph →
+    /// tiny price line → track link. Telegram pulls a chart screenshot
+    /// above this from the DexScreener pair URL via link preview
+    /// (callers must enable it via send_message_full preview_url).
     fn render_call_card(
         &self,
         address: &str,
         meta: Option<&crate::metadata::TokenMeta>,
-        timeline: &[TimelineEntry],
+        _timeline: &[TimelineEntry],
         status: &str,  // "active" | "withdrew" | "failed" | "expired"
-        entry_note: &str,   // original call.note — narrative + horizon tag
-        exit_note: &str,    // settle verdict (empty for active)
+        entry_note: &str,   // call.note — entry narrative (already ape-voiced for auto-fires)
+        exit_note: &str,    // settle verdict ("-22.1% · moonshot stop") or empty
     ) -> String {
         let ticker_name = match meta {
             Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
@@ -1217,10 +1327,99 @@ impl Notifier {
                 format!("<code>{}…{}</code>", &address[..6.min(address.len())], &address[end..])
             }
         };
-        // Parse horizon tag from the entry narrative — produces both the
-        // badge (SHORT/LONG/SCALP/MOONSHOT) and the clean prose with the
-        // tag stripped. Operator-typed notes ("FIRST CALL — $PsyopAnime")
-        // pass through with their editorial framing intact.
+        let (horizon, narrative) = crate::horizon::parse_with_clean(entry_note);
+        let exit_pct = parse_pct_prefix(exit_note);
+        let peak_pct = parse_peak_pct(exit_note);
+
+        let header = match status {
+            "withdrew" | "closed" => {
+                let mult_label = exit_pct
+                    .map(|p| {
+                        let m = 1.0 + p / 100.0;
+                        if m >= 2.0 { format!(" — {:.1}x ✊", m) }
+                        else { format!(" — +{:.0}% ✊", p) }
+                    })
+                    .unwrap_or_default();
+                format!("🟢 {}{}", ticker_name, mult_label)
+            }
+            "failed" => {
+                let label = exit_pct.map(|p| format!(" — {:+.0}%", p)).unwrap_or_default();
+                format!("🔴 {}{}", ticker_name, label)
+            }
+            "expired" => format!("⏰ {} — flat", ticker_name),
+            "voided"  => format!("⚪ {} — voided", ticker_name),
+            _ => format!("📣 {} — new call", ticker_name),
+        };
+
+        // Body voice: ape entry on open, brag on win, loss on red close.
+        let body = match status {
+            "withdrew" | "closed" => {
+                let pct = exit_pct.unwrap_or(0.0);
+                let peak = peak_pct.unwrap_or(pct);
+                compose_ape_brag(pct, peak, horizon)
+            }
+            "failed" | "expired" => {
+                let pct = exit_pct.unwrap_or(0.0);
+                let peak = peak_pct.unwrap_or(pct.max(0.0));
+                compose_ape_loss(pct, peak, status)
+            }
+            _ => narrative.trim().to_string(),
+        };
+
+        // Tiny price/mc line — single row, no liq/vol clutter.
+        let price_line = match meta {
+            Some(m) => {
+                let mc = m.market_cap_usd.or(m.fdv_usd)
+                    .map(|v| format!("mc {}", compact_usd(v)))
+                    .unwrap_or_default();
+                let px = m.price_usd
+                    .map(|v| format!("px ${:.6}", v))
+                    .unwrap_or_default();
+                let parts: Vec<&str> = [&px as &str, &mc].iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect();
+                if parts.is_empty() { String::new() } else { format!("\n\n{}", parts.join(" · ")) }
+            }
+            None => String::new(),
+        };
+
+        let track_line = format!(
+            "\n\n<a href=\"https://madapesai.com/#call={}\">track live on madapesai.com</a>",
+            address
+        );
+
+        let body_block = if body.is_empty() { String::new() } else { format!("\n{}", html_escape(&body)) };
+        format!("{header}{body}{px}{track}",
+            header = header,
+            body = body_block,
+            px = price_line,
+            track = track_line,
+        )
+    }
+
+    /// Render the lounge mirror — heavy data card. Includes the full
+    /// numbers block (mom/dist/spring/tpm, forensics, h1 tape) when the
+    /// caller passes an analysis snapshot, falling back to the entry
+    /// narrative on close (when `a` is not in scope). Always includes
+    /// market line with liq/vol and the full history blockquote.
+    fn render_lounge_card(
+        &self,
+        address: &str,
+        meta: Option<&crate::metadata::TokenMeta>,
+        analysis: Option<(&TokenAnalysis, i32)>,
+        timeline: &[TimelineEntry],
+        status: &str,
+        entry_note: &str,
+        exit_note: &str,
+    ) -> String {
+        let ticker_name = match meta {
+            Some(m) => format!("<b>${}</b>", html_escape(&m.symbol)),
+            None => {
+                let end = address.len().saturating_sub(5);
+                format!("<code>{}…{}</code>", &address[..6.min(address.len())], &address[end..])
+            }
+        };
         let (horizon_badge, narrative) = parse_horizon_from_note(entry_note);
         let term_label = horizon_badge.map(|h| format!(" · <b>{}</b>", h)).unwrap_or_default();
         let header = match status {
@@ -1228,29 +1427,31 @@ impl Notifier {
             "failed"   => format!("🔴 <b>FAILED</b>{} · {}", term_label, ticker_name),
             "expired"  => format!("⏰ <b>EXPIRED</b>{} · {}", term_label, ticker_name),
             "voided"   => format!("⚪ <b>VOIDED</b>{} · {}", term_label, ticker_name),
-            _          => format!("📣 <b>NEW CALL</b>{} · {}", term_label, ticker_name),
+            _          => format!("📣 <b>SIGNAL</b>{} · {}", term_label, ticker_name),
         };
-
-        // Verdict line for closed cards. settle path passes the formatted
-        // verdict ("-66.8% · moonshot stop") via exit_note. Bolded so it
-        // reads as the headline outcome, not a footnote.
         let verdict_line = if !exit_note.trim().is_empty() && status != "active" {
             format!("\n<b>{}</b>", html_escape(exit_note))
         } else {
             String::new()
         };
-
-        // Narrative paragraph — the thesis. For auto-fired calls this is
-        // the structural compose_auto_narrative output (classification +
-        // shape + ladder). For operator-typed calls this is whatever they
-        // wrote. Always shown when present.
-        let narrative_block = if narrative.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n{}", html_escape(&narrative))
+        // Body: when we have a live analysis snapshot, use the rich
+        // signals-card paragraph + numbers block (mom/dist/spring/tpm,
+        // forensics, 1h tape). Otherwise fall back to the entry note
+        // narrative (close path, no `a` in scope).
+        let body = match analysis {
+            Some((a, conf)) => {
+                let para = templates::caller_paragraph(a, meta, None);
+                let nums = templates::numbers_block(a, meta, conf);
+                format!("\n\n{}\n\n{}", html_escape(&para), nums)
+            }
+            None => {
+                if narrative.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{}", html_escape(&narrative))
+                }
+            }
         };
-
-        // Compact market line — one row of bullet-separated stats.
         let market_line = match meta {
             Some(m) => {
                 let mc  = m.market_cap_usd.or(m.fdv_usd).map(|v| format!("mc {}", compact_usd(v))).unwrap_or_else(|| "mc ?".to_string());
@@ -1266,20 +1467,15 @@ impl Notifier {
             }
             None => String::new(),
         };
-
-        // Track-live link — every card points at the public ledger so the
-        // reader can follow the position's lifecycle on the site without
-        // hunting for the per-call URL.
         let track_line = format!(
             "\n\n📊 <a href=\"https://madapesai.com/#call={}\">track live on madapesai.com</a>",
             address
         );
-
         let mut html = format!(
-            "{header}{verdict}{narrative}{market}{track}",
+            "{header}{verdict}{body}{market}{track}",
             header = header,
             verdict = verdict_line,
-            narrative = narrative_block,
+            body = body,
             market = market_line,
             track = track_line,
         );
@@ -1307,7 +1503,7 @@ impl Notifier {
         if !self.cfg.enabled {
             return Ok(());
         }
-        let channel = "winners";
+        let channel = CALLS_CHANNEL;
         let chat_id = self.cfg.signals_chat_id.clone();
         let now = chrono::Utc::now().timestamp();
         let meta = crate::metadata::fetch(address).await.ok().flatten();
@@ -1320,21 +1516,56 @@ impl Notifier {
             "manual".to_string()
         };
 
+        let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
         let existing = self.db.get_active_delivery(address, channel)?;
         match existing {
             None => {
                 let timeline = vec![TimelineEntry { ts: now, kind: "called".into(), line: call_line }];
                 let html = self.render_call_card(address, meta_ref, &timeline, "active", note, "");
-                let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
-                let msg_id = self.send_message_ex(&chat_id, &html, Some(&kb)).await?;
+                let chart_png = self.build_call_chart(
+                    address,
+                    meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?"),
+                    price.unwrap_or(0.0),
+                    None,
+                );
+                let msg_id = match chart_png {
+                    Some(png) => match self.send_photo(&chat_id, png, &html, Some(&kb)).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!("manual call sendPhoto failed for {}: {} — falling back to text", address, e);
+                            self.send_message_ex(&chat_id, &html, Some(&kb)).await?
+                        }
+                    },
+                    None => self.send_message_ex(&chat_id, &html, Some(&kb)).await?,
+                };
                 let timeline_json = serde_json::to_string(&timeline)?;
                 self.db.insert_delivery(address, channel, msg_id, 0, "MANUAL", price, None, &timeline_json)?;
+
+                // Lounge mirror for manual calls — same dual-destination
+                // shape as auto-fired calls. Operator-typed note becomes
+                // the body since we don't have a TokenAnalysis snapshot
+                // for manual calls.
+                if !self.cfg.lounge_chat_id.is_empty()
+                    && self.cfg.lounge_chat_id != self.cfg.signals_chat_id
+                {
+                    let lounge_html = self.render_lounge_card(
+                        address, meta_ref, None, &timeline, "active", note, "",
+                    );
+                    if let Ok(lounge_msg_id) = self
+                        .send_message_ex(&self.cfg.lounge_chat_id, &lounge_html, Some(&kb))
+                        .await
+                    {
+                        let _ = self.db.insert_delivery(
+                            address, LOUNGE_CHANNEL, lounge_msg_id, 0, "MANUAL",
+                            price, None, &timeline_json,
+                        );
+                    }
+                }
             }
             Some(d) if d.status == "active" => {
                 let mut timeline: Vec<TimelineEntry> = serde_json::from_str(&d.timeline_json).unwrap_or_default();
                 timeline.push(TimelineEntry { ts: now, kind: "called".into(), line: call_line });
                 let html = self.render_call_card(address, meta_ref, &timeline, "active", note, "");
-                let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
                 self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await?;
                 let timeline_json = serde_json::to_string(&timeline)?;
                 self.db.update_delivery(d.id, "active", 0, "MANUAL", price, None, &timeline_json)?;
@@ -1369,7 +1600,7 @@ impl Notifier {
         if !self.cfg.enabled {
             return Ok(());
         }
-        let channel = "winners";
+        let channel = CALLS_CHANNEL;
         let chat_id = self.cfg.signals_chat_id.clone();
         let now = chrono::Utc::now().timestamp();
         let meta = crate::metadata::fetch(address).await.ok().flatten();
@@ -1417,17 +1648,35 @@ impl Notifier {
             .unwrap_or_default();
         let html = self.render_call_card(address, meta_ref, &timeline, outcome, &entry_note, exit_note);
         let kb = self.token_keyboard(address, meta_ref.and_then(|m| m.pair_url.as_deref()));
-        // Soft-error on edits: when re-running a backfill we may hit
-        // "message is not modified" or "message to edit not found"
-        // (channel scrubbed). 429 Too Many Requests honours retry_after.
-        // Log + continue rather than aborting the whole pass.
+        // Calls cards posted by the new pipeline are sendPhoto messages,
+        // which require editMessageCaption (not editMessageText) to update.
+        // Try caption first; on "no text in the message" or "no caption
+        // in the message" fall back to text edit (legacy text-only cards).
         let mut attempt = 0;
+        let mut try_caption = true;
         loop {
             attempt += 1;
-            match self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await {
+            let edit_result = if try_caption {
+                self.edit_photo_caption(&chat_id, d.message_id, &html, Some(&kb)).await
+            } else {
+                self.edit_message_ex(&chat_id, d.message_id, &html, Some(&kb)).await
+            };
+            match edit_result {
                 Ok(_) => break,
                 Err(e) => {
                     let s = format!("{}", e);
+                    // Photo→text fallback: legacy text-only deliveries
+                    // raise "there is no caption in the message to edit".
+                    if try_caption && s.contains("caption") {
+                        try_caption = false;
+                        continue;
+                    }
+                    // Text→photo fallback: photo deliveries raise
+                    // "there is no text in the message to edit".
+                    if !try_caption && s.contains("no text") {
+                        try_caption = true;
+                        continue;
+                    }
                     if s.contains("not modified") {
                         // Already in the right state — continue and persist
                         // the timeline entry if we added one.
@@ -1459,6 +1708,44 @@ impl Notifier {
         let timeline_json = serde_json::to_string(&timeline)?;
         let price = meta_ref.and_then(|m| m.price_usd);
         self.db.update_delivery(d.id, "demoted", d.snapshot_conf, &d.snapshot_class, price, d.snapshot_top_holder, &timeline_json)?;
+
+        // Mirror the close into the lounge — heavy data card with full
+        // timeline + verdict line. Soft-skip when no lounge mirror exists
+        // (legacy single-channel deploys, or fires from before the split).
+        if !self.cfg.lounge_chat_id.is_empty()
+            && self.cfg.lounge_chat_id != self.cfg.signals_chat_id
+        {
+            if let Ok(Some(lounge_d)) = self.db.get_active_delivery(address, LOUNGE_CHANNEL) {
+                if lounge_d.status == "active" || force {
+                    let lounge_html = self.render_lounge_card(
+                        address, meta_ref, None, &timeline, outcome, &entry_note, exit_note,
+                    );
+                    if let Err(e) = self
+                        .edit_message_ex(
+                            &self.cfg.lounge_chat_id,
+                            lounge_d.message_id,
+                            &lounge_html,
+                            Some(&kb),
+                        )
+                        .await
+                    {
+                        let s = format!("{}", e);
+                        if !s.contains("not modified") && !s.contains("message to edit not found") {
+                            tracing::warn!("lounge close edit failed for {}: {}", address, e);
+                        }
+                    }
+                    let _ = self.db.update_delivery(
+                        lounge_d.id,
+                        "demoted",
+                        lounge_d.snapshot_conf,
+                        &lounge_d.snapshot_class,
+                        price,
+                        lounge_d.snapshot_top_holder,
+                        &timeline_json,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1483,7 +1770,7 @@ impl Notifier {
             );
             return Ok(());
         }
-        let channel = "winners"; // legacy internal DB key — kept stable to preserve
+        let channel = CALLS_CHANNEL; // legacy internal DB key — kept stable to preserve
                                  // existing telegram_deliveries rows across the rename.
         let chat_id = self.cfg.signals_chat_id.clone();
 
@@ -1545,19 +1832,68 @@ impl Notifier {
                     kind: "called".into(),
                     line: call_line,
                 }];
-                let html = self.render_signal_with_timeline(
-                    a,
+
+                // Resolve horizon + ape narrative BEFORE rendering — render_call_card
+                // reads the entry note for the body line on the calls channel.
+                let liq = meta.as_ref().and_then(|m| m.liquidity_usd).unwrap_or(0.0);
+                let mcap = meta
+                    .as_ref()
+                    .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
+                    .unwrap_or(0.0);
+                let sym = meta.as_ref().map(|m| m.symbol.clone()).unwrap_or_default();
+                let dex = meta
+                    .as_ref()
+                    .and_then(|m| m.dex_id.clone())
+                    .unwrap_or_default();
+                let auto_horizon = if moonshot_pass {
+                    crate::horizon::Horizon::Moonshot
+                } else if scalp_pass {
+                    crate::horizon::Horizon::Scalp
+                } else if mcap >= 1_000_000.0 {
+                    crate::horizon::Horizon::Long
+                } else {
+                    crate::horizon::Horizon::Short
+                };
+                let auto_horizon_tag = auto_horizon.tag().unwrap_or("");
+                let narrative = compose_ape_entry(a, auto_horizon, mcap);
+                let auto_note = if auto_horizon_tag.is_empty() {
+                    narrative.clone()
+                } else {
+                    format!("{} · {}", narrative, auto_horizon_tag)
+                };
+
+                // Calls channel — ape card with rendered chart sparkline
+                // (chart.rs reads token_snapshots for the price history).
+                // Falls back to text-only sendMessage when chart render
+                // fails (don't kill the call over a render hiccup).
+                let ape_html = self.render_call_card(
+                    &a.address,
                     meta.as_ref(),
                     &timeline,
                     "active",
-                    effective_conf,
-                    None,
+                    &auto_note,
+                    "",
                 );
                 let kb = self.token_keyboard(
                     &a.address,
                     meta.as_ref().and_then(|m| m.pair_url.as_deref()),
                 );
-                let msg_id = self.send_message_ex(&chat_id, &html, Some(&kb)).await?;
+                let chart_png = self.build_call_chart(
+                    &a.address,
+                    meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("?"),
+                    price.unwrap_or(0.0),
+                    None,
+                );
+                let msg_id = match chart_png {
+                    Some(png) => match self.send_photo(&chat_id, png, &ape_html, Some(&kb)).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!("sendPhoto failed for {}: {} — falling back to text", a.address, e);
+                            self.send_message_ex(&chat_id, &ape_html, Some(&kb)).await?
+                        }
+                    },
+                    None => self.send_message_ex(&chat_id, &ape_html, Some(&kb)).await?,
+                };
                 let timeline_json = serde_json::to_string(&timeline)?;
                 self.db.insert_delivery(
                     &a.address,
@@ -1570,54 +1906,46 @@ impl Notifier {
                     &timeline_json,
                 )?;
 
-                // Mirror the promotion into the public calls ledger with the
-                // entry state frozen at call-time. The MadApes.ai publisher
-                // serializes this to data/calls.json on its next tick, which
-                // is what the site's CALLS section reads. Idempotent via a
-                // unique partial index on (mint, status='active').
-                let liq = meta.as_ref().and_then(|m| m.liquidity_usd).unwrap_or(0.0);
-                let mcap = meta
-                    .as_ref()
-                    .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
-                    .unwrap_or(0.0);
-                let sym = meta.as_ref().map(|m| m.symbol.clone()).unwrap_or_default();
-                let dex = meta
-                    .as_ref()
-                    .and_then(|m| m.dex_id.clone())
-                    .unwrap_or_default();
-                // Auto-call horizon heuristic. SCALP is its own bucket (set
-                // by which gate fired). For standard signals, anything entering
-                // at >= $1M mcap is past the bonding-curve life cycle — those
-                // are sit-on-it positions, not 6h swings. Without this tag,
-                // settle_calls() would expire ROTUS-class entries on its 6h
-                // SHORT timeout.
-                let auto_horizon = if moonshot_pass {
-                    crate::horizon::Horizon::Moonshot
-                } else if scalp_pass {
-                    crate::horizon::Horizon::Scalp
-                } else if mcap >= 1_000_000.0 {
-                    crate::horizon::Horizon::Long
-                } else {
-                    crate::horizon::Horizon::Short
-                };
-                let auto_horizon_tag = auto_horizon.tag().unwrap_or("");
-                // Compose a structural narrative for the call note. The site
-                // renders the cleaned (tag-stripped) body as a thesis paragraph
-                // under the symbol — this is the front-page text that gives
-                // each card its PsyopAnime-style presence. Operator-typed
-                // /call notes override this path entirely (different code path).
-                let narrative = compose_auto_narrative(
-                    a,
-                    meta.as_ref(),
-                    auto_horizon,
-                    mcap,
-                    effective_conf,
-                );
-                let auto_note = if auto_horizon_tag.is_empty() {
-                    narrative
-                } else {
-                    format!("{} · {}", narrative, auto_horizon_tag)
-                };
+                // Lounge mirror — heavy data card with full numbers/forensics
+                // + timeline blockquote. Soft-fail: if the lounge chat is the
+                // same as signals_chat_id (pre-split deploys) skip the duplicate.
+                if !self.cfg.lounge_chat_id.is_empty()
+                    && self.cfg.lounge_chat_id != self.cfg.signals_chat_id
+                {
+                    let lounge_html = self.render_lounge_card(
+                        &a.address,
+                        meta.as_ref(),
+                        Some((a, effective_conf)),
+                        &timeline,
+                        "active",
+                        &auto_note,
+                        "",
+                    );
+                    match self
+                        .send_message_ex(&self.cfg.lounge_chat_id, &lounge_html, Some(&kb))
+                        .await
+                    {
+                        Ok(lounge_msg_id) => {
+                            let _ = self.db.insert_delivery(
+                                &a.address,
+                                LOUNGE_CHANNEL,
+                                lounge_msg_id,
+                                effective_conf,
+                                &a.confidence.classification,
+                                price,
+                                Some(a.top_holder_pct),
+                                &timeline_json,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "lounge mirror post failed for {}: {} — calls card still posted",
+                                a.address, e
+                            );
+                        }
+                    }
+                }
+
                 let inserted = self.db.insert_call(
                     &a.address,
                     &sym,
@@ -1728,23 +2056,57 @@ impl Notifier {
                 });
 
                 let render_status = if failed { "failed" } else { "active" };
-                let prev_class = delivery.snapshot_class.clone();
-                let html = self.render_signal_with_timeline(
-                    a,
-                    meta.as_ref(),
-                    &timeline,
-                    render_status,
-                    effective_conf,
-                    Some(&prev_class),
-                );
                 let kb = self.token_keyboard(
                     &a.address,
                     meta.as_ref().and_then(|m| m.pair_url.as_deref()),
                 );
-                self.edit_message_ex(&chat_id, delivery.message_id, &html, Some(&kb))
-                    .await?;
                 let timeline_json = serde_json::to_string(&timeline)?;
-                self.db.update_delivery(
+
+                // Lounge mirror gets every flip — that's its whole job.
+                // Tokens fired before the dual-split have no lounge row;
+                // soft-skip when the lookup returns None.
+                if let Ok(Some(lounge_d)) =
+                    self.db.get_active_delivery(&a.address, LOUNGE_CHANNEL)
+                {
+                    let lounge_html = self.render_lounge_card(
+                        &a.address,
+                        meta.as_ref(),
+                        Some((a, effective_conf)),
+                        &timeline,
+                        render_status,
+                        "",
+                        "",
+                    );
+                    if let Err(e) = self
+                        .edit_message_ex(
+                            &self.cfg.lounge_chat_id,
+                            lounge_d.message_id,
+                            &lounge_html,
+                            Some(&kb),
+                        )
+                        .await
+                    {
+                        let s = format!("{}", e);
+                        if !s.contains("not modified") {
+                            tracing::warn!("lounge edit failed for {}: {}", a.address, e);
+                        }
+                    }
+                    let _ = self.db.update_delivery(
+                        lounge_d.id,
+                        status,
+                        effective_conf,
+                        &a.confidence.classification,
+                        price,
+                        Some(a.top_holder_pct),
+                        &timeline_json,
+                    );
+                }
+
+                // Calls channel stays quiet during a position's life —
+                // settle's close edit is the only public update. Keep the
+                // calls delivery row's snapshot fresh so settle's outcome
+                // edit fires correctly without re-rendering the card.
+                let _ = self.db.update_delivery(
                     delivery.id,
                     status,
                     effective_conf,
@@ -1752,7 +2114,7 @@ impl Notifier {
                     price,
                     Some(a.top_holder_pct),
                     &timeline_json,
-                )?;
+                );
             }
             Some(delivery) => {
                 // Terminal-but-recoverable. Two cohorts land here:
@@ -1799,13 +2161,23 @@ impl Notifier {
                     kind: "rebound".into(),
                     line,
                 });
-                let html = self.render_signal_with_timeline(
-                    a,
+                // Recover the original ape entry note so the calls card
+                // re-renders the narrative (not just the header). Empty
+                // when the call row is gone — falls back to header-only.
+                let entry_note = self
+                    .db
+                    .get_call_by_mint(&a.address)
+                    .ok()
+                    .flatten()
+                    .map(|c| c.note)
+                    .unwrap_or_default();
+                let html = self.render_call_card(
+                    &a.address,
                     meta.as_ref(),
                     &timeline,
                     "active",
-                    effective_conf,
-                    None,
+                    &entry_note,
+                    "",
                 );
                 let kb = self.token_keyboard(
                     &a.address,
@@ -2080,7 +2452,7 @@ impl Notifier {
         let hour_label = now.format("%H:00 UTC").to_string();
         let queue = self.db.pending_alert_count().unwrap_or(0);
         let breakdown = self.db.pending_alerts_by_type().unwrap_or_default();
-        let signals_active = self.db.active_delivery_count("winners").unwrap_or(0);
+        let signals_active = self.db.active_delivery_count(CALLS_CHANNEL).unwrap_or(0);
 
         let emoji = |t: &str| match t {
             "concentrating" => "⚠️",

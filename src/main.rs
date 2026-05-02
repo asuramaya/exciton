@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 mod bonding_curve;
 mod bot;
+mod chart;
 mod config;
 mod db;
 mod discovery;
@@ -74,6 +75,10 @@ async fn main() -> Result<()> {
         tg_cfg.dm_bot_token = ingester::resolve_env_vars(&tg_cfg.dm_bot_token);
         tg_cfg.signals_chat_id = ingester::resolve_env_vars(&tg_cfg.signals_chat_id);
         tg_cfg.ops_chat_id = ingester::resolve_env_vars(&tg_cfg.ops_chat_id);
+        tg_cfg.lounge_chat_id = ingester::resolve_env_vars(&tg_cfg.lounge_chat_id);
+        if tg_cfg.lounge_chat_id.trim().is_empty() {
+            tg_cfg.lounge_chat_id = tg_cfg.ops_chat_id.clone();
+        }
         tg_cfg.anthropic_api_key = ingester::resolve_env_vars(&tg_cfg.anthropic_api_key);
         tg_cfg.openai_api_key = ingester::resolve_env_vars(&tg_cfg.openai_api_key);
         tg_cfg.claw_api_secret = ingester::resolve_env_vars(&tg_cfg.claw_api_secret);

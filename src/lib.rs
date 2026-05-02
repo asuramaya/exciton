@@ -1,5 +1,6 @@
 pub mod bonding_curve;
 pub mod bot;
+pub mod chart;
 pub mod config;
 pub mod db;
 pub mod discovery;

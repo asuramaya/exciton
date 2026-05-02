@@ -157,11 +157,19 @@ pub struct TelegramConfig {
     /// to keep the long-poll exclusive.
     #[serde(default)]
     pub dm_bot_token: String,
-    /// Channel ID for signal cards — "we think this makes money" calls.
-    /// Verdict evolves in-card; failures stay visible with FAILED header.
+    /// Channel ID for the public-facing call channel. Ape-voiced cards
+    /// only — entry punchline + chart + verdict-on-close. No numbers
+    /// dump, no timeline blockquote.
     pub signals_chat_id: String,
-    /// Chat ID for ops heartbeats + hourly monster digest.
+    /// Chat ID for ops heartbeats + hourly monster digest. Also used as
+    /// the lounge fallback when `lounge_chat_id` is empty (back-compat).
     pub ops_chat_id: String,
+    /// Chat ID for the data-junkie lounge — full structural signal card
+    /// (numbers, classification, forensics, timeline) + every per-call
+    /// flip mirrors here. When empty, falls back to `ops_chat_id` so
+    /// existing single-channel deploys keep working.
+    #[serde(default)]
+    pub lounge_chat_id: String,
 
     /// Enable the direct-message bot interface (long-poll loop for /commands).
     /// Separate switch from channel posting — can disable DM while keeping
