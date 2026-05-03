@@ -1253,6 +1253,40 @@ impl Notifier {
             .ok_or_else(|| anyhow!("missing message_id"))?)
     }
 
+    /// sendMessage with reply_to_message_id — used for milestone
+    /// theatre replies under a live call card. allow_sending_without_reply
+    /// preserves the message even if the original card got deleted.
+    async fn send_message_reply(
+        &self,
+        chat_id: &str,
+        reply_to_msg_id: i64,
+        text: &str,
+    ) -> Result<i64> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            self.cfg.bot_token
+        );
+        let form = vec![
+            ("chat_id", chat_id.to_string()),
+            ("text", text.to_string()),
+            ("parse_mode", "HTML".to_string()),
+            (
+                "link_preview_options",
+                r#"{"is_disabled":true}"#.to_string(),
+            ),
+            ("reply_to_message_id", reply_to_msg_id.to_string()),
+            ("allow_sending_without_reply", "true".to_string()),
+        ];
+        let resp = self.http.post(&url).form(&form).send().await?;
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            return Err(anyhow!("telegram sendMessage(reply) failed: {}", body));
+        }
+        Ok(body["result"]["message_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("missing message_id"))?)
+    }
+
     /// sendPhoto with reply_to_message_id — used for win-verdict cards
     /// that thread under the original entry card. The reader sees the
     /// entry chart followed by the exit chart with the claw verdict line
@@ -2206,6 +2240,61 @@ impl Notifier {
             html.push_str("\n…[truncated]");
         }
         html
+    }
+
+    /// Fire a milestone reply under an active call's TG card. Called
+    /// by the scanner settling loop when a live mark crosses a new
+    /// multiple threshold (1.5x, 2x, 3x, 4x, 5x). Idempotent at the
+    /// call-row level via peak_announced_pct — caller writes that
+    /// AFTER this returns success. Falls back gracefully when the
+    /// original call card is missing (rare; manual /close, message
+    /// deletion).
+    pub async fn fire_call_milestone(
+        &self,
+        address: &str,
+        symbol: &str,
+        pct: f64,
+        milestone_label: &str,
+    ) -> anyhow::Result<()> {
+        if !self.cfg.enabled {
+            return Ok(());
+        }
+        let chat_id = self.cfg.signals_chat_id.clone();
+        if chat_id.is_empty() {
+            return Ok(());
+        }
+        let delivery = self
+            .db
+            .get_active_delivery(address, CALLS_CHANNEL)
+            .ok()
+            .flatten();
+        let Some(d) = delivery else {
+            tracing::debug!("milestone: no active delivery for {} — skipping", address);
+            return Ok(());
+        };
+        let sym = if symbol.is_empty() {
+            let n = address.len();
+            if n <= 8 {
+                address.to_string()
+            } else {
+                format!("{}…{}", &address[..4], &address[n - 4..])
+            }
+        } else {
+            format!("${}", symbol)
+        };
+        let text = format!(
+            "<b>{} → {}</b>\n+{:.0}% from entry",
+            html_escape(&sym),
+            milestone_label,
+            pct
+        );
+        match self.send_message_reply(&chat_id, d.message_id, &text).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!("milestone reply for {} failed: {}", address, e);
+                Err(e)
+            }
+        }
     }
 
     /// Post a manual call card to the signals channel. Skips should_signal() —

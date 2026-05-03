@@ -866,6 +866,63 @@ impl BackgroundScanner {
             let pct = (current_price / call.entry_price_usd - 1.0) * 100.0;
             let age = now - call.called_at;
 
+            // Milestone theatre. As the call's mark-to-market crosses
+            // each multiple threshold, fire a reply under the original
+            // call card so the channel sees the run live. One reply
+            // per milestone, ever — the peak_announced_pct column on
+            // the call gates re-fires across ticks AND across photon
+            // restarts. Tiers:
+            //   +50%  → 1.5x
+            //   +100% → 2x
+            //   +200% → 3x
+            //   +300% → 4x
+            //   +500% → 5x
+            // Higher tiers fire on top of lower ones if the price
+            // jumps between ticks, but each only ever fires once.
+            const MILESTONES: &[(f64, &str)] = &[
+                (50.0, "1.5x"),
+                (100.0, "2x"),
+                (200.0, "3x"),
+                (300.0, "4x"),
+                (500.0, "5x"),
+            ];
+            if let Some(notifier) = &self.notifier {
+                let already = self
+                    .db
+                    .get_call_peak_announced(call.id)
+                    .unwrap_or(0.0);
+                for &(threshold, label) in MILESTONES {
+                    if pct >= threshold && threshold > already {
+                        match notifier
+                            .fire_call_milestone(&call.mint, &call.symbol, pct, label)
+                            .await
+                        {
+                            Ok(_) => {
+                                if let Err(e) =
+                                    self.db.set_call_peak_announced(call.id, threshold)
+                                {
+                                    tracing::warn!(
+                                        "milestone: persist {} for call {} failed: {}",
+                                        threshold,
+                                        call.id,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "milestone: fire {} for call {} failed: {} — will retry",
+                                    label,
+                                    call.id,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Take-profit pct: use the higher of (market price, latest on-chain
             // snapshot price) — DexScreener feeds lag during fast spikes by
             // 30-90s, but analyze_token writes on-chain price into snapshots

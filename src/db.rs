@@ -522,6 +522,14 @@ impl Db {
         let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_sol_received REAL", []);
         let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_attempt_count INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE calls ADD COLUMN sell_last_error TEXT", []);
+        // Milestone theatre — track the highest +pct threshold already
+        // announced via TG reply on the active call card. Used by the
+        // scanner settling loop to fire one (and only one) reply per
+        // milestone crossing (1.5x at +50, 2x at +100, etc.).
+        let _ = conn.execute(
+            "ALTER TABLE calls ADD COLUMN peak_announced_pct REAL NOT NULL DEFAULT 0",
+            [],
+        );
 
         // Bonding-curve observation snapshots. Pre-graduation pump.fun
         // tokens have no DexScreener pair, so token_snapshots can't hold
@@ -1837,6 +1845,33 @@ impl Db {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Read the highest milestone-pct already announced via TG reply
+    /// for an active call. 0 means none announced yet. Returns 0 when
+    /// the call doesn't exist (so the milestone hook fails open).
+    pub fn get_call_peak_announced(&self, call_id: i64) -> Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let pct: f64 = conn
+            .query_row(
+                "SELECT peak_announced_pct FROM calls WHERE id = ?1",
+                params![call_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+        Ok(pct)
+    }
+
+    /// Persist a new milestone level on a call. Caller is responsible
+    /// for sending the TG reply BEFORE calling this — if the reply
+    /// fails we leave the column unchanged so the next tick retries.
+    pub fn set_call_peak_announced(&self, call_id: i64, pct: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE calls SET peak_announced_pct = ?2 WHERE id = ?1",
+            params![call_id, pct],
+        )?;
+        Ok(())
     }
 
     /// Free-text call lookup. `query` matches against `symbol`
