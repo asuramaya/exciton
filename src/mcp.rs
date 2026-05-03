@@ -167,6 +167,35 @@ struct PresentResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DbCallLookupParams {
+    /// Symbol (case-insensitive substring) or full mint address.
+    pub query: String,
+    /// Max rows to return. Default 10, cap 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DbTokenHistoryParams {
+    /// Mint address. Required — symbols won't match here, this hits
+    /// token_snapshots.token_address directly.
+    pub mint: String,
+    /// Max snapshots to return, newest first. Default 30, cap 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DbNearMissesParams {
+    /// Max rows to return, newest first. Default 30, cap 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Optional mint to scope the search to a single token.
+    #[serde(default)]
+    pub mint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TradeParams {
     /// Token mint address
     pub token: String,
@@ -1520,6 +1549,77 @@ impl PhotonServer {
     async fn active_calls(&self) -> String {
         let rows = self.db.list_calls(true, 100).unwrap_or_default();
         serde_json::to_string_pretty(&rows).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+    }
+
+    /// Look up calls by symbol (case-insensitive substring) or exact mint.
+    /// Returns full call rows — entry/exit fields, classification,
+    /// confidence, exit_note. Use this for post-mortem ("why did BUTT
+    /// exit at +4.7%?") instead of grepping the DB by hand.
+    #[tool]
+    async fn db_call_lookup(&self, Parameters(params): Parameters<DbCallLookupParams>) -> String {
+        let limit = params.limit.unwrap_or(10).min(50);
+        match self.db.find_calls(&params.query, limit) {
+            Ok(rows) => serde_json::to_string_pretty(&rows)
+                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+            Err(e) => serde_json::json!({"error": format!("{}", e)}).to_string(),
+        }
+    }
+
+    /// Snapshot history for a single mint, newest first. Each row is one
+    /// analyzer cycle: classification, confidence, momentum/distribution/
+    /// spring, top-holder %, holder count, tx_rate, price, mcap, liquidity,
+    /// buys/sells, price_change_h1, plus launch-forensics fields. Use to
+    /// reconstruct what the bot saw during a run — i.e. peak price vs exit
+    /// price for a fakeout investigation.
+    #[tool]
+    async fn db_token_history(
+        &self,
+        Parameters(params): Parameters<DbTokenHistoryParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(30).min(200);
+        match self.db.get_snapshot_history(&params.mint, limit) {
+            Ok(snaps) => serde_json::to_string_pretty(&snaps)
+                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+            Err(e) => serde_json::json!({"error": format!("{}", e)}).to_string(),
+        }
+    }
+
+    /// Recent signal_near_misses — cycles where the analyzer almost fired
+    /// but a gate blocked. Use to figure out *why* a runner went uncalled
+    /// (was it sniper%, liquidity, momentum_delta?). Pass `mint` to scope
+    /// to a single token; omit for cross-token triage.
+    #[tool]
+    async fn db_recent_near_misses(
+        &self,
+        Parameters(params): Parameters<DbNearMissesParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(30).min(200);
+        let result = match params.mint.as_deref() {
+            Some(m) if !m.is_empty() => self.db.get_token_near_misses(m, limit),
+            _ => self.db.get_recent_near_misses(limit),
+        };
+        match result {
+            Ok(rows) => {
+                let pretty: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "mint": r.token_address,
+                            "classification": r.classification,
+                            "effective_confidence": r.effective_confidence,
+                            "top_holder_pct": r.top_holder_pct,
+                            "momentum_delta": r.momentum_delta,
+                            "gate": r.gate_that_failed,
+                            "gap": r.gap,
+                            "timestamp": r.timestamp,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&pretty)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+            }
+            Err(e) => serde_json::json!({"error": format!("{}", e)}).to_string(),
+        }
     }
 
     /// Execute a trade via Jupiter v6 + Jito MEV protection.

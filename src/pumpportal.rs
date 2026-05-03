@@ -37,12 +37,17 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub const WS_URL: &str = "wss://pumpportal.fun/api/data";
 
-/// Subscription methods we care about today. Trade + account-trade
-/// methods exist too but they're a separate phase.
+/// Subscription methods we care about. NewToken + Migration are global
+/// firehoses (no params). AccountTrade is keyed — pass the wallets you
+/// want trades for; PumpPortal pushes every buy/sell signed by any of
+/// them. Used for smart-wallet imitation alpha: subscribe to the
+/// wallets promoted into smart_wallets so we see their trades in
+/// real-time without polling.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum Subscription {
     NewToken,
     Migration,
+    AccountTrade(Vec<String>),
 }
 
 impl Subscription {
@@ -50,22 +55,37 @@ impl Subscription {
         match self {
             Subscription::NewToken => "subscribeNewToken",
             Subscription::Migration => "subscribeMigration",
+            Subscription::AccountTrade(_) => "subscribeAccountTrade",
         }
     }
 
     fn payload(&self) -> serde_json::Value {
-        serde_json::json!({ "method": self.method() })
+        match self {
+            Subscription::NewToken | Subscription::Migration => {
+                serde_json::json!({ "method": self.method() })
+            }
+            Subscription::AccountTrade(keys) => serde_json::json!({
+                "method": self.method(),
+                "keys": keys,
+            }),
+        }
     }
 }
 
-/// Parsed event types. The two streams we subscribe to today
-/// (`subscribeNewToken`, `subscribeMigration`) get typed variants;
-/// anything unknown lands as `Raw` so the sink can still see it for
-/// debugging and we surface schema changes loudly instead of silently.
+/// Parsed event types. The streams we subscribe to today
+/// (`subscribeNewToken`, `subscribeMigration`, `subscribeAccountTrade`)
+/// get typed variants; anything unknown lands as `Raw` so the sink can
+/// still see it for debugging and we surface schema changes loudly
+/// instead of silently.
 #[derive(Debug, Clone)]
 pub enum PumpEvent {
     NewToken(NewTokenEvent),
     Migration(MigrationEvent),
+    /// `subscribeAccountTrade` event — a smart wallet executed a buy
+    /// or sell on a token. Sink uses it to score the wallet (was this
+    /// buy followed by a runner?) and to forward conviction to the
+    /// signal layer (multiple smart wallets buying the same fresh mint).
+    AccountTrade(AccountTradeEvent),
     Raw(serde_json::Value),
 }
 
@@ -126,6 +146,34 @@ pub struct NewTokenEvent {
     pub symbol: Option<String>,
     #[serde(default)]
     pub uri: Option<String>,
+}
+
+/// `subscribeAccountTrade` event payload. PumpPortal pushes one of
+/// these whenever a tracked wallet signs a buy or sell on a pump.fun
+/// token. Field shape mirrors a trade event: `txType` is `"buy"` or
+/// `"sell"`, `traderPublicKey` is the wallet doing the trade,
+/// `solAmount`/`tokenAmount` are the swap sides. Optional fields
+/// follow the same tolerance as NewTokenEvent so a server-side schema
+/// drift doesn't crash the consumer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AccountTradeEvent {
+    pub mint: String,
+    #[serde(rename = "traderPublicKey", default)]
+    pub trader_public_key: Option<String>,
+    #[serde(rename = "txType", default)]
+    pub tx_type: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(rename = "solAmount", default)]
+    pub sol_amount: Option<f64>,
+    #[serde(rename = "tokenAmount", default)]
+    pub token_amount: Option<f64>,
+    #[serde(rename = "marketCapSol", default)]
+    pub market_cap_sol: Option<f64>,
+    #[serde(rename = "vSolInBondingCurve", default)]
+    pub v_sol_in_bonding_curve: Option<f64>,
+    #[serde(rename = "vTokensInBondingCurve", default)]
+    pub v_tokens_in_bonding_curve: Option<f64>,
 }
 
 /// Health surface read by scanner. `is_connected` is true while a
@@ -281,6 +329,11 @@ fn parse_event(text: &str) -> PumpEvent {
         Some("migrate") => {
             if let Ok(evt) = serde_json::from_value::<MigrationEvent>(value.clone()) {
                 return PumpEvent::Migration(evt);
+            }
+        }
+        Some("buy") | Some("sell") => {
+            if let Ok(evt) = serde_json::from_value::<AccountTradeEvent>(value.clone()) {
+                return PumpEvent::AccountTrade(evt);
             }
         }
         _ => {}

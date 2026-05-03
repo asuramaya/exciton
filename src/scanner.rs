@@ -998,18 +998,30 @@ impl BackgroundScanner {
             // Trail-stop fakeout guard. NYAN ran a single 80-second wick
             // through our -25 moonshot stop, exited at -28, then
             // immediately recovered and ran to +147%. Before firing any
-            // stop-out, require AT LEAST ONE prior snapshot in the last
-            // 15-120s also priced below the trail floor. A single live
-            // fetch wick alone doesn't trigger; we wait one more cycle.
+            // stop-out, require AT LEAST ONE post-peak snapshot also priced
+            // below the trail floor. A single live wick alone doesn't fire;
+            // we wait one more cycle. We MUST scope to "since peak" — the
+            // earlier rolling-120s window counted pre-peak snapshots from
+            // when the token was climbing UP through the floor, which
+            // falsely confirmed every fast pump (see BUTT 2026-05-02:
+            // peak +31% at 23:41:28 → wick to +4.7% at 23:41:44 → exit
+            // fired because three pre-peak ticks were "below floor").
             // First-call grace: when fewer than 2 minutes have elapsed
             // since the call we don't have enough snapshot history to
             // confirm anyway, so skip the gate (worst case we eat the
             // full -25% which is already capped).
             let breach_confirmed = if pct <= trail_floor && call.entry_price_usd > 0.0 {
                 let price_floor = call.entry_price_usd * (1.0 + trail_floor / 100.0);
+                let peak_ts = self
+                    .db
+                    .get_peak_snapshot(&call.mint, call.called_at)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.timestamp)
+                    .unwrap_or(call.called_at);
                 let prior_below = self
                     .db
-                    .count_recent_snapshots_below(&call.mint, price_floor)
+                    .count_snapshots_below_since(&call.mint, price_floor, peak_ts)
                     .unwrap_or(0);
                 let age_now = chrono::Utc::now().timestamp() - call.called_at;
                 prior_below >= 1 || age_now < 120

@@ -1,17 +1,18 @@
-//! Real holder count via Birdeye + Solscan APIs. Replaces our previous
-//! RPC-based reading which was capped at 20 (the limit of
+//! Real holder count via Birdeye → Solscan → Moralis. Replaces our
+//! previous RPC-based reading which was capped at 20 (the limit of
 //! `getTokenLargestAccounts`) — meaning the entire `holder_count`
 //! column in token_snapshots was effectively constant at 0/20 and the
 //! moonshot gate's holder-range check (15-60) couldn't read truth.
 //!
 //! Birdeye is primary (cleaner data, returns `holder` directly on
-//! `/defi/token_overview`). Solscan is fallback for when Birdeye
-//! rate-limits or returns null. Both are cached per-mint at 60s — the
-//! holder-count signal moves slowly, no need to spam the providers.
+//! `/defi/token_overview`). Solscan is second tier. Moralis is third —
+//! its `/token/mainnet/holders/<mint>` endpoint also exposes whale/
+//! shark/dolphin distribution and `holderChange` deltas which we don't
+//! consume yet but are worth surfacing later. All cached per-mint at 60s.
 //!
-//! Keys come from env (`BIRDEYE_API_KEY`, `SOLSCAN_API_KEY`); when
-//! absent the helper returns None and callers fall back to the prior
-//! RPC-cap reading.
+//! Keys come from env (`BIRDEYE_API_KEY`, `SOLSCAN_API_KEY`,
+//! `MORALIS_API_KEY`); when absent the helper falls through to the next
+//! tier. Returns None only when all three providers fail.
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -110,10 +111,32 @@ async fn fetch_solscan(mint: &str) -> Result<Option<u32>> {
     Ok(h)
 }
 
-/// Get the real holder count for a mint. Tries Birdeye first, falls back
-/// to Solscan, then None. Results cached for 60s. Returns None when no
-/// API keys are configured or both providers fail — callers should
-/// preserve backward-compat behavior (treat None as "unknown").
+async fn fetch_moralis(mint: &str) -> Result<Option<u32>> {
+    let key = std::env::var("MORALIS_API_KEY").unwrap_or_default();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let url = format!(
+        "https://solana-gateway.moralis.io/token/mainnet/holders/{}",
+        mint
+    );
+    let resp = HTTP.get(&url).header("X-API-Key", key).send().await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let h = body
+        .get("totalHolders")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    Ok(h)
+}
+
+/// Get the real holder count for a mint. Tries Birdeye → Solscan →
+/// Moralis, returning the first hit. Results cached for 60s. Returns
+/// None when no API keys are configured or all providers fail —
+/// callers should preserve backward-compat behavior (treat None as
+/// "unknown").
 pub async fn get_holder_count(mint: &str) -> Option<u32> {
     if let Some(c) = cached(mint) {
         return Some(c);
@@ -123,6 +146,10 @@ pub async fn get_holder_count(mint: &str) -> Option<u32> {
         return Some(c);
     }
     if let Ok(Some(c)) = fetch_solscan(mint).await {
+        cache_put(mint, c);
+        return Some(c);
+    }
+    if let Ok(Some(c)) = fetch_moralis(mint).await {
         cache_put(mint, c);
         return Some(c);
     }

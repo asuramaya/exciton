@@ -104,14 +104,14 @@ impl DiscoveryPoller {
             // gates as an early conviction marker — a project paying
             // for promotion is real-money intent, even if our standard
             // pattern gates haven't qualified the token yet.
+            // boosts-latest reports incremental `amount`; boosts-top
+            // reports only cumulative `totalAmount`. Prefer amount,
+            // fall back to total so both feeds land rows.
             if is_boost_feed {
-                if let Some(amount) = item.amount {
-                    if amount > 0 {
-                        if let Err(e) =
-                            self.db.record_token_boost(&mint, amount, source_tag)
-                        {
-                            tracing::debug!("discovery poll: record_boost {} failed: {}", mint, e);
-                        }
+                let boost = item.amount.or(item.total_amount).unwrap_or(0);
+                if boost > 0 {
+                    if let Err(e) = self.db.record_token_boost(&mint, boost, source_tag) {
+                        tracing::debug!("discovery poll: record_boost {} failed: {}", mint, e);
                     }
                 }
             }
@@ -148,9 +148,16 @@ struct DsTokenRef {
     chain_id: Option<String>,
     #[serde(rename = "tokenAddress")]
     token_address: Option<String>,
-    /// Boost amount on `ds:boosts-*` endpoints. Absent on profile feed.
+    /// Per-event boost delta on `ds:boosts-latest`. Absent on `ds:boosts-top`
+    /// (which only reports cumulative `totalAmount`) and on `ds:profiles`.
     #[serde(default)]
     amount: Option<i64>,
+    /// Cumulative boost spend on `ds:boosts-top` and `ds:boosts-latest`.
+    /// Absent on `ds:profiles`. Used as a fallback when `amount` is missing
+    /// so boosts-top actually records signal — without it, the table only
+    /// captured boosts-latest and we lost half the boost firehose.
+    #[serde(rename = "totalAmount", default)]
+    total_amount: Option<i64>,
 }
 
 fn short_url(u: &str) -> &str {

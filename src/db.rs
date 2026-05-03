@@ -801,6 +801,36 @@ impl Db {
         Ok(n)
     }
 
+    /// Count snapshots strictly AFTER `peak_ts` whose price sits below the
+    /// trail floor. Used by the trail-stop confirmation gate to distinguish
+    /// a real breakdown (multiple post-peak ticks below floor) from a single
+    /// wick (one tick below). The naive rolling-window variant counts pre-peak
+    /// snapshots from when the token was climbing UP through the floor, which
+    /// falsely "confirms" the breach for fast pumps — see BUTT 2026-05-02.
+    pub fn count_snapshots_below_since(
+        &self,
+        token_address: &str,
+        price_threshold: f64,
+        since_ts: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        // Exclude the very latest snapshot (within last 15s) so the current
+        // breach itself doesn't count as confirmation.
+        let now = chrono::Utc::now().timestamp();
+        let hi = now - 15;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM token_snapshots
+             WHERE token_address = ?1
+               AND timestamp > ?2
+               AND timestamp <= ?3
+               AND price_usd > 0
+               AND price_usd <= ?4",
+            params![token_address, since_ts, hi, price_threshold],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn get_recent_near_misses(&self, limit: usize) -> Result<Vec<NearMiss>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1120,6 +1150,99 @@ impl Db {
     }
 
     // -- Smart-wallet tracking (imitation-alpha) -----------------------------
+
+    /// Auto-promotion loop. Joins wallet_observations against token peaks
+    /// (max snapshot price since the wallet's buy_ts) to score each
+    /// observed wallet. A wallet that's been an early buyer on
+    /// `min_winners` distinct mints with hit_rate >= `min_hit_rate_pct` is
+    /// promoted into `smart_wallets`. Idempotent — already-active wallets
+    /// are left alone, deactivated ones are NOT re-activated (operator
+    /// must do that manually).
+    ///
+    /// Returns `(considered, promoted)`: how many distinct wallets had
+    /// the minimum observation count, and how many crossed the bar.
+    pub fn promote_smart_wallets(
+        &self,
+        min_winners: i64,
+        min_total_obs: i64,
+        win_multiple: f64,
+        min_hit_rate_pct: f64,
+    ) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        // Pull every wallet's distinct mints + min/max price since buy_ts.
+        // We score "winner" as max(price_usd) / first_price >= win_multiple
+        // where first_price = price_usd of the first snapshot at or after
+        // the buy. Tokens with no snapshots after buy_ts are skipped.
+        let mut stmt = conn.prepare(
+            "WITH per_obs AS (
+                 SELECT o.wallet,
+                        o.mint,
+                        (SELECT MAX(s.price_usd) FROM token_snapshots s
+                            WHERE s.token_address = o.mint
+                              AND s.timestamp >= o.buy_ts
+                              AND s.price_usd > 0) AS peak,
+                        (SELECT s.price_usd FROM token_snapshots s
+                            WHERE s.token_address = o.mint
+                              AND s.timestamp >= o.buy_ts
+                              AND s.price_usd > 0
+                            ORDER BY s.timestamp ASC
+                            LIMIT 1) AS first_price
+                 FROM wallet_observations o
+             )
+             SELECT wallet,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN first_price > 0 AND peak / first_price >= ?1
+                             THEN 1 ELSE 0 END) AS winners
+             FROM per_obs
+             WHERE first_price > 0
+             GROUP BY wallet
+             HAVING total >= ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![win_multiple, min_total_obs], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let considered = rows.len();
+        let mut promoted = 0usize;
+        let now = chrono::Utc::now().timestamp();
+        for (wallet, total, winners) in rows {
+            if winners < min_winners {
+                continue;
+            }
+            let hit_rate = (winners as f64) / (total as f64) * 100.0;
+            if hit_rate < min_hit_rate_pct {
+                continue;
+            }
+            // INSERT OR IGNORE so we don't overwrite operator labels or
+            // re-activate manually-deactivated wallets.
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO smart_wallets (address, label, added_at, active)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![
+                    wallet,
+                    format!("auto: {}/{} @ {:.0}%", winners, total, hit_rate),
+                    now,
+                ],
+            )?;
+            if n > 0 {
+                promoted += 1;
+                tracing::info!(
+                    "smart_wallet promotion: {} ({}/{} @ {:.0}%)",
+                    wallet,
+                    winners,
+                    total,
+                    hit_rate,
+                );
+            }
+        }
+        Ok((considered, promoted))
+    }
 
     pub fn add_smart_wallet(&self, address: &str, label: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1710,6 +1833,85 @@ impl Db {
                     exit_note: row.get(16).ok(),
                     expires_at: row.get(17).ok(),
                     entry_tx_rate: row.get(18).unwrap_or(0.0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Free-text call lookup. `query` matches against `symbol`
+    /// case-insensitively (substring) and exact-match against `mint`. Useful
+    /// for ad-hoc post-mortems via the MCP `db_call_lookup` tool — the same
+    /// shape `list_calls` returns.
+    pub fn find_calls(&self, query: &str, limit: usize) -> Result<Vec<CallRow>> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let like = format!("%{}%", needle.to_lowercase());
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, mint, symbol, classification, confidence, called_at,
+                    entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
+                    entry_top_holder_pct, entry_pair_dex, note, source,
+                    status, closed_at, exit_price_usd, exit_note, expires_at,
+                    entry_tx_rate
+             FROM calls
+             WHERE mint = ?1 OR LOWER(symbol) LIKE ?2
+             ORDER BY called_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![needle, like, limit], |row| {
+                Ok(CallRow {
+                    id: row.get(0)?,
+                    mint: row.get(1)?,
+                    symbol: row.get(2)?,
+                    classification: row.get(3)?,
+                    confidence: row.get(4)?,
+                    called_at: row.get(5)?,
+                    entry_mcap_usd: row.get(6)?,
+                    entry_price_usd: row.get(7)?,
+                    entry_liquidity_usd: row.get(8)?,
+                    entry_top_holder_pct: row.get(9)?,
+                    entry_pair_dex: row.get(10)?,
+                    note: row.get(11)?,
+                    source: row.get(12)?,
+                    status: row.get(13)?,
+                    closed_at: row.get(14).ok(),
+                    exit_price_usd: row.get(15).ok(),
+                    exit_note: row.get(16).ok(),
+                    expires_at: row.get(17).ok(),
+                    entry_tx_rate: row.get(18).unwrap_or(0.0),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Like `get_recent_near_misses` but scoped to a single token. Returns
+    /// the most recent `limit` rows for `mint` ordered newest-first.
+    pub fn get_token_near_misses(&self, mint: &str, limit: usize) -> Result<Vec<NearMiss>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT token_address, classification, effective_confidence, top_holder_pct,
+                    momentum_delta, gate_that_failed, gap, timestamp
+             FROM signal_near_misses
+             WHERE token_address = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![mint, limit], |row| {
+                Ok(NearMiss {
+                    token_address: row.get(0)?,
+                    classification: row.get(1)?,
+                    effective_confidence: row.get(2)?,
+                    top_holder_pct: row.get(3)?,
+                    momentum_delta: row.get(4).ok(),
+                    gate_that_failed: row.get(5)?,
+                    gap: row.get(6)?,
+                    timestamp: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

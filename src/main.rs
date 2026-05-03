@@ -3,6 +3,7 @@ use rmcp::ServiceExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod bitquery;
 mod bonding_curve;
 mod bot;
 mod chart_screenshot;
@@ -114,6 +115,42 @@ async fn main() -> Result<()> {
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("acknowledge_stale_alerts failed: {}", e),
+                }
+            }
+        });
+    }
+
+    // Smart-wallet auto-promotion. Hourly scan of wallet_observations
+    // joined against token_snapshots peaks. Wallets that bought ≥3
+    // tokens later running 1.5x with hit-rate ≥40% get inserted into
+    // smart_wallets. Closes the dead loop where the observer was
+    // collecting trades but nothing promoted them — leaving
+    // smart_money_count stuck at 0 in every forensics readout.
+    {
+        let db_promote = db.clone();
+        tokio::spawn(async move {
+            // Skip the immediate first tick; let the scanner warm up.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let res = tokio::task::spawn_blocking({
+                    let db = db_promote.clone();
+                    move || db.promote_smart_wallets(3, 5, 1.5, 40.0)
+                })
+                .await;
+                match res {
+                    Ok(Ok((considered, promoted))) => {
+                        if promoted > 0 || considered > 0 {
+                            tracing::info!(
+                                "smart_wallet promotion: {} considered, {} promoted",
+                                considered,
+                                promoted
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("smart_wallet promotion failed: {}", e),
+                    Err(e) => tracing::warn!("smart_wallet promotion panic: {}", e),
                 }
             }
         });
@@ -287,10 +324,30 @@ async fn main() -> Result<()> {
     // in the scanner gate on this client's freshness; when stale they fall
     // back to the existing RPC walks. No feature flag — connectivity is
     // the gate.
-    let pp_client = pumpportal::spawn(vec![
+    // Read smart wallets at boot for AccountTrade subscription. The
+    // hourly promotion loop adds new wallets over time; those get picked
+    // up on the next photon restart. PumpPortal's docs only document
+    // re-subscribing on connect, not modifying an active subscription —
+    // a process restart is the cleanest path for adding new wallets and
+    // the promotion cadence is hourly, so the staleness window matches.
+    let smart_wallets: Vec<String> = db
+        .list_active_smart_wallets()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(addr, _label)| addr)
+        .collect();
+    let mut pp_subs = vec![
         pumpportal::Subscription::NewToken,
         pumpportal::Subscription::Migration,
-    ]);
+    ];
+    if !smart_wallets.is_empty() {
+        tracing::info!(
+            "pumpportal: subscribing AccountTrade for {} smart wallets",
+            smart_wallets.len()
+        );
+        pp_subs.push(pumpportal::Subscription::AccountTrade(smart_wallets));
+    }
+    let pp_client = pumpportal::spawn(pp_subs);
     let pp_health = pp_client.health.clone();
     scanner = scanner.with_pumpportal_health(pp_health.clone());
     // Spawn the event sink. New-token events insert into `tokens`
@@ -357,6 +414,40 @@ async fn main() -> Result<()> {
                         m.signature.as_deref().unwrap_or("?")
                     );
                 }
+                pumpportal::PumpEvent::AccountTrade(t) => {
+                    // A promoted smart wallet just traded. Two leverage
+                    // points: (1) seed the mint into the watchlist if
+                    // we haven't seen it yet — smart-wallet entry is
+                    // strong "look here" signal for fresh mints; (2)
+                    // record the buy into wallet_observations so the
+                    // promotion loop keeps scoring the wallet's
+                    // ongoing hit rate. Sells just log; selling
+                    // signals are weaker and noisy until we score
+                    // peak-vs-sell-price properly.
+                    let trader = t.trader_public_key.as_deref().unwrap_or("?");
+                    let kind = t.tx_type.as_deref().unwrap_or("?");
+                    let sol = t.sol_amount.unwrap_or(0.0);
+                    if t.tx_type.as_deref() == Some("buy") {
+                        let _ = sink_db.insert_token(&t.mint, 0);
+                        let _ = sink_db.add_to_watchlist(&t.mint, "DEVELOPING");
+                        if !trader.is_empty() && trader != "?" {
+                            let _ = sink_db.insert_wallet_observation(
+                                trader,
+                                &t.mint,
+                                0,
+                                chrono::Utc::now().timestamp(),
+                                sol,
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        "pumpportal: smart-wallet {} {} {} ({:.3} SOL)",
+                        trader,
+                        kind,
+                        t.mint,
+                        sol
+                    );
+                }
                 pumpportal::PumpEvent::Raw(value) => {
                     // Unknown event shape — surface loudly so we notice
                     // schema drift and add typed handling.
@@ -365,6 +456,40 @@ async fn main() -> Result<()> {
                     tracing::info!(target: "pumpportal::raw", "{}", preview);
                 }
             }
+        }
+    });
+
+    // Bitquery streaming — second mint-discovery feed, redundancy for
+    // PumpPortal drops. Uses a different vendor with different gaps,
+    // so a missed event on one is likely covered by the other. Emits
+    // the same downstream contract as PumpPortal sink: insert into
+    // `tokens` and seed watchlist. No-op when BITQUERY_API_TOKEN is
+    // unset.
+    let bq_sink_db = db.clone();
+    let mut bq_client = bitquery::spawn();
+    tokio::spawn(async move {
+        while let Some(ev) = bq_client.events.recv().await {
+            if let Err(e) = bq_sink_db.insert_token(&ev.mint, 0) {
+                tracing::warn!(
+                    "bitquery-sink: insert_token {} failed: {}",
+                    ev.mint,
+                    e
+                );
+                continue;
+            }
+            if let Err(e) = bq_sink_db.add_to_watchlist(&ev.mint, "DEVELOPING") {
+                tracing::warn!(
+                    "bitquery-sink: add_to_watchlist {} failed: {}",
+                    ev.mint,
+                    e
+                );
+            }
+            tracing::info!(
+                "bitquery: trade {} ({}) sig {}",
+                ev.mint,
+                ev.symbol.as_deref().unwrap_or("?"),
+                ev.signature.as_deref().unwrap_or("?")
+            );
         }
         tracing::info!("pumpportal-sink: event stream ended");
     });
