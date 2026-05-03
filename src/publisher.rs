@@ -835,6 +835,17 @@ impl Publisher {
         trade_events.truncate(SLOT_TRADES);
 
         // Calls fired + closed, newest first.
+        // Narrative filter: the live feed used to flood with CALL FAILED
+        // entries (44% of stream events were failed calls — small fakeout
+        // exits that don't tell a story). Filter to keep only the
+        // interesting outcomes:
+        //   - CALL FIRED: always (we just opened a position — that's news)
+        //   - CALL WITHDREW: only if exit_pct >= +25% (real win)
+        //   - CALL FAILED: only if exit_pct <= -25% (real loss, not a wick)
+        //   - CALL EXPIRED: dropped entirely (timeouts are zero-signal)
+        // exit_pct extracted from the leading "+X.X%" / "-X.X%" of
+        // exit_note. When extraction fails we keep the event (don't
+        // silently swallow data we can't parse).
         if let Ok(rows) = self.db.list_calls(false, 25) {
             for c in rows {
                 let sym = if c.symbol.is_empty() {
@@ -856,26 +867,37 @@ impl Publisher {
                         signature: None,
                     }),
                     "withdrew" | "failed" | "closed" | "expired" => {
-                        if let Some(closed_ts) = c.closed_at {
-                            let tag_str = match c.status.as_str() {
-                                "expired" => "CALL EXPIRED",
-                                "withdrew" => "CALL WITHDREW",
-                                "failed" => "CALL FAILED",
-                                _ => "CALL CLOSED",
-                            };
-                            call_events.push(StreamEvent {
-                                ts: closed_ts,
-                                kind: "call".into(),
-                                tag: tag_str.into(),
-                                summary: format!(
-                                    "{} — {}",
-                                    sym,
-                                    c.exit_note.unwrap_or_else(|| "no note".into())
-                                ),
-                                mint: Some(c.mint),
-                                signature: None,
-                            });
+                        if c.status == "expired" {
+                            continue;
                         }
+                        let Some(closed_ts) = c.closed_at else { continue };
+                        let exit_note = c.exit_note.clone().unwrap_or_default();
+                        let exit_pct = exit_pct_from_note(&exit_note);
+                        let interesting = match c.status.as_str() {
+                            "withdrew" | "closed" => exit_pct.map_or(true, |p| p >= 25.0),
+                            "failed" => exit_pct.map_or(true, |p| p <= -25.0),
+                            _ => true,
+                        };
+                        if !interesting {
+                            continue;
+                        }
+                        let tag_str = match c.status.as_str() {
+                            "withdrew" => "CALL WITHDREW",
+                            "failed" => "CALL FAILED",
+                            _ => "CALL CLOSED",
+                        };
+                        call_events.push(StreamEvent {
+                            ts: closed_ts,
+                            kind: "call".into(),
+                            tag: tag_str.into(),
+                            summary: format!(
+                                "{} — {}",
+                                sym,
+                                if exit_note.is_empty() { "no note".into() } else { exit_note }
+                            ),
+                            mint: Some(c.mint),
+                            signature: None,
+                        });
                     }
                     _ => {}
                 }
@@ -1695,6 +1717,30 @@ fn short(s: &str) -> String {
 
 fn mint_short(m: &str) -> String {
     short(m)
+}
+
+/// Parse the leading "+X.X%" or "-X.X%" from an exit_note like
+/// "+250.4% · moonshot 3.5x" or "-30.2% · scalp stop". Returns None
+/// when the note doesn't start with a percentage (legacy rows, manual
+/// closes). Used by the live-feed filter to decide which call closes
+/// are worth surfacing — small-magnitude exits get hidden so the feed
+/// reads like a story instead of a graveyard.
+fn exit_pct_from_note(note: &str) -> Option<f64> {
+    let trimmed = note.trim_start();
+    let (sign, rest) = match trimmed.chars().next()? {
+        '+' => (1.0, &trimmed[1..]),
+        '-' => (-1.0, &trimmed[1..]),
+        c if c.is_ascii_digit() => (1.0, trimmed),
+        _ => return None,
+    };
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let num: f64 = rest[..end].parse().ok()?;
+    Some(sign * num)
 }
 
 fn fmt_number_human(n: f64) -> String {
