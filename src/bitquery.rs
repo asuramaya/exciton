@@ -253,6 +253,15 @@ fn parse_events(text: &str) -> Vec<BitqueryEvent> {
         if mint.is_empty() {
             continue;
         }
+        // Skip the system program and wrapped SOL — these are the
+        // "buy side" when someone is SELLING a token for SOL; not real
+        // discoverable mints. Without this filter the firehose floods
+        // with thousands of useless SOL events per minute.
+        if mint == "11111111111111111111111111111111"
+            || mint == "So11111111111111111111111111111111111111112"
+        {
+            continue;
+        }
         out.push(BitqueryEvent {
             mint,
             symbol: currency

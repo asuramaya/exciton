@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
                     e
                 );
             }
-            tracing::info!(
+            tracing::debug!(
                 "bitquery: trade {} ({}) sig {}",
                 ev.mint,
                 ev.symbol.as_deref().unwrap_or("?"),
