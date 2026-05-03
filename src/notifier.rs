@@ -130,7 +130,11 @@ pub const SIGNAL_MAX_INSIDER_PCT: f64 = 25.0;
 //
 // Trade-off: late-FOMO entries between 1.40-3.0 will sometimes slip; the
 // trailing-stop ladder is the safety net for those.
-pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.05;
+/// 2026-05-03 — bumped from 1.05 → 1.10 after 24h cohort analysis.
+/// Calls with latest-snapshot bs_ratio < 1.1 went 0 wins / 8 losses /
+/// 13 fires, average -42.5%. The 1.05 floor was permissive enough to
+/// let the actively-dumping band through.
+pub const SIGNAL_MIN_BUY_SELL_RATIO: f64 = 1.10;
 pub const SIGNAL_MAX_BUY_SELL_RATIO: f64 = 3.0;
 // Minimum sample size — below this the ratio is noise.
 pub const SIGNAL_MIN_HOUR_TXNS: i32 = 100;
@@ -777,7 +781,21 @@ impl Notifier {
         }
         let class = a.confidence.classification.as_str();
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
-        let conf_ok = effective_conf >= self.signal_threshold();
+        // Base global floor (currently 65). Per-class floors stack on top
+        // — DB mining 2026-05-03 (92 closed calls, 14k near-misses) found:
+        //   - STAIRCASE conf 70-75: 29 runners at 4.8:1 win/loss (ship)
+        //   - STAIRCASE conf 65-69: 12 runners vs 63 ruggers (toxic — block)
+        //   - GRINDER conf 65-69: 10 runners at 2.0:1 (ship)
+        //   - DEVELOPING conf <60: 36 calls, 1 win, 12 large losses
+        //     (-26.7% avg) → floor at 60.
+        let class_conf_floor: i32 = match class {
+            "STAIRCASE" => 70,
+            "GRINDER" => 65,
+            "DEVELOPING" => 60,
+            _ => 0,
+        };
+        let conf_ok = effective_conf >= self.signal_threshold()
+            && effective_conf >= class_conf_floor;
         let holder_ok = a.top_holder_pct < SIGNAL_MAX_TOP_HOLDER_PCT;
         // Insider-network gate: even when top1 looks fine, bundlers that
         // split 30-40% across 20+ wallets show up in top10 aggregate.
@@ -829,7 +847,12 @@ impl Notifier {
         // is mitigated by the b/s ratio gate + pc1h ceiling that came
         // in the same audit cycle — those filter the actual rugs.
         let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        // Sniper tier gate. Hard ceiling stays at SIGNAL_MAX_SNIPER_PCT.
+        // Soft mid-tier (40-95): requires conf >=75 to fire. DB mining
+        // 2026-05-03: 58 calls with sniper >=40% averaged -24% (35/58
+        // lost). Sweet spot 20-30% (n=6, +66% avg) passes unchanged.
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT
+            && (a.sniper_pct < 40.0 || effective_conf >= 75);
         let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate: organic accumulation lives in 0.9-1.6.
         // Below = already dumping. Above = late-stage FOMO peak.
@@ -916,7 +939,12 @@ impl Notifier {
         // Forensics ceilings — same as SHORT. Soft gate: unmeasured passes,
         // measured-bad blocks. See should_signal for the full rationale.
         let bundle_ok = a.bundle_pct < SIGNAL_MAX_BUNDLE_PCT;
-        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT;
+        // Sniper tier gate. Hard ceiling stays at SIGNAL_MAX_SNIPER_PCT.
+        // Soft mid-tier (40-95): requires conf >=75 to fire. DB mining
+        // 2026-05-03: 58 calls with sniper >=40% averaged -24% (35/58
+        // lost). Sweet spot 20-30% (n=6, +66% avg) passes unchanged.
+        let sniper_ok = a.sniper_pct < SIGNAL_MAX_SNIPER_PCT
+            && (a.sniper_pct < 40.0 || a.confidence.total >= 75);
         let insider_ok = a.insider_pct < SIGNAL_MAX_INSIDER_PCT;
         // Buy/sell pressure gate — the strongest single signal in the
         // 11-call live SCALP backtest. Inherited from SHORT.
@@ -1021,26 +1049,18 @@ impl Notifier {
             true // unknown current price → fall back to other gates
         };
 
-        // Boost override: a project paying DexScreener for promotion
-        // is real-money intent — strong early signal even when standard
-        // pattern gates are borderline. When the token has any boost
-        // observed in the last 4 hours, relax the holders + tx_rate +
-        // age gates (the most common moonshot-blockers for fresh
-        // boost-paid tokens that haven't built tape yet). Required gates
-        // still hold: class, mcap window, top1 ceiling, forensics.
-        let boost_amount = self
+        // Boost override DEMOTED 2026-05-03. Original assumption: "paying
+        // for promotion = real-money intent". Updated research (FXM Mar
+        // 2026 volume-cluster analysis; Trojan blog 2026 review) finds
+        // that 80%+ of boosted-token volume is wash trading. DexScreener
+        // explicitly labels boosts as paid promotion, not endorsement.
+        // Boosts are now neutral — they no longer relax other gates.
+        // Code retained as a no-op landmark in case the signal usefulness
+        // recovers; revisit when we have our own boost-vs-outcome cohort.
+        let _boost_amount = self
             .db
             .latest_boost_within(&a.address, 4 * 3600)
             .unwrap_or(0);
-        if boost_amount > 0 {
-            if mcap_ok && top1_ok && bundle_ok && sniper_ok && insider_ok && pre_ok {
-                tracing::info!(
-                    "moonshot boost-override fire: {} boosted +{} → relaxed gates passing",
-                    a.address, boost_amount
-                );
-                return true;
-            }
-        }
 
         // Deployer track-record veto. Pump.fun rug clusters launch
         // dozens of dud tokens from the same wallet (Arkham Q1-2025
