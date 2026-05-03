@@ -615,14 +615,60 @@ async fn main() -> Result<()> {
             rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default(),
         );
 
+        // Optional bearer-token gate. When PHOTON_MCP_TOKEN is set,
+        // every /mcp request must carry `Authorization: Bearer <token>`
+        // matching it (constant-time compared). When unset, the
+        // service runs unauthenticated — only safe behind a loopback
+        // bind or trusted Docker network. /health bypasses the gate
+        // so monitoring stays simple.
+        let mcp_token = std::env::var("PHOTON_MCP_TOKEN").unwrap_or_default();
+        if mcp_token.is_empty() {
+            tracing::warn!(
+                "MCP bearer auth DISABLED — set PHOTON_MCP_TOKEN to require Authorization header"
+            );
+        } else {
+            tracing::info!("MCP bearer auth enabled");
+        }
+        let mcp_token_arc = std::sync::Arc::new(mcp_token);
+        let auth_layer = {
+            let token = mcp_token_arc.clone();
+            axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move {
+                    if token.is_empty() {
+                        return Ok(next.run(req).await);
+                    }
+                    let header = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+                    let presented = header.strip_prefix("Bearer ").unwrap_or("");
+                    if !ct_eq_bytes(presented.as_bytes(), token.as_bytes()) {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    Ok(next.run(req).await)
+                }
+            })
+        };
+
         let app = axum::Router::new()
             .nest_service("/mcp", mcp_service)
+            .layer(auth_layer)
             .route(
                 "/health",
                 axum::routing::get(|| async { "ok" }),
             );
 
-        let bind_addr = format!("0.0.0.0:{}", mcp_port);
+        // Bind to 127.0.0.1 inside the container by default — the host
+        // docker-compose `127.0.0.1:8082:8082` mapping prevents external
+        // exposure; binding to 0.0.0.0 inside the container would still
+        // be reachable from other containers on the docker bridge
+        // network. Override via PHOTON_MCP_BIND for setups that need
+        // to expose to other containers (set to "0.0.0.0").
+        let bind_host = std::env::var("PHOTON_MCP_BIND")
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
+        let bind_addr = format!("{}:{}", bind_host, mcp_port);
         tracing::info!("MCP server listening on http://{}/mcp (Streamable HTTP)", bind_addr);
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         // axum::serve runs the HTTP server until the future completes.
@@ -640,4 +686,26 @@ async fn main() -> Result<()> {
     scanner_handle.stop();
 
     Ok(())
+}
+
+/// Constant-time byte comparison for the MCP bearer-token gate.
+/// Always walks the longer slice so an attacker can't binary-search
+/// the secret via response timing on length or position.
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        let mut acc: u8 = 1;
+        let n = a.len().max(b.len());
+        for i in 0..n {
+            let av = *a.get(i).unwrap_or(&0);
+            let bv = *b.get(i).unwrap_or(&0);
+            acc |= av ^ bv;
+        }
+        std::hint::black_box(acc);
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (av, bv) in a.iter().zip(b.iter()) {
+        acc |= av ^ bv;
+    }
+    acc == 0
 }

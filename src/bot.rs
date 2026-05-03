@@ -2771,13 +2771,15 @@ pub async fn serve_claw_api(
                     .await;
                 return;
             }
-            // Check secret header — applies to all routes.
+            // Check secret header — applies to all routes. Compare in
+            // constant time so a network attacker can't probe the
+            // secret byte-by-byte via response-time side channel.
             let header_secret = headers_part
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("x-claw-secret:"))
                 .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
                 .unwrap_or_default();
-            if header_secret != *secret {
+            if !ct_eq(header_secret.as_bytes(), secret.as_bytes()) {
                 let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\n\r\n").await;
                 return;
             }
@@ -3008,6 +3010,32 @@ fn parse_command(text: &str) -> (Option<String>, String) {
         .unwrap_or((rest, String::new()));
     let cmd = head.split('@').next().unwrap_or(head).to_lowercase();
     (Some(cmd), tail)
+}
+
+/// Constant-time byte comparison for secret-equality checks. Always
+/// scans the full length of the longer input so the timing of a
+/// "wrong byte at position 0" matches "wrong byte at position N",
+/// preventing a timing-side-channel attacker from binary-searching
+/// the secret. Use only on small fixed-size secrets.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Still walk a fixed amount of work so the attacker can't
+        // distinguish "wrong length" from "wrong content" via timing.
+        let mut acc: u8 = 1;
+        let n = a.len().max(b.len());
+        for i in 0..n {
+            let av = *a.get(i).unwrap_or(&0);
+            let bv = *b.get(i).unwrap_or(&0);
+            acc |= av ^ bv;
+        }
+        std::hint::black_box(acc);
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (av, bv) in a.iter().zip(b.iter()) {
+        acc |= av ^ bv;
+    }
+    acc == 0
 }
 
 fn html_escape(s: &str) -> String {
