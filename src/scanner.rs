@@ -833,6 +833,17 @@ impl BackgroundScanner {
         if active.is_empty() {
             return;
         }
+        // Liveness kick: with at least one active call, ask the
+        // publisher to refresh every settling cycle. The publisher's
+        // 30s burst-coalesce dedups so we don't fire git pushes more
+        // often than once every ~30-60s, but the site's pct_from_call
+        // / current_price_usd / peak_pct fields all stay close to
+        // real-time during a runner. Without this kick the site only
+        // updates on the 60s timer or call-state-change events, which
+        // is why holders watching a live pump felt the page was dead.
+        if let Some(ref n) = self.notifier {
+            n.kick_publisher();
+        }
         // Batch DexScreener fetch — one HTTP request for all active mints
         // instead of N serial per-call requests. Saves N-1 round-trips
         // every 15s; at 5 active calls that's 4 fewer HTTP calls per
@@ -908,6 +919,10 @@ impl BackgroundScanner {
                                         e
                                     );
                                 }
+                                // Kick the publisher so the site
+                                // shows the new live multiple within
+                                // seconds, in sync with the TG reply.
+                                notifier.kick_publisher();
                             }
                             Err(e) => {
                                 tracing::warn!(
