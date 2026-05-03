@@ -30,7 +30,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const WS_URL: &str = "wss://streaming.bitquery.io/graphql";
+/// Bitquery's EAP (early-access program) endpoint. The standard
+/// `/graphql` endpoint accepts HTTP queries but rejects WS upgrades
+/// for `Solana(network: solana)` realtime streams; `/eap` is the
+/// canonical streaming path.
+const WS_URL: &str = "wss://streaming.bitquery.io/eap";
 /// graphql-transport-ws — Bitquery's selected sub-protocol. The legacy
 /// `graphql-ws` (apollo) protocol is also accepted but uses different
 /// message types; we standardize on transport-ws for forward-compat.
@@ -142,19 +146,25 @@ async fn connect_and_subscribe(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static(SUBPROTOCOL),
     );
+    // Bitquery's WS upgrade authenticates via the HTTP Authorization
+    // header, NOT via connection_init payload (the older Apollo
+    // subscriptions-transport-ws style). Without this header the
+    // upgrade returns 401 before the WS handshake completes.
+    let bearer = format!("Bearer {}", token);
+    req.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&bearer).context("auth header")?,
+    );
     let (ws, _resp) = connect_async(req).await.context("ws connect")?;
     let (mut writer, mut reader) = ws.split();
     health.is_connected.store(true, Ordering::Relaxed);
     tracing::info!("bitquery: connected, authenticating");
 
     // graphql-transport-ws: client must send connection_init first.
+    // Payload is empty since auth already happened on the HTTP upgrade.
     let init = serde_json::json!({
         "type": "connection_init",
-        "payload": {
-            "headers": {
-                "Authorization": format!("Bearer {}", token),
-            }
-        }
+        "payload": {}
     });
     writer
         .send(Message::Text(init.to_string()))
