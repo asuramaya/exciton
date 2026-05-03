@@ -841,11 +841,16 @@ impl Publisher {
         // interesting outcomes:
         //   - CALL FIRED: always (we just opened a position — that's news)
         //   - CALL WITHDREW: only if exit_pct >= +25% (real win)
-        //   - CALL FAILED: only if exit_pct <= -25% (real loss, not a wick)
+        //   - CALL FAILED: only if exit_pct <= -35% (severe loss only)
+        //     AND additionally capped at 3 entries — the feed is a
+        //     story, not a graveyard. Without the cap, even a tightened
+        //     threshold left half the slot full of red.
         //   - CALL EXPIRED: dropped entirely (timeouts are zero-signal)
         // exit_pct extracted from the leading "+X.X%" / "-X.X%" of
         // exit_note. When extraction fails we keep the event (don't
         // silently swallow data we can't parse).
+        const MAX_FAILED_IN_FEED: usize = 3;
+        let mut failed_kept = 0usize;
         if let Ok(rows) = self.db.list_calls(false, 25) {
             for c in rows {
                 let sym = if c.symbol.is_empty() {
@@ -875,11 +880,17 @@ impl Publisher {
                         let exit_pct = exit_pct_from_note(&exit_note);
                         let interesting = match c.status.as_str() {
                             "withdrew" | "closed" => exit_pct.map_or(true, |p| p >= 25.0),
-                            "failed" => exit_pct.map_or(true, |p| p <= -25.0),
+                            "failed" => exit_pct.map_or(true, |p| p <= -35.0),
                             _ => true,
                         };
                         if !interesting {
                             continue;
+                        }
+                        if c.status == "failed" {
+                            if failed_kept >= MAX_FAILED_IN_FEED {
+                                continue;
+                            }
+                            failed_kept += 1;
                         }
                         let tag_str = match c.status.as_str() {
                             "withdrew" => "CALL WITHDREW",
