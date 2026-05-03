@@ -1056,7 +1056,13 @@ impl BackgroundScanner {
             // (basically pinned at the -30 stop on losers). 11 of 19 hit
             // scalp stop at -30. Tightening 5pp cuts loss-per-fire while
             // keeping the take ladders identical.
-            let default_stop_for_horizon = if is_moonshot { -25.0 }
+            //
+            // 2026-05-03 — moonshot stop -25 → -20. 24h cohort showed 11
+            // medium losses averaging -33% realized (8pp slippage tail
+            // past the -25 stop). Tighter trigger lets the confirmation
+            // gate fire earlier; saves ~5pp per loss × 11 = 55% sum
+            // even if each loss still picks up the same slippage tail.
+            let default_stop_for_horizon = if is_moonshot { -20.0 }
                 else if is_scalp { -25.0 }
                 else if is_long { -50.0 }
                 else { -40.0 };
@@ -1132,9 +1138,33 @@ impl BackgroundScanner {
                 None
             };
 
+            // Severe-collapse fast-path. Bypass the trail-confirmation
+            // gate when the move is deep enough that a single-wick
+            // recovery would still leave us underwater. Catches the
+            // -73% avg "large loss" tail (DOOPLICATE -51, MOG -50, etc.)
+            // — where the moonshot stop fired AT -25 but slippage gave
+            // us a -50 fill, so an additional cycle of "wait for
+            // confirmation" just bleeds 8 more pp. Scoped to active
+            // calls past -45% AND age >= 60s (don't react to a
+            // first-cycle wick on a brand-new fresh-mint call where
+            // settle latency between PumpPortal price and DexScreener
+            // can shake out anyway).
+            let severe_collapse_exit: Option<(&'static str, String)> =
+                if pct <= -45.0 && age >= 60 {
+                    Some(("failed", format!("{:+.1}% · severe collapse", pct)))
+                } else {
+                    None
+                };
+
             // Outcome decision: returns (action, status_str, exit_note).
             // Action determines which DB call + which TG outcome string.
             let outcome: Option<(&'static str, String)> = if let Some(e) = event_exit {
+                Some(e)
+            } else if let Some(e) = severe_collapse_exit {
+                // Bypass trail_exit / horizon ladders for collapse fast-fail
+                // — the position is already past where the trail would
+                // have caught it; another cycle of "wait for confirmation"
+                // just locks in extra bleed.
                 Some(e)
             } else if let Some(e) = trail_exit {
                 Some(e)
@@ -1634,11 +1664,14 @@ impl BackgroundScanner {
 /// retraced 30-50% off peak before recovering or rugging, so each tier
 /// captures roughly half of the prior tier's gain.
 ///
-/// 2026-05-02 PM tune — strategy review of 83 terminal calls. Peak band
-/// 30-50% had 4/13 wins, mean realized -25.7%; six positions hit the
-/// breakeven floor at +0% with peaks +22-42% (gave back the entire
-/// run). Inserted a +30→+10 tier so tokens that printed a real green
-/// but retraced lock in a small win instead of going flat.
+/// 2026-05-03 tune — review of 24h cohort post-fakeout-fix showed 6 of 7
+/// non-moonshot wins exiting flat (avg +13%). Root cause: the +20→0
+/// breakeven floor accepts any retrace from +20-30% peak as "free ride"
+/// and exits at exactly 0. Tightening: insert a +15→+5 floor so any
+/// peak >+15 locks at least +5%, and bump +30→+15 (was +10) so
+/// real-green retraces realize a meaningful win instead of a token
+/// gain. Removed +20→0 tier — the new +15→+5 covers the same band but
+/// captures rather than zeroes.
 fn trailing_stop_floor(peak_pct: f64, default_stop: f64) -> f64 {
     if peak_pct >= 400.0 {
         200.0
@@ -1649,13 +1682,16 @@ fn trailing_stop_floor(peak_pct: f64, default_stop: f64) -> f64 {
     } else if peak_pct >= 50.0 {
         25.0
     } else if peak_pct >= 30.0 {
-        // Capture-the-green tier — peak +30 means the call printed real
-        // upside; lock in +10 so a retrace doesn't deliver a flat exit.
-        10.0
-    } else if peak_pct >= 20.0 {
-        // Breakeven floor — once the position has gained 20% it can never
-        // be closed below entry. The "free ride" threshold.
-        0.0
+        // Capture-the-green tier — was +10, bumped to +15. The 24h
+        // cohort showed peaks 30-50% retracing past +10 to ~+0; the
+        // tighter +15 floor catches them earlier in the descent.
+        15.0
+    } else if peak_pct >= 15.0 {
+        // New tier — replaces the old +20→0 breakeven floor. A peak
+        // of +15-30% is real green; locking +5 instead of 0 cuts the
+        // "exit flat" tail. Six 24h fires would have realized +5
+        // instead of 0 = +30% sum recovered.
+        5.0
     } else {
         default_stop
     }
