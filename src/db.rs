@@ -1874,6 +1874,36 @@ impl Db {
         Ok(())
     }
 
+    /// Count snapshots in the last `lookback_secs` whose classification
+    /// is one of the terminal sentinel classes (ACTIVE_TRAP, CRASHING,
+    /// DEAD, UNSAFE_*). Used by the event-exit confirmation gate to
+    /// distinguish a single-tick flip (likely fakeout — token bounces
+    /// next cycle) from a sustained terminal state (real collapse).
+    /// Excludes the latest tick (window ends 15s before now) so the
+    /// triggering snapshot itself doesn't self-confirm.
+    pub fn count_recent_terminal_class(
+        &self,
+        token_address: &str,
+        lookback_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let lo = now - lookback_secs;
+        let hi = now - 15;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM token_snapshots
+             WHERE token_address = ?1
+               AND timestamp BETWEEN ?2 AND ?3
+               AND (classification = 'ACTIVE_TRAP'
+                    OR classification = 'CRASHING'
+                    OR classification = 'DEAD'
+                    OR classification LIKE 'UNSAFE%')",
+            params![token_address, lo, hi],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Free-text call lookup. `query` matches against `symbol`
     /// case-insensitively (substring) and exact-match against `mint`. Useful
     /// for ad-hoc post-mortems via the MCP `db_call_lookup` tool — the same

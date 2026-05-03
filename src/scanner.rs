@@ -993,6 +993,28 @@ impl BackgroundScanner {
                 })
                 .unwrap_or(false);
 
+            // Terminal-class confirmation gate. Both GAY (-30%, recovered
+            // to +13%) and ROCK (-34%, recovered to +2.4%) closed via
+            // event-exit on a single-tick ACTIVE_TRAP/CRASHING flip
+            // 2026-05-03 — same shape as the BUTT trail-stop fakeout we
+            // patched earlier, just on the event-exit path. Require at
+            // least 2 terminal-class snapshots in the last 5 minutes
+            // before honoring terminal_class as exit-eligible. Single
+            // wicks bounce; sustained terminal state is real. Severe
+            // dev_selling alerts (deployer rug-pattern at >=90 conf) are
+            // excluded — those need fast exit and shouldn't wait for a
+            // confirming tick. Severe-collapse fast-fail (-45% / age
+            // >=60s) earlier in the loop already handles deep dumps.
+            let terminal_confirmed = if terminal_class {
+                let n = self
+                    .db
+                    .count_recent_terminal_class(&call.mint, 300)
+                    .unwrap_or(0);
+                n >= 1 // at least one PRIOR terminal tick (now-snap excluded by helper)
+            } else {
+                false
+            };
+
             // Event-exit gating is horizon-aware. Goblin (LONG, called
             // 2026-05-01) closed at -3.6% in 17min only because classification
             // flipped — peak +0.5%, trough -5.4%. LONG horizon is supposed to
@@ -1008,14 +1030,14 @@ impl BackgroundScanner {
                 // close. Lets the take/stop ladder own normal volatility.
                 if severe_dev_selling && pct <= -20.0 {
                     Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
-                } else if terminal_class && pct <= -20.0 {
+                } else if terminal_class && terminal_confirmed && pct <= -20.0 {
                     Some(("failed", format!("{:+.1}% · structural collapse", pct)))
                 } else {
                     None
                 }
             } else if severe_dev_selling {
                 Some(("failed", format!("{:+.1}% · severe dev exit", pct)))
-            } else if terminal_class {
+            } else if terminal_class && terminal_confirmed {
                 if is_scalp {
                     Some(("failed", format!("{:+.1}% · structural collapse", pct)))
                 } else if pct <= -10.0 {
