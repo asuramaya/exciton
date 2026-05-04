@@ -269,6 +269,12 @@ pub struct TelegramConfig {
     /// Leave empty to omit the link entirely. Example: `https://example.com`.
     #[serde(default)]
     pub public_url: String,
+
+    /// Chat ID for evolution events (committed self-changes from the
+    /// agent: strategy tunes, prompt rewrites, site changes). When
+    /// empty, falls back to ops_chat_id. The agent's diary broadcast.
+    #[serde(default)]
+    pub evolution_chat_id: String,
 }
 
 fn default_claw_port() -> u16 {

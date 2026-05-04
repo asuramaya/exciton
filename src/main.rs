@@ -85,6 +85,10 @@ async fn main() -> Result<()> {
         tg_cfg.anthropic_api_key = ingester::resolve_env_vars(&tg_cfg.anthropic_api_key);
         tg_cfg.openai_api_key = ingester::resolve_env_vars(&tg_cfg.openai_api_key);
         tg_cfg.claw_api_secret = ingester::resolve_env_vars(&tg_cfg.claw_api_secret);
+        tg_cfg.evolution_chat_id = ingester::resolve_env_vars(&tg_cfg.evolution_chat_id);
+        if tg_cfg.evolution_chat_id.trim().is_empty() {
+            tg_cfg.evolution_chat_id = tg_cfg.ops_chat_id.clone();
+        }
     }
     if let Some(mp) = config.madapes.as_mut() {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
@@ -565,7 +569,7 @@ async fn main() -> Result<()> {
     let mcp_transport = std::env::var("PHOTON_MCP_TRANSPORT")
         .unwrap_or_else(|_| "http".to_string())
         .to_lowercase();
-    let mcp_port: u16 = std::env::var("PHOTON_MCP_PORT")
+    let mcp_port: u16 = std::env::var("EXCITON_MCP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8082);
@@ -590,7 +594,7 @@ async fn main() -> Result<()> {
         service.waiting().await?;
     } else {
         // HTTP mode — runs the MCP server as an axum service on
-        // PHOTON_MCP_PORT (default 8082) at the `/mcp` path. The
+        // EXCITON_MCP_PORT (default 8082) at the `/mcp` path. The
         // daemon (scanner/settling/publisher) keeps running because
         // we spawn the listener as a background task and then wait
         // for shutdown signal as before.
@@ -615,16 +619,16 @@ async fn main() -> Result<()> {
             rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default(),
         );
 
-        // Optional bearer-token gate. When PHOTON_MCP_TOKEN is set,
+        // Optional bearer-token gate. When EXCITON_MCP_TOKEN is set,
         // every /mcp request must carry `Authorization: Bearer <token>`
         // matching it (constant-time compared). When unset, the
         // service runs unauthenticated — only safe behind a loopback
         // bind or trusted Docker network. /health bypasses the gate
         // so monitoring stays simple.
-        let mcp_token = std::env::var("PHOTON_MCP_TOKEN").unwrap_or_default();
+        let mcp_token = std::env::var("EXCITON_MCP_TOKEN").unwrap_or_default();
         if mcp_token.is_empty() {
             tracing::warn!(
-                "MCP bearer auth DISABLED — set PHOTON_MCP_TOKEN to require Authorization header"
+                "MCP bearer auth DISABLED — set EXCITON_MCP_TOKEN to require Authorization header"
             );
         } else {
             tracing::info!("MCP bearer auth enabled");

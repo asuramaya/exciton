@@ -208,6 +208,102 @@ pub struct TradeParams {
     pub confirmed: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposeTuneParams {
+    /// Field to override. Must be in the tunable allow-list — see
+    /// `tunable_fields` doc on the server. Examples:
+    /// "min_effective_confidence", "max_top_holder_pct",
+    /// "min_liquidity_usd", "min_volume_24h_usd", "min_token_age_secs".
+    pub field: String,
+    /// Scope of the override. "global" or "class:STAIRCASE" /
+    /// "class:GRINDER" / "class:SPRING". Per-class scope only valid
+    /// for fields that support it.
+    pub scope: String,
+    /// Current value (stringified). For numeric fields, the agent passes
+    /// the integer or float as a string. The server validates type.
+    pub old_value: String,
+    /// Proposed new value (stringified). Must parse to the same type as
+    /// old_value. Validators check effect-size and holdout against the
+    /// evidence the agent supplies.
+    pub new_value: String,
+    /// Required: evidence_json must contain `current` and `proposed`
+    /// objects each with `n` and `mean_pnl_pct` (and ideally
+    /// `win_rate_pct`), plus a `holdout` object with `n` and
+    /// `mean_pnl_pct`. Validators reject anything missing these.
+    pub evidence_json: String,
+    /// Trader-voice 3-4 sentence narrative explaining what changed and
+    /// why. Goes into the diary entry verbatim. Must be non-empty and
+    /// not a placeholder.
+    pub narrative: String,
+    /// Identifier of the proposing agent — "claw" by default; operator
+    /// proposals (manual MCP calls from a human) should pass "operator".
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitTuneParams {
+    /// Proposal id returned by propose_tune. Must be in `pending` status.
+    pub proposal_id: i64,
+    /// Agent-authored markdown for the public diary entry. The renderer
+    /// validates structure (non-empty, must include the narrative + an
+    /// evidence section) but does NOT enforce a fixed template — voice
+    /// is whatever the agent's prompt produces. Length bounded to
+    /// 200..=4000 characters.
+    pub body_md: String,
+    /// Optional one-line headline for the diary entry. When omitted,
+    /// `record_evolution` derives one from field/old/new.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTunesParams {
+    /// Filter by status: "pending" | "committed" | "rejected" | "reverted".
+    /// None = all.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Cap on rows returned. Default 50, max 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RevertTuneParams {
+    /// Proposal id to revert. Must be in `committed` status. Deletes the
+    /// matching signal_overrides row (so should_signal falls back to
+    /// the compile-time default) and marks the proposal `reverted`.
+    pub proposal_id: i64,
+    /// Why the revert is happening. Goes into the audit log. Required.
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeOutcomesParams {
+    /// Optional classification filter (e.g. "STAIRCASE", "GRINDER", "SPRING").
+    /// None = all classifications.
+    #[serde(default)]
+    pub classification: Option<String>,
+    /// Optional horizon filter (SHORT | LONG | MOONSHOT | SCALP).
+    /// None = all horizons.
+    #[serde(default)]
+    pub horizon: Option<String>,
+    /// Earliest called_at to include (epoch seconds). None = unlimited
+    /// history. The agent typically passes `now - 30d`.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// When true, the response includes the raw call list (capped by `limit`)
+    /// in addition to the bucketed aggregates. Useful when the agent wants
+    /// to cite specific calls in its narrative. Default false to keep the
+    /// payload compact.
+    #[serde(default)]
+    pub include_raw: bool,
+    /// Cap on raw rows returned when `include_raw` is true. Default 50,
+    /// max 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
 // -- Response types --
 
 #[derive(Debug, Serialize)]
@@ -1995,6 +2091,776 @@ impl ExcitonServer {
             message,
         })
     }
+
+    /// Read-only outcome analyzer. Pulls closed calls (withdrew / failed /
+    /// expired / closed), groups by (classification, horizon), returns
+    /// per-bucket aggregates: count, win-rate, PnL distribution, hold time,
+    /// verdict breakdown. The agent's primary input when proposing a
+    /// strategy tune.
+    ///
+    /// Output structure:
+    /// ```text
+    /// {
+    ///   "since": <i64>,
+    ///   "raw_count": <usize>,
+    ///   "aggregates": [
+    ///     { "classification": "STAIRCASE", "horizon": "SHORT",
+    ///       "n": 14, "win_rate_pct": 42.8, "mean_pnl_pct": 3.2,
+    ///       "median_pnl_pct": -10.5, "p25_pnl_pct": -28.1,
+    ///       "p75_pnl_pct": 12.4, "mean_hold_secs": 4231,
+    ///       "verdicts": { "withdrew": 6, "failed": 5, "expired": 3 } },
+    ///     ...
+    ///   ],
+    ///   "outcomes": [...]   // present only when include_raw = true
+    /// }
+    /// ```
+    ///
+    /// Win rate is `withdrew / n`. PnL stats ignore rows missing exit_price.
+    /// Buckets with n < 1 are omitted.
+    #[tool]
+    async fn analyze_outcomes(
+        &self,
+        Parameters(params): Parameters<AnalyzeOutcomesParams>,
+    ) -> String {
+        let class = params.classification.as_deref();
+        let horizon = params.horizon.as_deref();
+        let since = params.since;
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        // Pull a generous slice — bucketing happens here; cap at 5000 to
+        // avoid degenerate full-table scans on giant DBs.
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class, horizon, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+
+        let _ = self.db.audit_log(
+            "claude",
+            "analyze_outcomes",
+            &format!(
+                "class={} horizon={} since={} n={}",
+                class.unwrap_or("*"),
+                horizon.unwrap_or("*"),
+                since.map(|s| s.to_string()).unwrap_or_else(|| "*".into()),
+                outcomes.len()
+            ),
+        );
+
+        // Group by (classification, horizon) into ordered buckets. We use a
+        // BTreeMap so the output is deterministic across calls.
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<(String, String), Vec<&crate::db::CallOutcome>> = BTreeMap::new();
+        for o in &outcomes {
+            buckets
+                .entry((o.classification.clone(), o.horizon.clone()))
+                .or_default()
+                .push(o);
+        }
+
+        let aggregates: Vec<serde_json::Value> = buckets
+            .into_iter()
+            .map(|((classification, horizon), rows)| {
+                let n = rows.len() as i64;
+                let mut pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+                pnls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let pct = |p: f64| -> Option<f64> {
+                    if pnls.is_empty() {
+                        None
+                    } else {
+                        let i = ((pnls.len() as f64 - 1.0) * p).round() as usize;
+                        pnls.get(i).copied()
+                    }
+                };
+                let median = pct(0.50);
+                let p25 = pct(0.25);
+                let p75 = pct(0.75);
+
+                let win_count = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+                let win_rate = if n > 0 {
+                    100.0 * win_count as f64 / n as f64
+                } else {
+                    0.0
+                };
+
+                let holds: Vec<i64> = rows.iter().filter_map(|r| r.hold_secs).collect();
+                let mean_hold = if holds.is_empty() {
+                    None
+                } else {
+                    Some(holds.iter().sum::<i64>() / holds.len() as i64)
+                };
+
+                let mut verdicts: BTreeMap<&str, i64> = BTreeMap::new();
+                for r in &rows {
+                    *verdicts.entry(r.status.as_str()).or_insert(0) += 1;
+                }
+
+                serde_json::json!({
+                    "classification": classification,
+                    "horizon": horizon,
+                    "n": n,
+                    "win_rate_pct": round2(win_rate),
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "median_pnl_pct": median.map(round2),
+                    "p25_pnl_pct": p25.map(round2),
+                    "p75_pnl_pct": p75.map(round2),
+                    "mean_hold_secs": mean_hold,
+                    "verdicts": verdicts,
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "since": since,
+            "raw_count": outcomes.len(),
+            "aggregates": aggregates,
+        });
+        if params.include_raw {
+            let raw: Vec<&crate::db::CallOutcome> = outcomes.iter().take(limit as usize).collect();
+            payload["outcomes"] = serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null);
+        }
+        payload.to_string()
+    }
+
+    /// Propose a strategy tune. Server-side validators reject anything
+    /// that fails: allow-list field, parseable value, n ≥ 10, effect
+    /// size ≥ EFFECT_FLOOR_PCT, holdout non-negative, narrative present.
+    /// Returns the proposal id on success or an error JSON on rejection.
+    /// Pending proposals do NOT take effect — the agent must follow up
+    /// with commit_tune to activate.
+    #[tool]
+    async fn propose_tune(
+        &self,
+        Parameters(params): Parameters<ProposeTuneParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+
+        if let Err(e) = validate_field_scope(&params.field, &params.scope) {
+            return reject_proposal("invalid_field_or_scope", &e);
+        }
+        if let Err(e) = validate_field_value(&params.field, &params.new_value) {
+            return reject_proposal("invalid_new_value", &e);
+        }
+        if let Err(e) = validate_field_value(&params.field, &params.old_value) {
+            return reject_proposal("invalid_old_value", &e);
+        }
+        if params.narrative.trim().len() < 40 {
+            return reject_proposal(
+                "narrative_too_short",
+                "narrative must be ≥ 40 chars; supply 3-4 trader-voice sentences",
+            );
+        }
+
+        let evidence: serde_json::Value = match serde_json::from_str(&params.evidence_json) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("evidence_json_invalid", &e.to_string()),
+        };
+
+        let n = match evidence["current"]["n"].as_i64() {
+            Some(v) if v >= EVIDENCE_FLOOR => v,
+            Some(v) => {
+                return reject_proposal(
+                    "insufficient_evidence",
+                    &format!("current.n = {} < floor of {}", v, EVIDENCE_FLOOR),
+                )
+            }
+            None => return reject_proposal("missing_current_n", "evidence.current.n required"),
+        };
+
+        let cur_pnl = match evidence["current"]["mean_pnl_pct"].as_f64() {
+            Some(v) => v,
+            None => {
+                return reject_proposal(
+                    "missing_current_pnl",
+                    "evidence.current.mean_pnl_pct required",
+                )
+            }
+        };
+        let prop_pnl = match evidence["proposed"]["mean_pnl_pct"].as_f64() {
+            Some(v) => v,
+            None => {
+                return reject_proposal(
+                    "missing_proposed_pnl",
+                    "evidence.proposed.mean_pnl_pct required",
+                )
+            }
+        };
+        let effect = prop_pnl - cur_pnl;
+        if effect < EFFECT_FLOOR_PCT {
+            return reject_proposal(
+                "insufficient_effect_size",
+                &format!(
+                    "proposed mean PnL improvement {:.2}% < floor of {:.1}%",
+                    effect, EFFECT_FLOOR_PCT
+                ),
+            );
+        }
+
+        let holdout_n = evidence["holdout"]["n"].as_i64().unwrap_or(0);
+        let holdout_pnl = evidence["holdout"]["mean_pnl_pct"].as_f64();
+        if holdout_n < 1 {
+            return reject_proposal(
+                "missing_holdout",
+                "evidence.holdout.n must be ≥ 1 — show the proposed setup beats current on a recent slice",
+            );
+        }
+        if let Some(h) = holdout_pnl {
+            if h < 0.0 {
+                return reject_proposal(
+                    "holdout_negative",
+                    &format!("holdout mean PnL {:.2}% < 0; proposed setup loses on the recent slice", h),
+                );
+            }
+        }
+
+        let new_proposal = crate::db::NewTuneProposal {
+            proposed_at: now,
+            proposed_by: params
+                .proposed_by
+                .clone()
+                .unwrap_or_else(|| "claw".to_string()),
+            field: params.field.clone(),
+            scope: params.scope.clone(),
+            old_value: params.old_value.clone(),
+            new_value: params.new_value.clone(),
+            sample_size: n,
+            effect_size: Some(round2(effect)),
+            holdout_metric: holdout_pnl.map(round2),
+            evidence_json: params.evidence_json.clone(),
+            narrative: params.narrative.clone(),
+        };
+        let id = match self.db.insert_tune_proposal(&new_proposal) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "propose_tune",
+            &format!(
+                "id={} field={} scope={} {} → {} effect={:+.2}% n={}",
+                id, params.field, params.scope, params.old_value, params.new_value, effect, n
+            ),
+        );
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": id,
+            "status": "pending",
+            "field": params.field,
+            "scope": params.scope,
+            "effect_size_pct": round2(effect),
+            "sample_size": n,
+            "next_step": "call commit_tune(proposal_id, body_md) to activate + post the diary entry"
+        })
+        .to_string()
+    }
+
+    /// Commit a pending proposal — writes the signal_overrides row that
+    /// makes the change effective for future scan cycles, and creates an
+    /// evolution_events row with the agent-authored body_md. Channel post
+    /// + diary file write happen here too once Phase A4 is wired in.
+    #[tool]
+    async fn commit_tune(
+        &self,
+        Parameters(params): Parameters<CommitTuneParams>,
+    ) -> String {
+        let proposal = match self.db.get_tune_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "pending" {
+            return reject_proposal(
+                "not_pending",
+                &format!(
+                    "proposal {} is in status '{}', cannot commit",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+        // Soft structural check: the body must reference the change
+        // (old or new value, or the field name) so the diary entry isn't
+        // disconnected from the proposal it narrates.
+        let body_lc = body.to_lowercase();
+        if !body_lc.contains(&proposal.field.to_lowercase())
+            && !body.contains(&proposal.old_value)
+            && !body.contains(&proposal.new_value)
+        {
+            return reject_proposal(
+                "body_md_disconnected",
+                "body_md must reference either the field name, old_value, or new_value",
+            );
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self.db.upsert_signal_override(
+            &proposal.field,
+            &proposal.scope,
+            &proposal.new_value,
+            now,
+            Some(proposal.id),
+        ) {
+            return reject_proposal("db_error_override", &e.to_string());
+        }
+
+        let summary = params.summary.unwrap_or_else(|| {
+            format!(
+                "{} ({}): {} → {}",
+                proposal.field, proposal.scope, proposal.old_value, proposal.new_value
+            )
+        });
+        let evo_id = match self.db.insert_evolution_event(
+            "strategy",
+            &summary,
+            body,
+            Some(&proposal.evidence_json),
+            Some(proposal.id),
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+
+        if let Err(e) = self.db.update_proposal_status(
+            proposal.id,
+            "committed",
+            "claw",
+            now,
+            None,
+            Some(evo_id),
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_tune",
+            &format!(
+                "id={} field={} scope={} new_value={} evo_id={}",
+                proposal.id, proposal.field, proposal.scope, proposal.new_value, evo_id
+            ),
+        );
+
+        // Broadcast: post to evolution channel + write markdown to the
+        // publisher's thoughts dir + git push. Failures here are NON-fatal
+        // — the evolution row is already in DB, so the website diary will
+        // pick it up on the next sync, and a channel re-post can be done
+        // manually by reading the row.
+        let publish = self
+            .publish_evolution(evo_id, "STRATEGY", &summary, body)
+            .await;
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "evolution_event_id": evo_id,
+            "status": "committed",
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
+    /// List tune proposals, optionally filtered by status. Returns the
+    /// full proposal records (status, sample_size, effect_size, etc.)
+    /// so the agent can audit its own history before proposing again.
+    #[tool]
+    async fn list_tunes(
+        &self,
+        Parameters(params): Parameters<ListTunesParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        let rows = match self.db.list_tune_proposals(params.status.as_deref(), limit) {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        serde_json::json!({
+            "ok": true,
+            "count": rows.len(),
+            "proposals": rows
+        })
+        .to_string()
+    }
+
+    /// Revert a previously-committed proposal. Deletes the matching
+    /// signal_overrides row (gate falls back to compile-time default)
+    /// and marks the proposal `reverted` with a reason. Does NOT
+    /// auto-fire an evolution event — the agent should narrate the
+    /// revert with a fresh propose+commit cycle if it wants the diary
+    /// to record it.
+    #[tool]
+    async fn revert_tune(
+        &self,
+        Parameters(params): Parameters<RevertTuneParams>,
+    ) -> String {
+        let reason = params.reason.trim();
+        if reason.len() < 20 {
+            return reject_proposal(
+                "reason_too_short",
+                "reason must be ≥ 20 chars — explain why the override is being removed",
+            );
+        }
+        let proposal = match self.db.get_tune_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "committed" {
+            return reject_proposal(
+                "not_committed",
+                &format!(
+                    "proposal {} is '{}', not 'committed' — only committed tunes can be reverted",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+        if let Err(e) = self.db.delete_signal_override(&proposal.field, &proposal.scope) {
+            return reject_proposal("db_error_override", &e.to_string());
+        }
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self.db.update_proposal_status(
+            proposal.id,
+            "reverted",
+            "claw",
+            now,
+            Some(reason),
+            proposal.evolution_event_id,
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+        let _ = self.db.audit_log(
+            "claude",
+            "revert_tune",
+            &format!(
+                "id={} field={} scope={} reason={}",
+                proposal.id, proposal.field, proposal.scope, reason
+            ),
+        );
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "status": "reverted"
+        })
+        .to_string()
+    }
+
+    /// Internal helper — publishes a freshly-inserted evolution event to
+    /// the operator's surfaces (Telegram channel + publisher diary). All
+    /// failures are non-fatal; the evolution row already lives in DB and
+    /// can be re-published manually from the operator surface. Returns a
+    /// JSON value the caller surfaces to the agent so it can see the
+    /// fan-out result.
+    async fn publish_evolution(
+        &self,
+        evo_id: i64,
+        kind_label: &str,
+        summary: &str,
+        body_md: &str,
+    ) -> serde_json::Value {
+        let mut channel_msg_id: Option<i64> = None;
+        let mut diary_path: Option<String> = None;
+        let mut errors: Vec<String> = Vec::new();
+        let now = chrono::Utc::now().timestamp();
+
+        // Telegram channel post — short HTML preview + link to diary.
+        if let Some(tg) = &self.config.telegram {
+            if tg.enabled && !tg.bot_token.is_empty() {
+                let chat_id = if !tg.evolution_chat_id.is_empty() {
+                    tg.evolution_chat_id.as_str()
+                } else if !tg.ops_chat_id.is_empty() {
+                    tg.ops_chat_id.as_str()
+                } else {
+                    ""
+                };
+                if !chat_id.is_empty() {
+                    let preview = body_md
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let preview = html_escape_basic(&preview);
+                    let link = if !tg.public_url.is_empty() {
+                        format!(
+                            "\n\n📜 <a href=\"{}/#diary={}\">full diary entry</a>",
+                            tg.public_url.trim_end_matches('/'),
+                            evo_id
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let text = format!(
+                        "🧬 <b>EVOLVED — {kind}</b> · {summary_html}\n\n{preview}{link}",
+                        kind = kind_label,
+                        summary_html = html_escape_basic(summary),
+                    );
+                    let url = format!(
+                        "https://api.telegram.org/bot{}/sendMessage",
+                        tg.bot_token
+                    );
+                    let resp = self
+                        .http
+                        .post(&url)
+                        .form(&[
+                            ("chat_id", chat_id),
+                            ("text", text.as_str()),
+                            ("parse_mode", "HTML"),
+                            ("disable_web_page_preview", "true"),
+                        ])
+                        .send()
+                        .await;
+                    match resp {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) if v["ok"].as_bool() == Some(true) => {
+                                channel_msg_id = v["result"]["message_id"].as_i64();
+                            }
+                            Ok(v) => errors.push(format!("telegram: {}", v)),
+                            Err(e) => errors.push(format!("telegram parse: {}", e)),
+                        },
+                        Err(e) => errors.push(format!("telegram post: {}", e)),
+                    }
+                }
+            }
+        }
+
+        // Diary file write + git push to the publisher repo.
+        if let Some(mp) = self.config.madapes.clone() {
+            if mp.enabled && !mp.repo_path.is_empty() {
+                let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let slug = slugify(summary);
+                let file = format!("{}_evo-{}-{}.md", date, kind_label.to_lowercase(), slug);
+                let thoughts_dir = std::path::PathBuf::from(&mp.repo_path).join("thoughts");
+                if let Err(e) = std::fs::create_dir_all(&thoughts_dir) {
+                    errors.push(format!("diary mkdir: {}", e));
+                } else {
+                    let path = thoughts_dir.join(&file);
+                    let title = format!("EVOLVED — {kind_label} · {summary}");
+                    let frontmatter = format!(
+                        "---\nkind: evolution\ncategory: {}\ndate: {}\nevolution_event_id: {}\ntitle: {}\n---\n\n",
+                        kind_label.to_lowercase(),
+                        date,
+                        evo_id,
+                        title
+                    );
+                    let contents = format!("{}{}\n", frontmatter, body_md);
+                    if let Err(e) = std::fs::write(&path, &contents) {
+                        errors.push(format!("diary write: {}", e));
+                    } else {
+                        diary_path = Some(format!("thoughts/{}", file));
+                        // Update index.json so the front end picks it up.
+                        let index_path = thoughts_dir.join("index.json");
+                        let mut index_val: serde_json::Value = std::fs::read_to_string(&index_path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_else(|| serde_json::json!({"thoughts": []}));
+                        if let Some(arr) =
+                            index_val.get_mut("thoughts").and_then(|v| v.as_array_mut())
+                        {
+                            arr.insert(
+                                0,
+                                serde_json::json!({
+                                    "date": date,
+                                    "file": file,
+                                    "title": title,
+                                    "kind": "evolution",
+                                    "category": kind_label.to_lowercase(),
+                                }),
+                            );
+                        }
+                        let _ = std::fs::write(
+                            &index_path,
+                            serde_json::to_string_pretty(&index_val).unwrap_or_default(),
+                        );
+                        let repo = &mp.repo_path;
+                        let msg = format!("evo: {kind_label} · {summary}");
+                        let _ = run_git_with_timeout(&["-C", repo, "add", "thoughts/"]).await;
+                        let commit =
+                            run_git_with_timeout(&["-C", repo, "commit", "-m", &msg]).await;
+                        let committed =
+                            commit.as_ref().map(|o| o.status.success()).unwrap_or(false);
+                        if committed {
+                            let _ = run_git_with_timeout(&["-C", repo, "push", "--quiet"]).await;
+                        } else if let Ok(out) = commit {
+                            errors.push(format!(
+                                "diary commit non-zero: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = self.db.update_evolution_posted(
+            evo_id,
+            now,
+            channel_msg_id,
+            diary_path.as_deref(),
+        ) {
+            errors.push(format!("db update: {}", e));
+        }
+
+        serde_json::json!({
+            "channel_msg_id": channel_msg_id,
+            "diary_path": diary_path,
+            "errors": errors,
+        })
+    }
+}
+
+/// Minimal HTML escape for the Telegram preview body. Telegram parses a
+/// small HTML subset; we only need to neutralize `< > &` to prevent the
+/// agent's markdown from breaking the bot's <b>/<a> tags.
+fn html_escape_basic(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// ── autonomy support: validators + constants ──────────────────────────
+
+/// Hardcoded floor on closed-call sample size in the agent's evidence.
+/// Anything below this is "noise pretending to be a pattern" and gets
+/// rejected with `insufficient_evidence`. Lifting the floor requires
+/// a code change — by design.
+pub const EVIDENCE_FLOOR: i64 = 10;
+
+/// Minimum mean-PnL improvement (proposed - current) required for a
+/// proposal to pass the effect-size validator. Defaults to 5%.
+pub const EFFECT_FLOOR_PCT: f64 = 5.0;
+
+const BODY_MD_MIN: usize = 200;
+const BODY_MD_MAX: usize = 4000;
+
+/// Validates that (field, scope) is in the tunable allow-list. Adding a
+/// new tunable requires editing this map AND wiring it into should_signal
+/// (Phase A5). Until both are done, the agent gets `invalid_field_or_scope`
+/// — preventing the agent from inventing fields the runtime won't honor.
+fn validate_field_scope(field: &str, scope: &str) -> Result<(), String> {
+    let per_class_ok = matches!(
+        scope,
+        "global" | "class:STAIRCASE" | "class:GRINDER" | "class:SPRING"
+    );
+    let global_only_ok = scope == "global";
+    match field {
+        "min_effective_confidence" | "max_top_holder_pct" => {
+            if !per_class_ok {
+                return Err(format!(
+                    "field '{}' supports scope 'global' or 'class:STAIRCASE|GRINDER|SPRING' (got '{}')",
+                    field, scope
+                ));
+            }
+        }
+        "min_liquidity_usd" | "min_volume_24h_usd" | "min_token_age_secs" => {
+            if !global_only_ok {
+                return Err(format!(
+                    "field '{}' supports scope 'global' only (got '{}')",
+                    field, scope
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "field '{}' is not in the tunable allow-list. Allowed: \
+                 min_effective_confidence, max_top_holder_pct, \
+                 min_liquidity_usd, min_volume_24h_usd, min_token_age_secs",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates that `value` parses to the expected type for `field`. The
+/// agent passes everything as strings; we coerce here.
+fn validate_field_value(field: &str, value: &str) -> Result<(), String> {
+    match field {
+        "min_effective_confidence" => value
+            .parse::<i64>()
+            .map_err(|_| format!("'{}' is not a valid integer", value))
+            .and_then(|n| {
+                if (0..=100).contains(&n) {
+                    Ok(())
+                } else {
+                    Err(format!("expected 0..=100, got {}", n))
+                }
+            }),
+        "max_top_holder_pct" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                if (0.0..=100.0).contains(&x) {
+                    Ok(())
+                } else {
+                    Err(format!("expected 0.0..=100.0, got {}", x))
+                }
+            }),
+        "min_liquidity_usd" | "min_volume_24h_usd" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                if x >= 0.0 {
+                    Ok(())
+                } else {
+                    Err(format!("expected ≥ 0, got {}", x))
+                }
+            }),
+        "min_token_age_secs" => value
+            .parse::<i64>()
+            .map_err(|_| format!("'{}' is not a valid integer", value))
+            .and_then(|n| {
+                if n >= 0 {
+                    Ok(())
+                } else {
+                    Err(format!("expected ≥ 0, got {}", n))
+                }
+            }),
+        _ => Err(format!("no value validator for field '{}'", field)),
+    }
+}
+
+fn reject_proposal(code: &str, message: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": code,
+        "message": message
+    })
+    .to_string()
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 #[tool_handler]

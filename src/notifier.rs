@@ -85,6 +85,47 @@ pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 25.0;
 pub const SIGNAL_MAX_TOP10_PCT: f64 = 50.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
+
+/// Snapshot of `signal_overrides` rows, indexed for fast lookup. Built
+/// once per `should_signal` call. The lookup precedence is the caller's
+/// responsibility — typically per-class scope first, then global, then
+/// the compile-time default. Returning Option lets the caller chain
+/// `.or_else(|| ...)` cleanly.
+#[derive(Debug, Default)]
+struct SignalOverrideMap {
+    /// Keyed by `field|scope` for O(1) lookup.
+    entries: std::collections::HashMap<String, String>,
+}
+
+impl SignalOverrideMap {
+    fn from_db(db: &Db) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        if let Ok(rows) = db.list_signal_overrides() {
+            for (field, scope, value, _set_at) in rows {
+                entries.insert(format!("{}|{}", field, scope), value);
+            }
+        }
+        Self { entries }
+    }
+
+    fn get_str(&self, field: &str, scope: &str) -> Option<&str> {
+        self.entries
+            .get(&format!("{}|{}", field, scope))
+            .map(String::as_str)
+    }
+
+    fn get_i32(&self, field: &str, scope: &str) -> Option<i32> {
+        self.get_str(field, scope).and_then(|s| s.parse().ok())
+    }
+
+    fn get_i64(&self, field: &str, scope: &str) -> Option<i64> {
+        self.get_str(field, scope).and_then(|s| s.parse().ok())
+    }
+
+    fn get_f64(&self, field: &str, scope: &str) -> Option<f64> {
+        self.get_str(field, scope).and_then(|s| s.parse().ok())
+    }
+}
 // 2026-05-01 Bucket A: liquidity floor 50k → 20k. Backtest universe used
 // 15k floor; 20k adds a 33% safety margin while still capturing ~85% of
 // historical 5x+ runners (median entry liq $25-30k for that cohort).
@@ -789,6 +830,11 @@ impl Notifier {
         }
         let class = a.confidence.classification.as_str();
         let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
+        // Runtime override snapshot. Read once per call from
+        // signal_overrides — committed tunes from propose_tune/commit_tune
+        // land here without a restart. Empty map = pure compile-time
+        // defaults.
+        let overrides = SignalOverrideMap::from_db(&self.db);
         // Base global floor (currently 65). Per-class floors stack on top
         // — DB mining 2026-05-03 (92 closed calls, 14k near-misses) found:
         //   - STAIRCASE conf 70-75: 29 runners at 4.8:1 win/loss (ship)
@@ -796,15 +842,25 @@ impl Notifier {
         //   - GRINDER conf 65-69: 10 runners at 2.0:1 (ship)
         //   - DEVELOPING conf <60: 36 calls, 1 win, 12 large losses
         //     (-26.7% avg) → floor at 60.
-        let class_conf_floor: i32 = match class {
+        let default_class_floor: i32 = match class {
             "STAIRCASE" => 70,
             "GRINDER" => 65,
             "DEVELOPING" => 60,
             _ => 0,
         };
+        // Per-class override of class confidence floor; falls back to the
+        // hardcoded default when no override is committed for this class.
+        let class_conf_floor = overrides
+            .get_i32("min_effective_confidence", &format!("class:{}", class))
+            .unwrap_or(default_class_floor);
         let conf_ok = effective_conf >= self.signal_threshold()
             && effective_conf >= class_conf_floor;
-        let holder_ok = a.top_holder_pct < SIGNAL_MAX_TOP_HOLDER_PCT;
+        // Top-holder ceiling: per-class override → global override → const.
+        let top_holder_ceiling = overrides
+            .get_f64("max_top_holder_pct", &format!("class:{}", class))
+            .or_else(|| overrides.get_f64("max_top_holder_pct", "global"))
+            .unwrap_or(SIGNAL_MAX_TOP_HOLDER_PCT);
+        let holder_ok = a.top_holder_pct < top_holder_ceiling;
         // Insider-network gate: even when top1 looks fine, bundlers that
         // split 30-40% across 20+ wallets show up in top10 aggregate.
         let top10_ok = a.top10_pct < SIGNAL_MAX_TOP10_PCT;
@@ -816,12 +872,18 @@ impl Notifier {
         // Market-data floors: prove the token has tradeable depth and is
         // actually trading. Missing meta (DexScreener fetch failed) means
         // the token isn't on any DEX — block.
+        let liq_floor = overrides
+            .get_f64("min_liquidity_usd", "global")
+            .unwrap_or(SIGNAL_MIN_LIQUIDITY_USD);
         let liq_ok = meta
             .and_then(|m| m.liquidity_usd)
-            .map_or(false, |v| v >= SIGNAL_MIN_LIQUIDITY_USD);
+            .map_or(false, |v| v >= liq_floor);
+        let vol_floor = overrides
+            .get_f64("min_volume_24h_usd", "global")
+            .unwrap_or(SIGNAL_MIN_VOLUME_24H_USD);
         let vol_ok = meta
             .and_then(|m| m.volume_24h_usd)
-            .map_or(false, |v| v >= SIGNAL_MIN_VOLUME_24H_USD);
+            .map_or(false, |v| v >= vol_floor);
         let mcap_ok = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD && v <= SIGNAL_MAX_MCAP_USD);
@@ -879,7 +941,10 @@ impl Notifier {
         // base reflects organic distribution, not creator + initial 5
         // bonding-curve buyers.
         let now = chrono::Utc::now().timestamp();
-        let age_ok = first_seen.map_or(false, |fs| now - fs >= SIGNAL_MIN_TOKEN_AGE_SECS);
+        let age_floor = overrides
+            .get_i64("min_token_age_secs", "global")
+            .unwrap_or(SIGNAL_MIN_TOKEN_AGE_SECS);
+        let age_ok = first_seen.map_or(false, |fs| now - fs >= age_floor);
         class_ok
             && conf_ok
             && holder_ok

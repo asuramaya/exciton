@@ -27,6 +27,92 @@ pub struct AuditEntry {
     pub details: String,
 }
 
+/// Insert payload for `insert_tune_proposal`. Keep the field set narrow:
+/// status, decided_*, and evolution_event_id are server-managed.
+#[derive(Debug, Clone)]
+pub struct NewTuneProposal {
+    pub proposed_at: i64,
+    pub proposed_by: String,
+    pub field: String,
+    pub scope: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub sample_size: i64,
+    pub effect_size: Option<f64>,
+    pub holdout_metric: Option<f64>,
+    pub evidence_json: String,
+    pub narrative: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuneProposal {
+    pub id: i64,
+    pub proposed_at: i64,
+    pub proposed_by: String,
+    pub field: String,
+    pub scope: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub sample_size: i64,
+    pub effect_size: Option<f64>,
+    pub holdout_metric: Option<f64>,
+    pub evidence_json: String,
+    pub narrative: String,
+    pub status: String,
+    pub decided_at: Option<i64>,
+    pub decided_by: Option<String>,
+    pub rejection_reason: Option<String>,
+    pub evolution_event_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentPrompt {
+    pub version: i64,
+    pub content: String,
+    pub created_at: i64,
+    pub created_by: String,
+    pub why: Option<String>,
+    pub proposal_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvolutionEvent {
+    pub id: i64,
+    pub kind: String,
+    pub summary: String,
+    pub body_md: String,
+    pub evidence_json: Option<String>,
+    pub proposal_id: Option<i64>,
+    pub committed_at: i64,
+    pub posted_at: Option<i64>,
+    pub channel_msg_id: Option<i64>,
+    pub diary_path: Option<String>,
+}
+
+/// One closed call's worth of fields needed for outcome analysis.
+/// pnl_pct + hold_secs are derived inline from entry/exit/timestamps.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallOutcome {
+    pub id: i64,
+    pub mint: String,
+    pub symbol: String,
+    pub classification: String,
+    pub confidence: i32,
+    pub called_at: i64,
+    pub closed_at: Option<i64>,
+    pub entry_price_usd: f64,
+    pub exit_price_usd: Option<f64>,
+    pub entry_mcap_usd: f64,
+    pub entry_liquidity_usd: f64,
+    pub entry_top_holder_pct: f64,
+    pub status: String,
+    pub horizon: String,
+    pub note: String,
+    pub exit_note: Option<String>,
+    pub pnl_pct: Option<f64>,
+    pub hold_secs: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchlistCandidate {
     pub token_address: String,
@@ -553,6 +639,84 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_curve_mint_ts
                 ON curve_snapshots(mint, timestamp DESC);
+            ",
+        )?;
+
+        // Autonomy tables (added with the self-tune surface).
+        // These power propose_tune / commit_tune / record_evolution
+        // and the agent's versioned system prompt.
+        conn.execute_batch(
+            "
+            -- Tunable proposals from the agent or operator.
+            -- Lifecycle: pending → committed | rejected | reverted.
+            CREATE TABLE IF NOT EXISTS tune_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposed_at INTEGER NOT NULL,
+                proposed_by TEXT NOT NULL,
+                field TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                old_value TEXT NOT NULL,
+                new_value TEXT NOT NULL,
+                sample_size INTEGER NOT NULL,
+                effect_size REAL,
+                holdout_metric REAL,
+                evidence_json TEXT NOT NULL,
+                narrative TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decided_at INTEGER,
+                decided_by TEXT,
+                rejection_reason TEXT,
+                evolution_event_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_tune_proposals_status
+                ON tune_proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_tune_proposals_field
+                ON tune_proposals(field);
+
+            -- Runtime-mutable gate values. should_signal reads from here
+            -- first, falling back to compile-time / config defaults when
+            -- no row exists for (field, scope).
+            CREATE TABLE IF NOT EXISTS signal_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                field TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                value TEXT NOT NULL,
+                set_at INTEGER NOT NULL,
+                set_by_proposal_id INTEGER,
+                UNIQUE(field, scope)
+            );
+
+            -- Versioned agent system prompt. Current = MAX(version).
+            -- Bootstrap inserts version 1 from a bundled markdown file
+            -- on first run; agent-authored revisions append new rows.
+            CREATE TABLE IF NOT EXISTS agent_prompt (
+                version INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                why TEXT,
+                proposal_id INTEGER
+            );
+
+            -- Public diary. Every committed self-change writes one row.
+            -- body_md is agent-authored markdown — voice is whatever the
+            -- prompt produces, not a fixed template.
+            CREATE TABLE IF NOT EXISTS evolution_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                body_md TEXT NOT NULL,
+                evidence_json TEXT,
+                proposal_id INTEGER,
+                committed_at INTEGER NOT NULL,
+                posted_at INTEGER,
+                channel_msg_id INTEGER,
+                diary_path TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_evolution_committed
+                ON evolution_events(committed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_evolution_kind
+                ON evolution_events(kind);
             ",
         )?;
 
@@ -3280,6 +3444,400 @@ impl Db {
         )?;
         Ok(n)
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Autonomy: tune proposals, signal overrides, agent prompt, evolution
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Insert a new tune proposal in `pending` state. Returns the new id.
+    pub fn insert_tune_proposal(&self, p: &NewTuneProposal) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tune_proposals
+                (proposed_at, proposed_by, field, scope, old_value, new_value,
+                 sample_size, effect_size, holdout_metric, evidence_json, narrative)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                p.proposed_at,
+                p.proposed_by,
+                p.field,
+                p.scope,
+                p.old_value,
+                p.new_value,
+                p.sample_size,
+                p.effect_size,
+                p.holdout_metric,
+                p.evidence_json,
+                p.narrative,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Fetch a single proposal by id.
+    pub fn get_tune_proposal(&self, id: i64) -> Result<Option<TuneProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, proposed_at, proposed_by, field, scope, old_value, new_value,
+                        sample_size, effect_size, holdout_metric, evidence_json, narrative,
+                        status, decided_at, decided_by, rejection_reason, evolution_event_id
+                   FROM tune_proposals WHERE id = ?1",
+                params![id],
+                row_to_tune_proposal,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List proposals filtered by status (None = all). Most recent first.
+    pub fn list_tune_proposals(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<TuneProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, args): (String, Vec<rusqlite::types::Value>) = match status {
+            Some(s) => (
+                "SELECT id, proposed_at, proposed_by, field, scope, old_value, new_value,
+                        sample_size, effect_size, holdout_metric, evidence_json, narrative,
+                        status, decided_at, decided_by, rejection_reason, evolution_event_id
+                   FROM tune_proposals WHERE status = ?1
+                   ORDER BY proposed_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![s.to_string().into(), limit.into()],
+            ),
+            None => (
+                "SELECT id, proposed_at, proposed_by, field, scope, old_value, new_value,
+                        sample_size, effect_size, holdout_metric, evidence_json, narrative,
+                        status, decided_at, decided_by, rejection_reason, evolution_event_id
+                   FROM tune_proposals ORDER BY proposed_at DESC LIMIT ?1"
+                    .to_string(),
+                vec![limit.into()],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), row_to_tune_proposal)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Mark a proposal as committed/rejected/reverted with the deciding actor.
+    pub fn update_proposal_status(
+        &self,
+        id: i64,
+        status: &str,
+        decided_by: &str,
+        decided_at: i64,
+        reason: Option<&str>,
+        evolution_event_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tune_proposals
+                SET status = ?1, decided_by = ?2, decided_at = ?3,
+                    rejection_reason = ?4, evolution_event_id = ?5
+              WHERE id = ?6",
+            params![status, decided_by, decided_at, reason, evolution_event_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Read a runtime override. Returns None if no row for (field, scope).
+    /// `signal_overrides` is the runtime-mutable store consulted by
+    /// should_signal before falling back to compile-time defaults.
+    pub fn get_signal_override(&self, field: &str, scope: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT value FROM signal_overrides WHERE field = ?1 AND scope = ?2",
+                params![field, scope],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// All overrides keyed by `field:scope` for cheap full-snapshot reads.
+    pub fn list_signal_overrides(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT field, scope, value, set_at FROM signal_overrides ORDER BY field, scope",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Upsert a runtime override. Called by commit_tune.
+    pub fn upsert_signal_override(
+        &self,
+        field: &str,
+        scope: &str,
+        value: &str,
+        set_at: i64,
+        proposal_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO signal_overrides (field, scope, value, set_at, set_by_proposal_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(field, scope) DO UPDATE SET
+                 value = excluded.value,
+                 set_at = excluded.set_at,
+                 set_by_proposal_id = excluded.set_by_proposal_id",
+            params![field, scope, value, set_at, proposal_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an override (used by revert_tune).
+    pub fn delete_signal_override(&self, field: &str, scope: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM signal_overrides WHERE field = ?1 AND scope = ?2",
+            params![field, scope],
+        )?;
+        Ok(())
+    }
+
+    /// Current agent prompt (highest version). None = bootstrap pending.
+    pub fn get_current_prompt(&self) -> Result<Option<AgentPrompt>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT version, content, created_at, created_by, why, proposal_id
+               FROM agent_prompt ORDER BY version DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(AgentPrompt {
+                    version: r.get(0)?,
+                    content: r.get(1)?,
+                    created_at: r.get(2)?,
+                    created_by: r.get(3)?,
+                    why: r.get(4)?,
+                    proposal_id: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.into())
+    }
+
+    /// Append a new prompt revision. Auto-increments version.
+    pub fn append_prompt(
+        &self,
+        content: &str,
+        created_at: i64,
+        created_by: &str,
+        why: Option<&str>,
+        proposal_id: Option<i64>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_prompt (content, created_at, created_by, why, proposal_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![content, created_at, created_by, why, proposal_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Insert a new evolution event. Returns id; channel_msg_id and posted_at
+    /// are filled in later via update_evolution_posted once the channel
+    /// post + diary write succeed.
+    pub fn insert_evolution_event(
+        &self,
+        kind: &str,
+        summary: &str,
+        body_md: &str,
+        evidence_json: Option<&str>,
+        proposal_id: Option<i64>,
+        committed_at: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO evolution_events
+                (kind, summary, body_md, evidence_json, proposal_id, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![kind, summary, body_md, evidence_json, proposal_id, committed_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Patch the post-publication fields (channel_msg_id, diary_path, posted_at).
+    pub fn update_evolution_posted(
+        &self,
+        id: i64,
+        posted_at: i64,
+        channel_msg_id: Option<i64>,
+        diary_path: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE evolution_events
+                SET posted_at = ?1, channel_msg_id = ?2, diary_path = ?3
+              WHERE id = ?4",
+            params![posted_at, channel_msg_id, diary_path, id],
+        )?;
+        Ok(())
+    }
+
+    /// Recent evolution events for the website's diary feed.
+    pub fn list_evolution_events(
+        &self,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<EvolutionEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, args): (String, Vec<rusqlite::types::Value>) = match kind {
+            Some(k) => (
+                "SELECT id, kind, summary, body_md, evidence_json, proposal_id,
+                        committed_at, posted_at, channel_msg_id, diary_path
+                   FROM evolution_events WHERE kind = ?1
+                   ORDER BY committed_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![k.to_string().into(), limit.into()],
+            ),
+            None => (
+                "SELECT id, kind, summary, body_md, evidence_json, proposal_id,
+                        committed_at, posted_at, channel_msg_id, diary_path
+                   FROM evolution_events ORDER BY committed_at DESC LIMIT ?1"
+                    .to_string(),
+                vec![limit.into()],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(EvolutionEvent {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    summary: r.get(2)?,
+                    body_md: r.get(3)?,
+                    evidence_json: r.get(4)?,
+                    proposal_id: r.get(5)?,
+                    committed_at: r.get(6)?,
+                    posted_at: r.get(7)?,
+                    channel_msg_id: r.get(8)?,
+                    diary_path: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Closed calls aggregator powering analyze_outcomes. Returns one row per
+    /// closed call with the fields the agent uses to argue for a tune.
+    /// `since` filters by called_at; classification/horizon are optional.
+    pub fn list_closed_call_outcomes(
+        &self,
+        classification: Option<&str>,
+        horizon: Option<&str>,
+        since: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<CallOutcome>> {
+        let conn = self.conn.lock().unwrap();
+        // The horizon lives inside the `note` column as either "horizon=SHORT",
+        // "horizon=LONG", "horizon=MOONSHOT", "horizon=SCALP". We do the LIKE
+        // filter inline rather than schema-changing the table.
+        let mut where_parts: Vec<String> =
+            vec!["status IN ('withdrew','failed','expired','closed')".to_string()];
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(c) = classification {
+            where_parts.push(format!("classification = ?{}", args.len() + 1));
+            args.push(c.to_string().into());
+        }
+        if let Some(h) = horizon {
+            where_parts.push(format!("note LIKE ?{}", args.len() + 1));
+            args.push(format!("%horizon={}%", h).into());
+        }
+        if let Some(s) = since {
+            where_parts.push(format!("called_at >= ?{}", args.len() + 1));
+            args.push(s.into());
+        }
+        let where_sql = where_parts.join(" AND ");
+        let limit_idx = args.len() + 1;
+        args.push(limit.into());
+
+        let sql = format!(
+            "SELECT id, mint, symbol, classification, confidence, called_at,
+                    closed_at, entry_price_usd, exit_price_usd, entry_mcap_usd,
+                    entry_liquidity_usd, entry_top_holder_pct, status, note, exit_note
+               FROM calls
+              WHERE {where_sql}
+              ORDER BY closed_at DESC NULLS LAST, called_at DESC
+              LIMIT ?{limit_idx}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                let entry: f64 = r.get(7)?;
+                let exit: Option<f64> = r.get(8)?;
+                let pnl_pct = match exit {
+                    Some(x) if entry > 0.0 => Some((x - entry) / entry * 100.0),
+                    _ => None,
+                };
+                let called_at: i64 = r.get(5)?;
+                let closed_at: Option<i64> = r.get(6)?;
+                let hold_secs = closed_at.map(|c| c - called_at);
+                let note: String = r.get(13)?;
+                let horizon = parse_horizon_tag(&note);
+                Ok(CallOutcome {
+                    id: r.get(0)?,
+                    mint: r.get(1)?,
+                    symbol: r.get(2)?,
+                    classification: r.get(3)?,
+                    confidence: r.get(4)?,
+                    called_at,
+                    closed_at,
+                    entry_price_usd: entry,
+                    exit_price_usd: exit,
+                    entry_mcap_usd: r.get(9)?,
+                    entry_liquidity_usd: r.get(10)?,
+                    entry_top_holder_pct: r.get(11)?,
+                    status: r.get(12)?,
+                    horizon,
+                    note,
+                    exit_note: r.get(14)?,
+                    pnl_pct,
+                    hold_secs,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+fn row_to_tune_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<TuneProposal> {
+    Ok(TuneProposal {
+        id: r.get(0)?,
+        proposed_at: r.get(1)?,
+        proposed_by: r.get(2)?,
+        field: r.get(3)?,
+        scope: r.get(4)?,
+        old_value: r.get(5)?,
+        new_value: r.get(6)?,
+        sample_size: r.get(7)?,
+        effect_size: r.get(8)?,
+        holdout_metric: r.get(9)?,
+        evidence_json: r.get(10)?,
+        narrative: r.get(11)?,
+        status: r.get(12)?,
+        decided_at: r.get(13)?,
+        decided_by: r.get(14)?,
+        rejection_reason: r.get(15)?,
+        evolution_event_id: r.get(16)?,
+    })
+}
+
+fn parse_horizon_tag(note: &str) -> String {
+    for token in note.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("horizon=") {
+            return rest.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+        }
+    }
+    "SHORT".to_string()
 }
 
 #[derive(Debug, Clone)]
