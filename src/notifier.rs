@@ -88,7 +88,14 @@ pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"]
 // 2026-05-01 Bucket A: liquidity floor 50k → 20k. Backtest universe used
 // 15k floor; 20k adds a 33% safety margin while still capturing ~85% of
 // historical 5x+ runners (median entry liq $25-30k for that cohort).
-pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 20_000.0;
+// 2026-05-03 — lifted 20k → 25k after 50-call STAIRCASE/GRINDER realized
+// audit. The $20-25k band was -5.6% mean (n=19, 7 losers / 9 wins/flats);
+// removing it lifts cohort EV while preserving every higher band. The
+// $25-30k band is +15.2% mean (1/10 catastrophic), $30-40k is the worst
+// at -26.9% mean (4/10 catastrophic), $60k+ is +25.5% mean. Keeping the
+// floor data-driven at the cleanly negative-band cutoff; the $30-40k
+// anomaly is too small to fit a separate exclusion against.
+pub const SIGNAL_MIN_LIQUIDITY_USD: f64 = 25_000.0;
 pub const SIGNAL_MIN_VOLUME_24H_USD: f64 = 50_000.0;
 // 2026-05-02 PM: mcap window widened from $30k-$1M → $15k-$5M. Live
 // runner cohort had p25 mcap of $21k (the $30k floor was clipping the
@@ -305,7 +312,8 @@ pub const SCALP_MIN_PRICE_CHANGE_1H_PCT: f64 = 100.0;
 // one false positive sacrificed — net win.
 pub const SCALP_MAX_PRICE_CHANGE_1H_PCT: f64 = 300.0;
 pub const SCALP_MAX_AGE_SECS: i64 = 4 * 3600;
-pub const SCALP_MIN_LIQUIDITY_USD: f64 = 20_000.0;
+// 2026-05-03 — matched to SIGNAL_MIN_LIQUIDITY_USD lift. Same audit logic.
+pub const SCALP_MIN_LIQUIDITY_USD: f64 = 25_000.0;
 // Floor lifted from 5/min to 25/min. wiffy at tpm=18 was the one outlier
 // below the win range and rugged -99%. Wins clustered at tpm ≥ 27.5.
 pub const SCALP_MIN_TX_RATE_PER_MIN: f64 = 25.0;
