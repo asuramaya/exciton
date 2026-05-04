@@ -18,18 +18,18 @@ pub struct Config {
     /// and no background posting task is spawned.
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
-    /// Optional — when absent, no data is published to the MadApes.ai repo.
+    /// Optional — when absent, no data is published to a target repo.
     #[serde(default)]
     pub madapes: Option<MadapesConfig>,
-    /// Optional — when absent OR `enabled=false`, photon stays paper-only.
+    /// Optional — when absent OR `enabled=false`, exciton stays paper-only.
     /// Auto-calls insert rows + post TG cards but never sign trades.
     #[serde(default)]
     pub execution: Option<ExecutionConfig>,
 }
 
 /// Trade-execution sizing + safety budget. Master kill switch is `enabled`.
-/// When false (or section absent) photon is paper-only and the keypair
-/// loaded from `PHOTON_PRIVATE_KEY` is never used by the auto path.
+/// When false (or section absent) exciton is paper-only and the keypair
+/// loaded from `EXCITON_PRIVATE_KEY` is never used by the auto path.
 ///
 /// Sizing is **adaptive**: `*_size_pct` is a percentage of the wallet's
 /// current SOL balance at call-fire time. As wallet grows, position size
@@ -105,7 +105,7 @@ pub struct MadapesConfig {
     /// push to the public repo.
     #[serde(default)]
     pub enabled: bool,
-    /// Absolute path to the MadApes.ai repo checkout on this machine.
+    /// Absolute path to the publisher target repo checkout on this machine.
     pub repo_path: String,
     /// Publish cadence in seconds. Data snapshots are pushed this often.
     /// Notes are always manual and never touched by this task.
@@ -181,7 +181,7 @@ pub struct TelegramConfig {
     pub lounge_chat_id: String,
     /// Optional message_id of an "anchor" message that should always
     /// appear at the bottom of `anchor_chat_id`. Telegram only pins to
-    /// the TOP of a chat — the magic trick is: after every photon-
+    /// the TOP of a chat — the magic trick is: after every exciton-
     /// originated send to the anchor chat, delete the previous forward
     /// of the anchor and forwardMessage from the source again as a
     /// fresh post. Set to 0 (or omit) to disable.
@@ -192,7 +192,7 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub anchor_msg_id: i64,
     /// Destination chat for the anchor — where the bump fires after
-    /// every photon-originated send. Empty = use `signals_chat_id`
+    /// every exciton-originated send. Empty = use `signals_chat_id`
     /// (calls channel — the most common case for a verify gate).
     #[serde(default)]
     pub anchor_chat_id: String,
@@ -208,6 +208,12 @@ pub struct TelegramConfig {
     /// the legacy [Chart]/[Solscan]/[Addr] row renders instead.
     #[serde(default)]
     pub public_bot_username: String,
+
+    /// Bot username (no @) for the operator/private bot. Surfaced in
+    /// cross-route hints when a public-surface user types an
+    /// operator-only command. Empty = generic "operator bot" wording.
+    #[serde(default)]
+    pub private_bot_username: String,
 
     /// Stale lounge-side anchor msg_id to delete. The bump only tracks
     /// ONE active anchor slot (the destination chat), so any forward
@@ -257,6 +263,12 @@ pub struct TelegramConfig {
     /// Port for the claw HTTP API server. Default: 8081.
     #[serde(default = "default_claw_port")]
     pub claw_api_port: u16,
+
+    /// Public-facing site that mirrors call state (the publisher's target).
+    /// When set, call cards include a "track live" link: `<public_url>/#call=<address>`.
+    /// Leave empty to omit the link entirely. Example: `https://example.com`.
+    #[serde(default)]
+    pub public_url: String,
 }
 
 fn default_claw_port() -> u16 {

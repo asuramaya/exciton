@@ -16,7 +16,7 @@ use solana_sdk::signature::Signer;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct PhotonServer {
+pub struct ExcitonServer {
     db: Arc<Db>,
     config: Config,
     rpc: Arc<RpcRouter>,
@@ -425,7 +425,7 @@ fn to_json<T: Serialize>(data: &T) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("Error: {e}"))
 }
 
-impl PhotonServer {
+impl ExcitonServer {
     pub fn new(
         db: Arc<Db>,
         config: Config,
@@ -467,7 +467,7 @@ impl PhotonServer {
 }
 
 #[tool_router]
-impl PhotonServer {
+impl ExcitonServer {
     /// Scan the market: read alerts from background scanner, show pending opportunities.
     /// The background scanner runs every 30s discovering and analyzing new tokens.
     ///
@@ -1088,7 +1088,7 @@ impl PhotonServer {
         }
     }
 
-    /// Append a new note to MadApes.ai/thoughts, update the index, commit
+    /// Append a new note to the publisher repo's `thoughts/` folder, update the index, commit
     /// with the `note:` prefix and push. Respects append-only — fails with
     /// an error if the target filename already exists. The image processor
     /// picks up any `<div class="img-placeholder">[IMAGE: ...]</div>` blocks
@@ -1523,9 +1523,9 @@ impl PhotonServer {
     /// Bump the lounge anchor — delete the previous copy of the
     /// configured "always at the bottom" message and copyMessage from
     /// the source again as a fresh post. Photon does this automatically
-    /// after every photon-originated lounge send; this tool lets
+    /// after every exciton-originated lounge send; this tool lets
     /// zeroclaw or the operator trigger it manually after posting to
-    /// the lounge through some path photon doesn't observe.
+    /// the lounge through some path exciton doesn't observe.
     #[tool]
     async fn bump_lounge_anchor(&self) -> String {
         let _ = self.db.audit_log("claude", "bump_lounge_anchor", "");
@@ -1630,7 +1630,7 @@ impl PhotonServer {
     /// For buys: amount = SOL to spend.
     /// For sells: amount = token UI amount to sell (e.g. 50000.0 tokens).
     ///
-    /// Requires PHOTON_PRIVATE_KEY env var (base58 secret key).
+    /// Requires EXCITON_PRIVATE_KEY env var (base58 secret key).
     #[tool]
     async fn trade(&self, Parameters(params): Parameters<TradeParams>) -> String {
         let _ = self.db.audit_log(
@@ -1785,7 +1785,7 @@ impl PhotonServer {
                 return serde_json::json!({
                     "error": "keypair not available",
                     "reason": e.to_string(),
-                    "hint": "export PHOTON_PRIVATE_KEY=<base58 secret key>",
+                    "hint": "export EXCITON_PRIVATE_KEY=<base58 secret key>",
                 })
                 .to_string();
             }
@@ -1797,7 +1797,7 @@ impl PhotonServer {
         {
             return serde_json::json!({
                 "error": "keypair mismatch",
-                "reason": "PHOTON_PRIVATE_KEY pubkey does not match wallet.public_key in config",
+                "reason": "EXCITON_PRIVATE_KEY pubkey does not match wallet.public_key in config",
                 "env_pubkey": keypair.pubkey().to_string(),
                 "config_pubkey": self.config.wallet.public_key,
             })
@@ -1998,21 +1998,21 @@ impl PhotonServer {
 }
 
 #[tool_handler]
-impl ServerHandler for PhotonServer {
+impl ServerHandler for ExcitonServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "photon".to_string(),
-                title: Some("Photon Signal Forecaster".to_string()),
+                name: "exciton".to_string(),
+                title: Some("Exciton".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 description: Some("Collaborative Solana trading intelligence".to_string()),
                 icons: None,
                 website_url: None,
             },
             instructions: Some(
-                "Photon Signal Forecaster — collaborative Solana trading intelligence. \
+                "Exciton — collaborative Solana trading intelligence. \
                  Use scan() for market overview, inspect() for deep analysis, \
                  scout()/deep_scout() for raw token forensics, \
                  historical_analysis()/holder_forensics()/wallet_xray()/deep_signals() \

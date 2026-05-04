@@ -1,5 +1,5 @@
-//! Thought-image processor — scans the MadApes.ai thoughts/ folder for
-//! placeholder blocks written in-band as
+//! Thought-image processor — scans the publisher target repo's `thoughts/`
+//! folder for placeholder blocks written in-band as
 //!
 //!     <div class="img-placeholder">[IMAGE: caption text]</div>
 //!

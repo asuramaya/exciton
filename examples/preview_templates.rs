@@ -3,10 +3,10 @@
 //!
 //! Optionally posts to Telegram when TG_BOT_TOKEN and TG_CHAT_ID are set.
 
-use photon::db::{TokenDelta, TokenSnapshot};
-use photon::metadata;
-use photon::signals::{Confidence, SignalLayer, SignalScore, TokenAnalysis};
-use photon::templates::{self, Template};
+use exciton::db::{TokenDelta, TokenSnapshot};
+use exciton::metadata;
+use exciton::signals::{Confidence, SignalLayer, SignalScore, TokenAnalysis};
+use exciton::templates::{self, Template};
 
 fn mk_score(layer: SignalLayer, kind: &str, score: i32, details: &str) -> SignalScore {
     SignalScore {

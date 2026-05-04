@@ -1,7 +1,7 @@
-use photon::config::Config;
-use photon::db::Db;
-use photon::ingester::RpcRouter;
-use photon::mcp::PhotonServer;
+use exciton::config::Config;
+use exciton::db::Db;
+use exciton::ingester::RpcRouter;
+use exciton::mcp::ExcitonServer;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -13,6 +13,6 @@ fn test_server_creation() {
     let rpc =
         Arc::new(RpcRouter::new(&["https://api.mainnet-beta.solana.com".to_string()]).unwrap());
     let endpoints = vec!["https://api.mainnet-beta.solana.com".to_string()];
-    let server = PhotonServer::new(db, config, rpc, endpoints);
+    let server = ExcitonServer::new(db, config, rpc, endpoints);
     assert!(server.is_healthy());
 }

@@ -1,7 +1,7 @@
 //! PumpPortal WebSocket client. The data source that should have been
 //! anchoring discovery + graduation detection from day one.
 //!
-//! photon's original sig-walking discovery (Phase 2) and graduation walk
+//! exciton's original sig-walking discovery (Phase 2) and graduation walk
 //! (Phase 2b) were placeholders standing in for the real upstream: an
 //! event feed of pump.fun activity. PumpPortal hosts that feed at
 //! `wss://pumpportal.fun/api/data` over a single multiplexed

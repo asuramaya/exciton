@@ -407,7 +407,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_wallet_obs_mint ON wallet_observations(mint);
             -- Lounge anchor state — singleton row tracking the current
             -- copy of the always-at-bottom message in the lounge.
-            -- After every photon-originated lounge send, bump_lounge_anchor
+            -- After every exciton-originated lounge send, bump_lounge_anchor
             -- deletes the previous copy and re-copies the source. Row 1
             -- holds the most recent copy message_id so deletes survive
             -- a process restart. INSERT OR IGNORE seeds the singleton.

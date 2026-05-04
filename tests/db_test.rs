@@ -1,5 +1,5 @@
-use photon::db::Db;
-use photon::db::TokenSnapshot;
+use exciton::db::Db;
+use exciton::db::TokenSnapshot;
 use tempfile::tempdir;
 
 #[test]

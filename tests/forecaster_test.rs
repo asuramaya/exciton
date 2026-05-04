@@ -1,5 +1,5 @@
-use photon::forecaster::{Forecaster, Regime};
-use photon::signals::{SignalLayer, SignalScore};
+use exciton::forecaster::{Forecaster, Regime};
+use exciton::signals::{SignalLayer, SignalScore};
 
 #[test]
 fn test_forecaster_aggregate_scores() {

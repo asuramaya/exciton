@@ -522,7 +522,7 @@ pub struct Notifier {
     /// `None` when the publisher isn't configured.
     publish_kick: Option<crate::publisher::PublishKick>,
     /// Optional trade-execution context. Some(_) only when
-    /// PHOTON_PRIVATE_KEY env var is set AND [execution] config block
+    /// EXCITON_PRIVATE_KEY env var is set AND [execution] config block
     /// has enabled=true. None = paper-only mode, the auto-call path
     /// inserts rows + posts cards but never signs trades.
     executor: Option<Arc<crate::execution::ExecutionCtx>>,
@@ -563,7 +563,7 @@ impl Notifier {
     }
 
     /// Attach trade-execution capability. Call once at boot when
-    /// PHOTON_PRIVATE_KEY + [execution] config are both wired. Mutates
+    /// EXCITON_PRIVATE_KEY + [execution] config are both wired. Mutates
     /// in place because Notifier is instantiated, then optionally
     /// upgraded — same pattern as `with_notifier` on the scanner.
     pub fn with_executor(mut self, ctx: Arc<crate::execution::ExecutionCtx>) -> Self {
@@ -1193,7 +1193,7 @@ impl Notifier {
     }
 
     /// Send a one-line operator-facing notification to every configured
-    /// admin user via the DM bot (Claudeinatorbot). Falls back to the
+    /// admin user via the DM bot. Falls back to the
     /// channel bot token when no dedicated DM token is set. Used by the
     /// settling phase to push BANKED/FAILED/EXPIRED outcomes into the
     /// operator's personal stream — the channel is public, this is for
@@ -1441,7 +1441,7 @@ impl Notifier {
 
     /// Ask zeroclaw to author a one-line close verdict.
     /// Routes through `http://zeroclaw:42617/webhook` (ChatGPT OAuth via
-    /// zeroclaw — no API key in photon). 30s timeout × 5 attempts; on
+    /// zeroclaw — no API key in exciton). 30s timeout × 5 attempts; on
     /// total failure returns Err and the caller renders an empty body.
     /// There is no deterministic fallback — claw is the only voice.
     ///
@@ -1536,7 +1536,7 @@ impl Notifier {
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let session_id = format!(
-                "photon-entry-{}-{}-{}",
+                "exciton-entry-{}-{}-{}",
                 ticker,
                 attempt,
                 std::time::SystemTime::now()
@@ -1674,7 +1674,7 @@ impl Notifier {
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let session_id = format!(
-                "photon-verdict-{}-{}-{}",
+                "exciton-verdict-{}-{}-{}",
                 ticker,
                 attempt,
                 std::time::SystemTime::now()
@@ -2158,10 +2158,17 @@ impl Notifier {
             None => String::new(),
         };
 
-        let track_line = format!(
-            "\n\n<a href=\"https://madapesai.com/#call={}\">track live on madapesai.com</a>",
-            address
-        );
+        let track_line = if self.cfg.public_url.is_empty() {
+            String::new()
+        } else {
+            let host = self.cfg.public_url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+            format!(
+                "\n\n<a href=\"{}/#call={}\">track live on {}</a>",
+                self.cfg.public_url.trim_end_matches('/'),
+                address,
+                host,
+            )
+        };
 
         let body_block = if body.is_empty() { String::new() } else { format!("\n{}", html_escape(&body)) };
         format!("{header}{body}{px}{track}",
@@ -2241,10 +2248,17 @@ impl Notifier {
             }
             None => String::new(),
         };
-        let track_line = format!(
-            "\n\n📊 <a href=\"https://madapesai.com/#call={}\">track live on madapesai.com</a>",
-            address
-        );
+        let track_line = if self.cfg.public_url.is_empty() {
+            String::new()
+        } else {
+            let host = self.cfg.public_url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+            format!(
+                "\n\n📊 <a href=\"{}/#call={}\">track live on {}</a>",
+                self.cfg.public_url.trim_end_matches('/'),
+                address,
+                host,
+            )
+        };
         let mut html = format!(
             "{header}{verdict}{body}{market}{track}",
             header = header,

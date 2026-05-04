@@ -42,15 +42,15 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
 
 // ── Keypair loading ───────────────────────────────────────────────────────────
 
-/// Load the trading keypair from PHOTON_PRIVATE_KEY (base58 64-byte secret key).
+/// Load the trading keypair from EXCITON_PRIVATE_KEY (base58 64-byte secret key).
 pub fn load_keypair() -> Result<Keypair> {
-    let raw = std::env::var("PHOTON_PRIVATE_KEY")
-        .context("PHOTON_PRIVATE_KEY not set — fund a wallet and export its private key")?;
+    let raw = std::env::var("EXCITON_PRIVATE_KEY")
+        .context("EXCITON_PRIVATE_KEY not set — fund a wallet and export its private key")?;
     let bytes = bs58::decode(raw.trim())
         .into_vec()
-        .context("PHOTON_PRIVATE_KEY: not valid base58")?;
+        .context("EXCITON_PRIVATE_KEY: not valid base58")?;
     Keypair::try_from(bytes.as_slice())
-        .context("PHOTON_PRIVATE_KEY: invalid keypair — expected 64-byte secret key")
+        .context("EXCITON_PRIVATE_KEY: invalid keypair — expected 64-byte secret key")
 }
 
 // ── Jupiter types ─────────────────────────────────────────────────────────────
@@ -406,8 +406,8 @@ pub async fn sell(
 // and BackgroundScanner (sell on settle-decision). When None at the
 // component level, that component stays paper-only — buys/sells aren't
 // spawned. Construction happens once at boot in main.rs after the
-// keypair loads from PHOTON_PRIVATE_KEY; absence of the env var keeps
-// photon in safe paper mode.
+// keypair loads from EXCITON_PRIVATE_KEY; absence of the env var keeps
+// exciton in safe paper mode.
 
 pub struct ExecutionCtx {
     pub db: Arc<Db>,
@@ -433,7 +433,7 @@ impl std::fmt::Debug for ExecutionCtx {
 }
 
 impl ExecutionCtx {
-    /// Build from boot config. Loads PHOTON_PRIVATE_KEY env var; returns
+    /// Build from boot config. Loads EXCITON_PRIVATE_KEY env var; returns
     /// Err when missing OR when the secret is malformed. Caller decides
     /// whether to fail boot or continue in paper mode.
     pub fn from_env(
@@ -447,7 +447,7 @@ impl ExecutionCtx {
         let wallet_pubkey = keypair.pubkey().to_string();
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .user_agent("photon/0.1")
+            .user_agent("exciton/0.1")
             .build()?;
         Ok(Self {
             db,

@@ -1,6 +1,6 @@
 //! Recraft image-generation client — server-side only. The API key never
 //! leaves this module, never lands in the public repo, never travels over
-//! a channel that isn't the photon process itself talking to Recraft.
+//! a channel that isn't the exciton process itself talking to Recraft.
 //!
 //! Used by the thought-image processor to render placeholder captions in
 //! the jungle notes into cinematic 2:1 photorealistic imagery.

@@ -1096,7 +1096,7 @@ async fn fetch_rug_report(mint: &str, rpc: &Arc<RpcRouter>) -> Result<RugReport>
     static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
-            .user_agent("photon/0.1")
+            .user_agent("exciton/0.1")
             .build()
             .expect("intel rugcheck HTTP init")
     });

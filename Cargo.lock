@@ -1369,6 +1369,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "exciton"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bincode",
+ "bs58",
+ "chrono",
+ "futures-util",
+ "headless_chrome",
+ "image",
+ "once_cell",
+ "reqwest",
+ "rmcp",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "solana-client",
+ "solana-sdk",
+ "solana-transaction-status",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "toml 0.8.23",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2860,39 +2893,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd23b938276f14057220b707937bcb42fa76dda7560e57a2da30cb52d557937"
 dependencies = [
  "num",
-]
-
-[[package]]
-name = "photon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bincode",
- "bs58",
- "chrono",
- "futures-util",
- "headless_chrome",
- "image",
- "once_cell",
- "reqwest",
- "rmcp",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "solana-client",
- "solana-sdk",
- "solana-transaction-status",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "toml 0.8.23",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

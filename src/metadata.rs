@@ -15,7 +15,7 @@ use serde::Deserialize;
 static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent("photon/0.1")
+        .user_agent("exciton/0.1")
         .build()
         .expect("metadata::HTTP client init")
 });

@@ -39,7 +39,7 @@ impl DiscoveryPoller {
     pub fn new(db: Arc<Db>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            .user_agent("photon/0.1 (free-tier discovery poller)")
+            .user_agent("exciton/0.1 (free-tier discovery poller)")
             .build()
             .expect("reqwest client init");
         Self { db, http }

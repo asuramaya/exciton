@@ -5,10 +5,10 @@
 //! feeds it three synthetic analyses in sequence, and prints the rendered
 //! digest body.
 
-use photon::config::TelegramConfig;
-use photon::db::{Db, TokenDelta, TokenSnapshot};
-use photon::notifier::Notifier;
-use photon::signals::{Confidence, SignalLayer, SignalScore, TokenAnalysis};
+use exciton::config::TelegramConfig;
+use exciton::db::{Db, TokenDelta, TokenSnapshot};
+use exciton::notifier::Notifier;
+use exciton::signals::{Confidence, SignalLayer, SignalScore, TokenAnalysis};
 use std::sync::Arc;
 
 fn mk_score(layer: SignalLayer, kind: &str, score: i32, details: &str) -> SignalScore {
@@ -139,14 +139,16 @@ fn demote_worthy(base: &TokenAnalysis) -> TokenAnalysis {
 async fn main() -> anyhow::Result<()> {
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
 
-    let tmp = std::env::temp_dir().join(format!("photon-smoke-{}.db", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("exciton-smoke-{}.db", std::process::id()));
     let db = Arc::new(Db::open(&tmp)?);
 
     let cfg = TelegramConfig {
         enabled: true,
         bot_token,
-        signals_chat_id: "-1003735501034".into(), // Claudeinator channel
-        ops_chat_id: "-1003869647282".into(),     // Claudeinator Chat
+        signals_chat_id: std::env::var("SIGNALS_CHAT_ID")
+            .expect("SIGNALS_CHAT_ID must be set (your test channel id)"),
+        ops_chat_id: std::env::var("OPS_CHAT_ID")
+            .expect("OPS_CHAT_ID must be set (your test ops channel id)"),
     };
     let notifier = Notifier::new(cfg, db.clone(), None)?;
 

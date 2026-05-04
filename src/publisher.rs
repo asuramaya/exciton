@@ -1,5 +1,5 @@
-//! MadApes.ai publisher — periodically snapshots the operating wallet to
-//! JSON files inside the MadApes.ai repo checkout, then commits and pushes.
+//! Publisher — periodically snapshots the operating wallet to JSON files
+//! inside a configured target git repo, then commits and pushes.
 //!
 //! Zero LLM, zero API keys. All numbers come from on-chain reads + DexScreener;
 //! all summaries are templated from raw balance deltas. The site is the bag +

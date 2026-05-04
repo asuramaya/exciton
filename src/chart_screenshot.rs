@@ -54,7 +54,7 @@ fn embed_url(pair_address: &str) -> String {
 /// Capture the chart via CDP. Real wall-clock wait — no virtual time.
 /// Returns raw PNG bytes (uncropped, full viewport).
 fn raw_screenshot_cdp(pair_address: &str, render_wait_secs: u64) -> Result<Vec<u8>> {
-    let user_data_dir = std::path::PathBuf::from("/var/cache/chromium-photon");
+    let user_data_dir = std::path::PathBuf::from("/var/cache/chromium-exciton");
     let _ = std::fs::create_dir_all(&user_data_dir);
 
     // Stable args on top of headless_chrome defaults: no-sandbox for

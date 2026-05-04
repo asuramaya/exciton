@@ -35,7 +35,7 @@ mod thought_images;
 use config::Config;
 use db::Db;
 use ingester::{resolve_endpoints, RpcRouter};
-use mcp::PhotonServer;
+use mcp::ExcitonServer;
 use scanner::BackgroundScanner;
 
 async fn wait_for_shutdown_signal() -> Result<()> {
@@ -62,7 +62,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("photon=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("exciton=info".parse()?),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -90,13 +90,13 @@ async fn main() -> Result<()> {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
         mp.recraft_api_key = ingester::resolve_env_vars(&mp.recraft_api_key);
     }
-    tracing::info!("Photon Signal Forecaster starting");
+    tracing::info!("Exciton starting");
 
-    let db_path = std::env::var("PHOTON_DB_PATH")
+    let db_path = std::env::var("EXCITON_DB_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("photon.db"));
+        .unwrap_or_else(|_| PathBuf::from("exciton.db"));
     let db = Arc::new(Db::open(&db_path)?);
-    db.audit_log("system", "startup", "Photon Signal Forecaster started")?;
+    db.audit_log("system", "startup", "Exciton started")?;
     tracing::info!("Database initialized at {:?}", db_path);
 
     // Autonomous alert-queue hygiene: every 60s, acknowledge any alert row
@@ -186,9 +186,9 @@ async fn main() -> Result<()> {
     // becomes a no-op).
     let publish_kick: publisher::PublishKick = Arc::new(tokio::sync::Notify::new());
 
-    // Trade-execution context. Built once at boot when both PHOTON_PRIVATE_KEY
+    // Trade-execution context. Built once at boot when both EXCITON_PRIVATE_KEY
     // env var is present AND [execution] config block exists. Either missing
-    // means photon stays paper-only (no real swaps fire from auto-call paths).
+    // means exciton stays paper-only (no real swaps fire from auto-call paths).
     // The cfg.enabled flag gates further — present keypair + config but
     // enabled=false means the bundle is constructed for future use but
     // calls.spawn_buy / settle.execute_sell short-circuit.
@@ -252,8 +252,8 @@ async fn main() -> Result<()> {
                 notifier_arc = Some(arc);
 
                 // Telegram bot surfaces — two long-polls, one per surface.
-                // Private (Claudeinatorbot) hosts operator+claw; Public
-                // (MadApesAIBot) hosts read-only intel + per-user state.
+                // Private hosts operator+claw; Public hosts read-only
+                // intel + per-user state.
                 // Public surface enforces a 1/min global ceiling on
                 // RPC-heavy lookup commands; the gate is shared across
                 // every public user and persists for the bot's lifetime.
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
                             Ok(b) => {
                                 let admins = cfg.admin_user_ids.len();
                                 tracing::info!(
-                                    "Private bot (Claudeinatorbot) enabled (admin_user_ids={})",
+                                    "Private bot enabled (admin_user_ids={})",
                                     admins
                                 );
                                 Arc::new(b).start();
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
 
                     // Public surface — bot_token is also the channel poster,
                     // so this adds a long-poll on it. Only ever one process
-                    // does getUpdates per token; if you run two photon
+                    // does getUpdates per token; if you run two exciton
                     // instances against the same bot_token you'll see 409s.
                     if !cfg.bot_token.is_empty() {
                         match bot::DmBot::public(
@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
                             public_gate,
                         ) {
                             Ok(b) => {
-                                tracing::info!("Public bot (MadApesAIBot) enabled");
+                                tracing::info!("Public bot enabled");
                                 Arc::new(b).start();
                             }
                             Err(e) => tracing::warn!(
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
     // the gate.
     // Read smart wallets at boot for AccountTrade subscription. The
     // hourly promotion loop adds new wallets over time; those get picked
-    // up on the next photon restart. PumpPortal's docs only document
+    // up on the next exciton restart. PumpPortal's docs only document
     // re-subscribing on connect, not modifying an active subscription —
     // a process restart is the cleanest path for adding new wallets and
     // the promotion cadence is hourly, so the staleness window matches.
@@ -504,7 +504,7 @@ async fn main() -> Result<()> {
     // 3 HTTPS calls/min total, no auth, no key.
     discovery_pollers::DiscoveryPoller::new(db.clone()).spawn();
 
-    // MadApes.ai publisher — pushes data/*.json snapshots to the public repo
+    // Publisher — pushes data/*.json snapshots to a target git repo
     // on a fixed interval. Notes under thoughts/ are left alone (append-only,
     // manual). Non-fatal on failures: a transient git/RPC error doesn't
     // interrupt the main scanner.
@@ -552,16 +552,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    let disable_mcp = std::env::var("PHOTON_DISABLE_MCP")
+    let disable_mcp = std::env::var("EXCITON_DISABLE_MCP")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
     // Two-mode runtime:
-    //   stdio  — legacy parent-as-MCP-client (zeroclaw-spawns-photon).
+    //   stdio  — legacy parent-as-MCP-client (zeroclaw-spawns-exciton).
     //            Foreground; daemon dies. Set via PHOTON_MCP_TRANSPORT=stdio.
     //   http   — bidirectional MCP over Streamable-HTTP (SSE for server→
     //            client streams, POST for client→server JSON-RPC). Runs
     //            alongside the daemon. Default when MCP isn't disabled.
-    //   off    — PHOTON_DISABLE_MCP=1; daemon-only.
+    //   off    — EXCITON_DISABLE_MCP=1; daemon-only.
     let mcp_transport = std::env::var("PHOTON_MCP_TRANSPORT")
         .unwrap_or_else(|_| "http".to_string())
         .to_lowercase();
@@ -571,14 +571,14 @@ async fn main() -> Result<()> {
         .unwrap_or(8082);
 
     if disable_mcp {
-        tracing::info!("MCP server disabled by PHOTON_DISABLE_MCP; running daemon-only mode");
+        tracing::info!("MCP server disabled by EXCITON_DISABLE_MCP; running daemon-only mode");
         wait_for_shutdown_signal().await?;
     } else if mcp_transport == "stdio" {
         // Foreground stdio mode — kept for backward compat with zeroclaw
-        // setups that spawn photon as a child process. NOTE: this exits
+        // setups that spawn exciton as a child process. NOTE: this exits
         // the daemon (scanner/settling/publisher all stop the moment
         // serve_directly takes over). Don't pick this in production.
-        let server = PhotonServer::new(
+        let server = ExcitonServer::new(
             db,
             config,
             rpc,
@@ -601,7 +601,7 @@ async fn main() -> Result<()> {
         let server_notifier = notifier_arc.clone();
         let mcp_service = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
             move || {
-                Ok(PhotonServer::new(
+                Ok(ExcitonServer::new(
                     server_db.clone(),
                     server_config.clone(),
                     server_rpc.clone(),

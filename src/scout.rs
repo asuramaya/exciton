@@ -617,7 +617,7 @@ pub struct PastLaunch {
 }
 
 /// Track record for a deployer wallet, assembled from our own `tokens`
-/// table. Only captures launches photon has observed (post-tracking), not
+/// table. Only captures launches exciton has observed (post-tracking), not
 /// their full career — honest limit, but enough to see a pattern once a
 /// deployer has multiple tokens in our DB.
 pub async fn deployer_history(deployer: &str, db: &Arc<Db>) -> Result<Vec<PastLaunch>> {

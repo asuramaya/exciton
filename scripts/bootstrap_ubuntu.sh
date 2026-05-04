@@ -10,15 +10,18 @@ if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
 
-mkdir -p /opt/photon/state
-mkdir -p /opt/photon/runtime
-mkdir -p /opt/photon/ssh
-mkdir -p /srv/MadApes.ai
+EXCITON_ROOT="${EXCITON_ROOT:-/opt/exciton}"
+PUBLISHER_REPO_DIR="${PUBLISHER_REPO_DIR:-/srv/publisher-target}"
 
-chmod 700 /opt/photon/ssh
+mkdir -p "$EXCITON_ROOT/state"
+mkdir -p "$EXCITON_ROOT/runtime"
+mkdir -p "$EXCITON_ROOT/ssh"
+mkdir -p "$PUBLISHER_REPO_DIR"
 
-if ! git -C /srv/MadApes.ai rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git init /srv/MadApes.ai >/dev/null
+chmod 700 "$EXCITON_ROOT/ssh"
+
+if ! git -C "$PUBLISHER_REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git init "$PUBLISHER_REPO_DIR" >/dev/null
 fi
 
 echo "bootstrap complete"

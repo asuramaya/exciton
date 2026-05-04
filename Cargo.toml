@@ -1,7 +1,15 @@
 [package]
-name = "photon"
+name = "exciton"
 version = "0.1.0"
 edition = "2021"
+description = "Exciton — MCP-first Solana intelligence engine. Deterministic on-chain scanner, signal forecaster, Telegram surface, and JSON publisher in one Rust binary."
+license = "MIT"
+repository = "https://github.com/asuramaya/exciton"
+homepage = "https://github.com/asuramaya/exciton"
+readme = "README.md"
+keywords = ["solana", "mcp", "trading", "telegram", "signals"]
+categories = ["command-line-utilities"]
+authors = ["Exciton contributors"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
