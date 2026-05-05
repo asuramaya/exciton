@@ -2177,8 +2177,16 @@ impl ExcitonServer {
         &self,
         Parameters(params): Parameters<AnalyzeOutcomesParams>,
     ) -> String {
-        let class = params.classification.as_deref();
-        let horizon = params.horizon.as_deref();
+        // Treat empty strings as "omit this filter" — the agent often
+        // emits "" instead of leaving the field out entirely.
+        let class = params
+            .classification
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let horizon = params
+            .horizon
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
         let since = params.since;
         let limit = params.limit.unwrap_or(50).clamp(1, 500);
         // Pull a generous slice — bucketing happens here; cap at 5000 to
