@@ -409,6 +409,113 @@ pub struct RankTuneCandidatesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeDriftParams {
+    /// Scope of the analysis. "global" or "class:STAIRCASE" /
+    /// "class:GRINDER" / "class:SPRING" / "class:DEVELOPING".
+    pub scope: String,
+    /// Number of time windows to slice the universe into. Default 4.
+    /// Range 2..=12.
+    #[serde(default)]
+    pub window_count: Option<i64>,
+    /// Total trailing span in seconds. Default: 30 days.
+    #[serde(default)]
+    pub window_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeFailureModesParams {
+    /// Scope filter — same shape as analyze_drift.
+    pub scope: String,
+    /// Earliest called_at to include. Default: now - 30d.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListEvolutionEventsParams {
+    /// Optional kind filter: "strategy" | "tool" | "site". None = all.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Cap on rows. Default 20, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// When true, includes the full body_md. Default false to keep
+    /// payloads compact.
+    #[serde(default)]
+    pub include_body: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComparePeriodsParams {
+    /// Scope filter.
+    pub scope: String,
+    /// Pivot timestamp (epoch seconds) — typically a prior tune's
+    /// committed_at. before_secs of universe up to this point becomes
+    /// the "before" window; after_secs from this point becomes the
+    /// "after" window. Defaults to now (use this with after_secs=0
+    /// to ask "what did the trailing window look like").
+    #[serde(default)]
+    pub anchor_at: Option<i64>,
+    /// "before" window length in seconds. Default 30 days.
+    #[serde(default)]
+    pub before_secs: Option<i64>,
+    /// "after" window length in seconds. Default = (now - anchor_at).
+    #[serde(default)]
+    pub after_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DescribeClassificationsParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SimulateOverridesParams {
+    /// List of overrides to apply on top of current state. Each entry
+    /// must be a (field, scope, new_value) triple. Stacks atop already-
+    /// committed overrides; if a (field, scope) is in this list and
+    /// also a real override, the simulation uses this list's value.
+    pub overrides: Vec<SimulateOverrideEntry>,
+    /// Earliest called_at to include. Default: trailing 30d.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SimulateOverrideEntry {
+    pub field: String,
+    pub scope: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewLogParams {
+    /// How many recent cycles to return. Default 10, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewLogWriteParams {
+    /// Epoch seconds when the cycle started.
+    pub started_at: i64,
+    /// "propose" | "commit".
+    pub mode: String,
+    /// "proposed" | "committed" | "stopped" | "failed".
+    pub outcome: String,
+    /// One-paragraph summary of what the cycle did and why. Becomes
+    /// the agent's note-to-future-self.
+    pub summary: String,
+    /// Optional proposal id this cycle produced.
+    #[serde(default)]
+    pub proposal_id: Option<i64>,
+    /// Optional turn count (claw fills this in).
+    #[serde(default)]
+    pub turns: Option<i64>,
+    /// Optional tool-call count (claw fills this in).
+    #[serde(default)]
+    pub tool_calls: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DescribeSignalFiltersParams {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3377,6 +3484,481 @@ impl ExcitonServer {
         .to_string()
     }
 
+    /// Time-windowed drift detector. Slices the closed-call universe
+    /// into N equal time windows and reports per-window (n, mean_pnl,
+    /// win_rate). The agent uses this to spot "this bucket was +12%
+    /// for the first 3 weeks then -8% in week 4" patterns that
+    /// `analyze_outcomes` smoothes over.
+    #[tool]
+    async fn analyze_drift(
+        &self,
+        Parameters(params): Parameters<AnalyzeDriftParams>,
+    ) -> String {
+        let window_count = params.window_count.unwrap_or(4).clamp(2, 12);
+        let span = params.window_secs.unwrap_or(30 * 24 * 60 * 60);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - span;
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, Some(since), 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let window_size = span / window_count;
+        let windows: Vec<serde_json::Value> = (0..window_count)
+            .map(|i| {
+                let start = since + i * window_size;
+                let end = start + window_size;
+                let slice: Vec<&crate::db::CallOutcome> = outcomes
+                    .iter()
+                    .filter(|o| o.called_at >= start && o.called_at < end)
+                    .collect();
+                let n = slice.len() as i64;
+                let pnls: Vec<f64> = slice.iter().filter_map(|r| r.pnl_pct).collect();
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let wins = slice.iter().filter(|r| r.status == "withdrew").count() as i64;
+                let win_rate = if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 };
+                serde_json::json!({
+                    "window_index": i,
+                    "start": start,
+                    "end": end,
+                    "n": n,
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "win_rate_pct": round2(win_rate),
+                })
+            })
+            .collect();
+        let overall_pnls: Vec<f64> = outcomes.iter().filter_map(|r| r.pnl_pct).collect();
+        let overall_mean = if overall_pnls.is_empty() {
+            None
+        } else {
+            Some(overall_pnls.iter().sum::<f64>() / overall_pnls.len() as f64)
+        };
+        // Drift signal: largest absolute delta of any window's mean from
+        // the overall mean, plus the trend direction (last - first).
+        let mut max_dev: f64 = 0.0;
+        let mut max_dev_idx: i64 = -1;
+        if let Some(om) = overall_mean {
+            for w in &windows {
+                if let Some(m) = w.get("mean_pnl_pct").and_then(|v| v.as_f64()) {
+                    let dev = (m - om).abs();
+                    if dev > max_dev {
+                        max_dev = dev;
+                        max_dev_idx = w.get("window_index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    }
+                }
+            }
+        }
+        let first_mean = windows
+            .first()
+            .and_then(|w| w.get("mean_pnl_pct"))
+            .and_then(|v| v.as_f64());
+        let last_mean = windows
+            .last()
+            .and_then(|w| w.get("mean_pnl_pct"))
+            .and_then(|v| v.as_f64());
+        let trend = match (first_mean, last_mean) {
+            (Some(f), Some(l)) => Some(l - f),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "since": since,
+            "window_count": window_count,
+            "window_size_secs": window_size,
+            "universe_n": outcomes.len(),
+            "overall_mean_pnl_pct": overall_mean.map(round2),
+            "windows": windows,
+            "max_deviation_pct": round2(max_dev),
+            "max_deviation_window": max_dev_idx,
+            "trend_first_to_last_pct": trend.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Failure-mode taxonomy. For closed calls in scope, classify each
+    /// non-winning outcome into a category by status + exit_note pattern,
+    /// returning counts + mean PnL per category. Lets the agent name
+    /// what's broken (rug vs timeout vs slow-bleed) instead of just
+    /// reporting "lots of failures."
+    #[tool]
+    async fn analyze_failure_modes(
+        &self,
+        Parameters(params): Parameters<AnalyzeFailureModesParams>,
+    ) -> String {
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<&str, Vec<&crate::db::CallOutcome>> = BTreeMap::new();
+        for o in &outcomes {
+            let mode = classify_failure_mode(o);
+            buckets.entry(mode).or_default().push(o);
+        }
+        let summaries: Vec<serde_json::Value> = buckets
+            .into_iter()
+            .map(|(mode, rows)| {
+                let n = rows.len() as i64;
+                let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let median = if pnls.is_empty() {
+                    None
+                } else {
+                    let mut sorted = pnls.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(sorted[sorted.len() / 2])
+                };
+                serde_json::json!({
+                    "mode": mode,
+                    "n": n,
+                    "share_pct": round2(100.0 * n as f64 / outcomes.len().max(1) as f64),
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "median_pnl_pct": median.map(round2),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "since": since,
+            "universe_n": outcomes.len(),
+            "modes": summaries,
+        })
+        .to_string()
+    }
+
+    /// Read the public diary so the agent can avoid repeating itself
+    /// and can cite prior moves when narrating a new one. Body_md is
+    /// omitted by default to keep payloads small — set
+    /// `include_body=true` when the agent specifically wants to see
+    /// what its previous voice looked like.
+    #[tool]
+    async fn list_evolution_events(
+        &self,
+        Parameters(params): Parameters<ListEvolutionEventsParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(20).clamp(1, 200);
+        let kind_filter = params
+            .kind
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        match self.db.list_evolution_events(kind_filter, limit) {
+            Ok(rows) => {
+                let entries: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|e| {
+                        let mut obj = serde_json::json!({
+                            "id": e.id,
+                            "kind": e.kind,
+                            "summary": e.summary,
+                            "committed_at": e.committed_at,
+                            "posted_at": e.posted_at,
+                            "proposal_id": e.proposal_id,
+                            "diary_path": e.diary_path,
+                        });
+                        if params.include_body {
+                            obj["body_md"] = serde_json::json!(e.body_md);
+                        }
+                        obj
+                    })
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "count": entries.len(),
+                    "events": entries,
+                })
+                .to_string()
+            }
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Before/after comparison anchored at a timestamp (e.g. a prior
+    /// tune's committed_at). Returns per-window aggregates + delta.
+    /// "Did my last tune actually work?" tool. anchor_at defaults to
+    /// now; use the tune's committed_at to compare pre-tune vs
+    /// post-tune performance.
+    #[tool]
+    async fn compare_periods(
+        &self,
+        Parameters(params): Parameters<ComparePeriodsParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let anchor = params.anchor_at.unwrap_or(now);
+        let before_span = params.before_secs.unwrap_or(30 * 24 * 60 * 60);
+        let after_span = params.after_secs.unwrap_or((now - anchor).max(0));
+        let before_start = anchor - before_span;
+        let before_end = anchor;
+        let after_start = anchor;
+        let after_end = anchor + after_span;
+        let class = scope_class(&params.scope);
+        // Pull a wide superset and partition in-memory; cheaper than two
+        // round trips and keeps the bucket math identical.
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, Some(before_start), 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let before: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|o| o.called_at >= before_start && o.called_at < before_end)
+            .collect();
+        let after: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|o| o.called_at >= after_start && o.called_at < after_end)
+            .collect();
+        let stats = |rows: &[&crate::db::CallOutcome]| -> serde_json::Value {
+            let n = rows.len() as i64;
+            let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+            let mean = if pnls.is_empty() {
+                None
+            } else {
+                Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+            };
+            let wins = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+            let win_rate = if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 };
+            serde_json::json!({
+                "n": n,
+                "mean_pnl_pct": mean.map(round2),
+                "win_rate_pct": round2(win_rate),
+            })
+        };
+        let before_stats = stats(&before);
+        let after_stats = stats(&after);
+        let delta_mean = match (
+            after_stats.get("mean_pnl_pct").and_then(|v| v.as_f64()),
+            before_stats.get("mean_pnl_pct").and_then(|v| v.as_f64()),
+        ) {
+            (Some(a), Some(b)) => Some(a - b),
+            _ => None,
+        };
+        let delta_win = match (
+            after_stats.get("win_rate_pct").and_then(|v| v.as_f64()),
+            before_stats.get("win_rate_pct").and_then(|v| v.as_f64()),
+        ) {
+            (Some(a), Some(b)) => Some(a - b),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "anchor_at": anchor,
+            "before": {"start": before_start, "end": before_end, "stats": before_stats},
+            "after": {"start": after_start, "end": after_end, "stats": after_stats},
+            "delta_mean_pnl_pct": delta_mean.map(round2),
+            "delta_win_rate_pct": delta_win.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Glossary of classifications + horizons in voice. Returns the
+    /// agent's frame for what each label *means* — so the prompt
+    /// doesn't have to carry the glossary and so a future operator
+    /// can extend the surface without re-prompting.
+    #[tool]
+    async fn describe_classifications(
+        &self,
+        Parameters(_): Parameters<DescribeClassificationsParams>,
+    ) -> String {
+        serde_json::json!({
+            "ok": true,
+            "classifications": [
+                {
+                    "name": "STAIRCASE",
+                    "voice": "stair-stepping accumulation; volume + price advancing in steps. Higher confidence threshold because false positives on this shape are usually still alive — the strategy wants the cleanest stair, not the questionable one.",
+                    "default_floor": 70,
+                },
+                {
+                    "name": "GRINDER",
+                    "voice": "slow upward drift, narrow ATR, persistent bid. Forgivable on confidence (lower default floor) because the shape itself is anti-rug — quiet tape, organic distribution.",
+                    "default_floor": 65,
+                },
+                {
+                    "name": "SPRING",
+                    "voice": "compression + release; basing range broken. Newer pattern — no per-class default floor in production yet.",
+                    "default_floor": null,
+                },
+                {
+                    "name": "DEVELOPING",
+                    "voice": "still forming; not yet committed to a shape. Conservative floor (60) because the pattern is unproven; mostly a watch class.",
+                    "default_floor": 60,
+                }
+            ],
+            "horizons": [
+                {"name": "SCALP", "voice": "minutes-scale flip; exit on first stall."},
+                {"name": "SHORT", "voice": "hours-scale; ride the first leg, exit at first lower-high."},
+                {"name": "LONG", "voice": "days-scale; let position breathe through normal pullbacks."},
+                {"name": "MOONSHOT", "voice": "low-probability multi-x runner; size small, hold through most drawdowns."},
+            ],
+            "tunable_classes": ["STAIRCASE", "GRINDER", "SPRING"],
+            "note": "DEVELOPING has a compile-time floor but is not in the per-class scope allow-list for tunes — only STAIRCASE/GRINDER/SPRING accept class:X overrides."
+        })
+        .to_string()
+    }
+
+    /// Counterfactual replay applying multiple overrides at once.
+    /// Lets the agent test combined effects ("what if I tighten BOTH
+    /// confidence and liquidity?") deterministically — no LLM math.
+    /// Returns the would-have-been bucket aggregates plus delta vs the
+    /// current bucket.
+    #[tool]
+    async fn simulate_overrides(
+        &self,
+        Parameters(params): Parameters<SimulateOverridesParams>,
+    ) -> String {
+        if params.overrides.is_empty() {
+            return serde_json::json!({"ok": false, "error": "empty_overrides", "message": "at least one override required"}).to_string();
+        }
+        for o in &params.overrides {
+            if let Err(e) = validate_field_scope(&o.field, &o.scope) {
+                return serde_json::json!({"ok": false, "error": "invalid_field_or_scope", "detail": e}).to_string();
+            }
+            if let Err(e) = validate_field_value(&o.field, &o.new_value) {
+                return serde_json::json!({"ok": false, "error": "invalid_value", "detail": e}).to_string();
+            }
+            if !field_is_sweepable(&o.field) {
+                return serde_json::json!({"ok": false, "error": "field_not_sweepable", "field": o.field}).to_string();
+            }
+        }
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let outcomes = match self.db.list_closed_call_outcomes(None, None, since, 5000) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let baseline = bucket_stats(&outcomes);
+
+        // For each call, check if it passes ALL the simulated overrides.
+        // Per-class scopes only apply when call.classification matches.
+        let passing: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|c| {
+                params.overrides.iter().all(|ov| {
+                    let scope_class = ov.scope.strip_prefix("class:");
+                    if let Some(sc) = scope_class {
+                        if c.classification != sc {
+                            // Override doesn't apply to this call's class — pass.
+                            return true;
+                        }
+                    }
+                    call_passes(c, &ov.field, &ov.new_value)
+                })
+            })
+            .collect();
+        let pnls: Vec<f64> = passing.iter().filter_map(|r| r.pnl_pct).collect();
+        let mean = if pnls.is_empty() {
+            None
+        } else {
+            Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+        };
+        let wins = passing.iter().filter(|r| r.status == "withdrew").count() as i64;
+        let win_rate = if !passing.is_empty() {
+            100.0 * wins as f64 / passing.len() as f64
+        } else {
+            0.0
+        };
+        let cur_mean = baseline.get("mean_pnl_pct").and_then(|v| v.as_f64());
+        let delta = match (mean, cur_mean) {
+            (Some(p), Some(c)) => Some(p - c),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "since": since,
+            "overrides": params.overrides.iter().map(|o| serde_json::json!({
+                "field": o.field, "scope": o.scope, "new_value": o.new_value
+            })).collect::<Vec<_>>(),
+            "baseline": baseline,
+            "simulated": {
+                "n": passing.len(),
+                "mean_pnl_pct": mean.map(round2),
+                "win_rate_pct": round2(win_rate),
+            },
+            "delta_mean_pnl_pct": delta.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Read recent claw review cycles. Lets the agent recall what it
+    /// looked at + concluded last time so the cycles aren't independent.
+    #[tool]
+    async fn review_log(
+        &self,
+        Parameters(params): Parameters<ReviewLogParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(10).clamp(1, 200);
+        match self.db.list_review_cycles(limit) {
+            Ok(rows) => serde_json::json!({
+                "ok": true,
+                "count": rows.len(),
+                "cycles": rows,
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Write a review-cycle ledger row. Claw calls this once per cycle
+    /// at the end with a one-paragraph summary; future cycles read via
+    /// `review_log`. The agent's memory across runs.
+    #[tool]
+    async fn review_log_write(
+        &self,
+        Parameters(params): Parameters<ReviewLogWriteParams>,
+    ) -> String {
+        if !["propose", "commit"].contains(&params.mode.as_str()) {
+            return serde_json::json!({"ok": false, "error": "invalid_mode"}).to_string();
+        }
+        if !["proposed", "committed", "stopped", "failed"].contains(&params.outcome.as_str()) {
+            return serde_json::json!({"ok": false, "error": "invalid_outcome"}).to_string();
+        }
+        let summary = params.summary.trim();
+        if summary.is_empty() || summary.len() > 2000 {
+            return serde_json::json!({"ok": false, "error": "summary_length", "message": "summary must be 1..=2000 chars"}).to_string();
+        }
+        let now = chrono::Utc::now().timestamp();
+        match self.db.insert_review_cycle(
+            params.started_at,
+            Some(now),
+            &params.mode,
+            &params.outcome,
+            params.proposal_id,
+            summary,
+            params.turns,
+            params.tool_calls,
+        ) {
+            Ok(id) => serde_json::json!({
+                "ok": true,
+                "review_cycle_id": id,
+                "ended_at": now,
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        }
+    }
+
     /// Internal helper — publishes a freshly-inserted evolution event to
     /// the operator's surfaces (Telegram channel + publisher diary). All
     /// failures are non-fatal; the evolution row already lives in DB and
@@ -3573,6 +4155,43 @@ const PROMPT_MAX: usize = 20_000;
 /// new tunable requires editing this map AND wiring it into should_signal
 /// (Phase A5). Until both are done, the agent gets `invalid_field_or_scope`
 /// — preventing the agent from inventing fields the runtime won't honor.
+/// Classify a closed call into a failure-mode bucket based on status
+/// + exit_note text. Coarse but useful: `winner` (positive PnL),
+/// `flat` (small abs PnL), `slow_bleed` (negative + slow exit),
+/// `drawdown_cap` (note mentions stop/dropped), `rug_or_fast_dump`
+/// (large negative + fast exit), `timeout` (status=expired), `void`
+/// (status=voided / failed-but-no-fill).
+fn classify_failure_mode(o: &crate::db::CallOutcome) -> &'static str {
+    if o.status == "voided" {
+        return "void";
+    }
+    if o.status == "expired" {
+        return "timeout";
+    }
+    let pnl = o.pnl_pct.unwrap_or(0.0);
+    if pnl >= 5.0 {
+        return "winner";
+    }
+    if pnl >= -5.0 {
+        return "flat";
+    }
+    let note = o.exit_note.as_deref().unwrap_or("").to_lowercase();
+    if note.contains("rug") || note.contains("dump") || note.contains("trap") {
+        return "rug_or_fast_dump";
+    }
+    if note.contains("stop") || note.contains("dropped") || note.contains("cap") {
+        return "drawdown_cap";
+    }
+    let hold = o.hold_secs.unwrap_or(0);
+    if pnl <= -25.0 && hold < 600 {
+        return "rug_or_fast_dump";
+    }
+    if pnl <= -15.0 && hold > 1800 {
+        return "slow_bleed";
+    }
+    "slow_bleed"
+}
+
 /// Resolve the current effective value of a (field, scope) — the
 /// override if one exists, otherwise the compile-time default. Returns
 /// the value as a string so the agent can pass it directly as

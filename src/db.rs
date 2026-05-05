@@ -115,6 +115,22 @@ pub struct EvolutionEvent {
     pub diary_path: Option<String>,
 }
 
+/// One claw review cycle's record. Lets the agent recall what it
+/// looked at + concluded last cycle so successive cycles aren't
+/// independent. Written by `review_log_write`; read by `review_log`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewCycle {
+    pub id: i64,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub mode: String,
+    pub outcome: String,
+    pub proposal_id: Option<i64>,
+    pub summary: String,
+    pub turns: Option<i64>,
+    pub tool_calls: Option<i64>,
+}
+
 /// One closed call's worth of fields needed for outcome analysis.
 /// pnl_pct + hold_secs are derived inline from entry/exit/timestamps.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -764,6 +780,24 @@ impl Db {
                 ON evolution_events(committed_at DESC);
             CREATE INDEX IF NOT EXISTS idx_evolution_kind
                 ON evolution_events(kind);
+
+            -- Per-cycle ledger so the agent has memory across runs.
+            -- Each row captures one claw `review` invocation and what it
+            -- concluded. The agent reads recent rows to avoid restating
+            -- the same diagnosis it made last cycle.
+            CREATE TABLE IF NOT EXISTS review_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                mode TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                proposal_id INTEGER,
+                summary TEXT NOT NULL,
+                turns INTEGER,
+                tool_calls INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_cycles_started
+                ON review_cycles(started_at DESC);
             ",
         )?;
 
@@ -3857,6 +3891,63 @@ impl Db {
                     posted_at: r.get(7)?,
                     channel_msg_id: r.get(8)?,
                     diary_path: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_review_cycle(
+        &self,
+        started_at: i64,
+        ended_at: Option<i64>,
+        mode: &str,
+        outcome: &str,
+        proposal_id: Option<i64>,
+        summary: &str,
+        turns: Option<i64>,
+        tool_calls: Option<i64>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO review_cycles
+                (started_at, ended_at, mode, outcome, proposal_id, summary, turns, tool_calls)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                started_at,
+                ended_at,
+                mode,
+                outcome,
+                proposal_id,
+                summary,
+                turns,
+                tool_calls
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_review_cycles(&self, limit: i64) -> Result<Vec<ReviewCycle>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, ended_at, mode, outcome, proposal_id,
+                    summary, turns, tool_calls
+               FROM review_cycles
+              ORDER BY started_at DESC
+              LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                Ok(ReviewCycle {
+                    id: r.get(0)?,
+                    started_at: r.get(1)?,
+                    ended_at: r.get(2)?,
+                    mode: r.get(3)?,
+                    outcome: r.get(4)?,
+                    proposal_id: r.get(5)?,
+                    summary: r.get(6)?,
+                    turns: r.get(7)?,
+                    tool_calls: r.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -25,13 +25,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde_json::json;
 
-/// Hard cap on agent turns per review. Each turn = one provider.complete.
-/// With the D1 deterministic-tools surface (rank_tune_candidates does the
-/// search) a normal cycle lands in 3-4 turns: list_tunes →
-/// rank_tune_candidates → propose_tune → (commit_tune if mode=commit).
-/// 8 leaves headroom for one diagnostic detour + final message without
-/// runaway loops.
-const MAX_TURNS: usize = 8;
+/// Hard cap on agent turns per review. With the D1+D2+D3 surface the
+/// happy path is review_log → list_tunes → rank_tune_candidates →
+/// propose_tune → review_log_write → final message ≈ 5-6 turns. 10
+/// leaves headroom for one diagnostic detour without runaway loops.
+const MAX_TURNS: usize = 10;
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 
@@ -73,13 +71,15 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
     let since = now - args.window_secs;
     let user_kickoff = format!(
-        "Review cycle starting now (epoch={}). Window: last {}s (since={}). Mode: {}.\n\n\
+        "Review cycle starting now (started_at={}). Window: last {}s (since={}). Mode: {}.\n\n\
          Suggested flow:\n\
-         1. `list_tunes(limit=20)` — check prior moves.\n\
-         2. `rank_tune_candidates(top_k=5, since={})` — get the pre-validated menu. The server already enforces n≥10, effect≥5%, holdout≥0.\n\
-         3. If a row clears your robustness judgment, call `propose_tune` with that row's `evidence_json` verbatim. {}.\n\
-         4. Otherwise stop with a brief explanation of what you saw.\n\n\
-         You should NOT call `analyze_outcomes` or `sweep_threshold` unless `rank_tune_candidates` returned an empty/weak menu and you want to investigate a specific bucket. The ranker already covers the deterministic search.",
+         1. `review_log(limit=5)` — check what you concluded last cycle. Don't restate yesterday's diagnosis; only act on new evidence.\n\
+         2. `list_tunes(limit=20)` — check prior moves still on file.\n\
+         3. `rank_tune_candidates(top_k=5, since={})` — pre-validated menu. n≥10, effect≥5%, holdout≥0 already enforced.\n\
+         4. If a row clears your robustness judgment, call `propose_tune` with that row's `evidence_json` verbatim. {}.\n\
+         5. **ALWAYS** finish by calling `review_log_write(started_at={}, mode=\"{}\", outcome=..., summary=..., proposal_id=...?, turns=..., tool_calls=...)`. This is how future cycles see what you did.\n\
+         6. Then output your final message and stop.\n\n\
+         Do not call `analyze_outcomes` or `sweep_threshold` unless `rank_tune_candidates` returned weak — the ranker already covers the deterministic search. The diagnostic tools (`analyze_drift`, `analyze_failure_modes`, `compare_periods`) are for narrating *why*, not for finding candidates.",
         now,
         args.window_secs,
         since,
@@ -90,6 +90,8 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         } else {
             "Stop after propose; no commit this cycle"
         },
+        now,
+        args.mode,
     );
 
     let mut messages = vec![
@@ -267,6 +269,140 @@ fn autonomy_tools() -> Vec<ToolSpec> {
                           values). Read counterpart to commit_tune writes."
                 .into(),
             parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "review_log".into(),
+            description: "Read recent claw review cycles. Use this at the \
+                          start of a cycle to know what you concluded last \
+                          time; helps avoid restating the same diagnosis."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Default 10, max 200." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "review_log_write".into(),
+            description: "Write this cycle's ledger row at the end. ALWAYS \
+                          call this exactly once per cycle, after you've \
+                          either proposed/committed or stopped — that's how \
+                          future cycles know what you did."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["started_at", "mode", "outcome", "summary"],
+                "properties": {
+                    "started_at": { "type": "integer", "description": "Epoch seconds the cycle started — use the value from the kickoff message." },
+                    "mode": { "type": "string", "description": "propose | commit" },
+                    "outcome": { "type": "string", "description": "proposed | committed | stopped | failed" },
+                    "summary": { "type": "string", "description": "One paragraph note-to-future-self." },
+                    "proposal_id": { "type": "integer", "description": "Optional. Set if this cycle produced one." },
+                    "turns": { "type": "integer" },
+                    "tool_calls": { "type": "integer" }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "analyze_drift".into(),
+            description: "Time-windowed performance check on a scope. \
+                          Slices the closed-call universe into N windows \
+                          and reports per-window stats so you can spot \
+                          rotting buckets analyze_outcomes smoothes over."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["scope"],
+                "properties": {
+                    "scope": { "type": "string", "description": "global | class:STAIRCASE | class:GRINDER | class:SPRING | class:DEVELOPING" },
+                    "window_count": { "type": "integer", "description": "Default 4. Range 2..=12." },
+                    "window_secs": { "type": "integer", "description": "Total span in seconds. Default 30 days." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "analyze_failure_modes".into(),
+            description: "Failure-mode taxonomy for closed calls in scope. \
+                          Buckets non-winners into rug_or_fast_dump, \
+                          slow_bleed, drawdown_cap, timeout, void, flat, \
+                          winner; returns share + mean PnL per bucket."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["scope"],
+                "properties": {
+                    "scope": { "type": "string" },
+                    "since": { "type": "integer" }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "list_evolution_events".into(),
+            description: "Read the public diary so you don't repeat \
+                          yourself. Returns kind/summary/committed_at; \
+                          set include_body=true to see your prior voice."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "description": "strategy | tool | site. Omit for all." },
+                    "limit": { "type": "integer", "description": "Default 20, max 200." },
+                    "include_body": { "type": "boolean", "description": "Include the full body_md. Default false." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "compare_periods".into(),
+            description: "Before/after comparison anchored at a timestamp. \
+                          Use with anchor_at = a prior tune's committed_at \
+                          to answer 'did my last tune work?'."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["scope"],
+                "properties": {
+                    "scope": { "type": "string" },
+                    "anchor_at": { "type": "integer", "description": "Pivot timestamp. Default now." },
+                    "before_secs": { "type": "integer", "description": "Default 30 days." },
+                    "after_secs": { "type": "integer", "description": "Default = (now - anchor_at)." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "describe_classifications".into(),
+            description: "Glossary: classification names, horizons, voice \
+                          framing, default floors. Read once if you need \
+                          to refresh on what each label means."
+                .into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "simulate_overrides".into(),
+            description: "Counterfactual replay applying multiple overrides \
+                          at once. For testing combined effects (tighten \
+                          confidence AND liquidity simultaneously) without \
+                          asking the LLM to do the math."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["overrides"],
+                "properties": {
+                    "overrides": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["field", "scope", "new_value"],
+                            "properties": {
+                                "field": { "type": "string" },
+                                "scope": { "type": "string" },
+                                "new_value": { "type": "string" }
+                            }
+                        }
+                    },
+                    "since": { "type": "integer" }
+                }
+            }),
         },
         ToolSpec {
             name: "analyze_outcomes".into(),
