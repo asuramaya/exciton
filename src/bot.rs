@@ -727,7 +727,7 @@ impl DmBot {
                          <b>Runtime</b>\n\
                          /halt · /resume · /threshold &lt;N&gt; · /stats\n\n\
                          <i>Public intel (/scan, /inspect, /signals, etc.) lives on the public bot.</i></blockquote>",
-                    ).into()
+                    )
                 }
             }
         };
@@ -749,7 +749,7 @@ impl DmBot {
         let now = chrono::Utc::now().timestamp();
         let _ = self.db.acknowledge_stale_alerts(1800);
         let pending = self.db.get_signal_alerts(20).unwrap_or_default();
-        let total = self.db.pending_alert_count().unwrap_or(0) as usize;
+        let total = self.db.pending_alert_count().unwrap_or(0);
         let ops_count = total.saturating_sub(pending.len());
 
         if pending.is_empty() {
@@ -2591,7 +2591,7 @@ fn strip_tool_blocks(text: &str) -> String {
         let mut earliest: Option<(usize, &str)> = None;
         for tag in OPEN_TAGS {
             if let Some(pos) = s.find(tag) {
-                if earliest.map_or(true, |(p, _)| pos < p) {
+                if earliest.is_none_or(|(p, _)| pos < p) {
                     earliest = Some((pos, tag));
                 }
             }
@@ -2770,7 +2770,7 @@ pub async fn serve_claw_api(
                         .split(|&b| b == b'\n')
                         .find(|l| l.to_ascii_lowercase().starts_with(b"content-length:"))
                         .and_then(|l| std::str::from_utf8(l).ok())
-                        .and_then(|l| l.splitn(2, ':').nth(1))
+                        .and_then(|l| l.split_once(':').map(|x| x.1))
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
                     if raw_bytes.len() >= pos + 4 + cl {
@@ -2802,7 +2802,7 @@ pub async fn serve_claw_api(
             let header_secret = headers_part
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("x-claw-secret:"))
-                .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
+                .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string())
                 .unwrap_or_default();
             if !ct_eq(header_secret.as_bytes(), secret.as_bytes()) {
                 let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\n\r\n").await;

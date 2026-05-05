@@ -126,11 +126,8 @@ pub async fn check_graduated_tokens(
             seen_mints.insert(mint.clone());
             // Only re-analyze mints we've already seen on pump.fun that haven't
             // made it to the watchlist yet, and aren't in cooldown.
-            match db.is_graduation_candidate(&mint, GRADUATION_COOLDOWN_SECS) {
-                Ok(true) => {
-                    graduated.push(mint);
-                }
-                _ => {}
+            if let Ok(true) = db.is_graduation_candidate(&mint, GRADUATION_COOLDOWN_SECS) {
+                graduated.push(mint);
             }
             if graduated.len() >= limit {
                 break;

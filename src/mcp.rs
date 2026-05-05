@@ -1337,7 +1337,7 @@ impl ExcitonServer {
             "publisher": {
                 "health_path": publisher_path,
                 "last_push_seconds_ago": publisher_age_seconds,
-                "status": if publisher_age_seconds < 0 || publisher_age_seconds > 720 {
+                "status": if !(0..=720).contains(&publisher_age_seconds) {
                     "stale"
                 } else {
                     "fresh"
@@ -3090,7 +3090,7 @@ impl ExcitonServer {
                 let mut s = p.content;
                 if s.len() > 240 {
                     s.truncate(240);
-                    s.push_str("…");
+                    s.push('…');
                 }
                 s
             };
@@ -3583,8 +3583,8 @@ impl ExcitonServer {
                     if n < EVIDENCE_FLOOR
                         || effect < EFFECT_FLOOR_PCT
                         || holdout_n < 1
-                        || holdout_pnl.map_or(true, |h| h < 0.0)
-                        || spread.map_or(true, |s| s < SPREAD_FLOOR_PCT)
+                        || holdout_pnl.is_none_or(|h| h < 0.0)
+                        || spread.is_none_or(|s| s < SPREAD_FLOOR_PCT)
                     {
                         continue;
                     }
@@ -4556,28 +4556,28 @@ fn call_passes(call: &crate::db::CallOutcome, field: &str, candidate_str: &str) 
     match field {
         "min_effective_confidence" => candidate_str
             .parse::<i32>()
-            .map_or(false, |c| call.confidence >= c),
+            .is_ok_and(|c| call.confidence >= c),
         "max_top_holder_pct" => candidate_str
             .parse::<f64>()
-            .map_or(false, |c| call.entry_top_holder_pct <= c),
+            .is_ok_and(|c| call.entry_top_holder_pct <= c),
         "min_liquidity_usd" => candidate_str
             .parse::<f64>()
-            .map_or(false, |c| call.entry_liquidity_usd >= c),
+            .is_ok_and(|c| call.entry_liquidity_usd >= c),
         "max_h1_price_change_pct" => candidate_str
             .parse::<f64>()
-            .map_or(false, |cap| match call.entry_price_change_h1 {
+            .is_ok_and(|cap| match call.entry_price_change_h1 {
                 Some(pc) => pc <= cap,
                 None => true,
             }),
         "min_h1_price_change_pct" => candidate_str
             .parse::<f64>()
-            .map_or(false, |floor| match call.entry_price_change_h1 {
+            .is_ok_and(|floor| match call.entry_price_change_h1 {
                 Some(pc) => pc >= floor,
                 None => true,
             }),
         "max_pre_call_peak_vs_entry_pct" => candidate_str
             .parse::<f64>()
-            .map_or(false, |cap| match call.entry_pre_call_peak_pct {
+            .is_ok_and(|cap| match call.entry_pre_call_peak_pct {
                 Some(p) => p <= cap,
                 None => true,
             }),

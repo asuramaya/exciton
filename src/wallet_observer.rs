@@ -69,7 +69,7 @@ pub fn should_trace(
     liquidity_usd: f64,
     holder_count: i64,
 ) -> bool {
-    if !HEALTHY_CLASSES.iter().any(|c| *c == classification) {
+    if !HEALTHY_CLASSES.contains(&classification) {
         return false;
     }
     if age_secs < MIN_AGE_SECS {

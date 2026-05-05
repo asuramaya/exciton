@@ -126,7 +126,7 @@ pub async fn scout_deployer(
     let mut last_ts: Option<i64> = None;
     for s in &sigs {
         let Some(ts) = s.block_time else { continue };
-        if last_ts.map_or(true, |prev| ts > prev) {
+        if last_ts.is_none_or(|prev| ts > prev) {
             last_ts = Some(ts);
         }
         let age = now - ts;
@@ -139,7 +139,7 @@ pub async fn scout_deployer(
     }
 
     let seconds_since_last_tx = last_ts.map(|ts| now - ts);
-    let active = seconds_since_last_tx.map_or(false, |s| s <= 86_400 * 2);
+    let active = seconds_since_last_tx.is_some_and(|s| s <= 86_400 * 2);
 
     Ok(Some(DeployerProfile {
         deployer_address: deployer,
@@ -325,7 +325,7 @@ fn starts_with_ci(bytes: &[u8], pos: usize, needle: &[u8]) -> bool {
     }
     for (i, &nb) in needle.iter().enumerate() {
         let b = bytes[pos + i];
-        if b.to_ascii_lowercase() != nb.to_ascii_lowercase() {
+        if !b.eq_ignore_ascii_case(&nb) {
             return false;
         }
     }
@@ -386,7 +386,7 @@ pub async fn whale_trace(mint: &str, rpc: &Arc<RpcRouter>) -> Result<Vec<WhaleMo
         .unwrap_or_else(|_| vec![None; top10.len()]);
 
     let mut moves: Vec<WhaleMove> = Vec::new();
-    for (h, owner_opt) in top10.iter().zip(owner_batch.into_iter()) {
+    for (h, owner_opt) in top10.iter().zip(owner_batch) {
         let pct_of_supply = if supply_ui > 0.0 {
             h.ui_amount / supply_ui * 100.0
         } else {
@@ -824,7 +824,7 @@ pub async fn cohort_overlap(
         .get_multiple_token_account_owners(&holder_addrs)
         .await
         .unwrap_or_else(|_| vec![None; holder_addrs.len()]);
-    for (h, owner_opt) in holders.iter().take(20).zip(owner_batch.into_iter()) {
+    for (h, owner_opt) in holders.iter().take(20).zip(owner_batch) {
         let owner = match owner_opt {
             Some(o) => o,
             None => continue,

@@ -22,6 +22,12 @@ impl std::fmt::Display for Regime {
 #[derive(Clone)]
 pub struct Forecaster;
 
+impl Default for Forecaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Forecaster {
     pub fn new() -> Self {
         Self

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Claw — Exciton's autonomous agent runtime.
 //!
 //! Three subcommands cover the v0 lifecycle:

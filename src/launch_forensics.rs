@@ -73,7 +73,7 @@ pub async fn compute(
     // get summed.
     let mut owner_balances: HashMap<String, f64> = HashMap::new();
     let mut top_owners_in_order: Vec<String> = Vec::new();
-    for (h, owner_opt) in largest.iter().zip(owners.into_iter()) {
+    for (h, owner_opt) in largest.iter().zip(owners) {
         if let Some(owner) = owner_opt {
             *owner_balances.entry(owner.clone()).or_insert(0.0) += h.ui_amount;
             if !top_owners_in_order.contains(&owner) {
@@ -211,11 +211,9 @@ async fn compute_smart_money_count(
     });
     let results = futures_util::future::join_all(futures).await;
     let mut count = 0i32;
-    for r in results {
-        if let Some(holdings) = r {
-            if holdings.iter().any(|(mint, _)| refs.contains(mint)) {
-                count += 1;
-            }
+    for holdings in results.into_iter().flatten() {
+        if holdings.iter().any(|(mint, _)| refs.contains(mint)) {
+            count += 1;
         }
     }
     Ok(count)

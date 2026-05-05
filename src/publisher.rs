@@ -484,7 +484,7 @@ impl Publisher {
         //    that are fully exited (current balance == 0). For partial exits
         //    we book proportionally: realized = received - (sold_tokens/bought_tokens)*spent.
         let mut realized_sol_net = 0f64;
-        for (_mint, (bt, bs, st, rs)) in &cb_map {
+        for (bt, bs, st, rs) in cb_map.values() {
             if *st <= 0.0 || *bt <= 0.0 {
                 continue;
             }
@@ -879,8 +879,8 @@ impl Publisher {
                         let exit_note = c.exit_note.clone().unwrap_or_default();
                         let exit_pct = exit_pct_from_note(&exit_note);
                         let interesting = match c.status.as_str() {
-                            "withdrew" | "closed" => exit_pct.map_or(true, |p| p >= 25.0),
-                            "failed" => exit_pct.map_or(true, |p| p <= -35.0),
+                            "withdrew" | "closed" => exit_pct.is_none_or(|p| p >= 25.0),
+                            "failed" => exit_pct.is_none_or(|p| p <= -35.0),
                             _ => true,
                         };
                         if !interesting {
@@ -1323,10 +1323,7 @@ impl Publisher {
             let window_end = call.closed_at.unwrap_or(now);
             // Pull up to 200 snapshots — covers a 30d LONG call at 15s
             // cycles after the watchlist drops to 5min cadence.
-            let snaps = match self.db.get_snapshot_history(&call.mint, 200) {
-                Ok(s) => s,
-                Err(_) => Vec::new(),
-            };
+            let snaps = self.db.get_snapshot_history(&call.mint, 200).unwrap_or_default();
             // Filter to the window + reverse to chronological. Drop
             // snapshots before called_at (orphan analyses from when
             // the token wasn't on the watchlist as a call yet).
@@ -1334,7 +1331,7 @@ impl Publisher {
                 .into_iter()
                 .filter(|s| s.timestamp >= call.called_at && s.timestamp <= window_end)
                 .collect();
-            in_window.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            in_window.sort_by_key(|a| a.timestamp);
             // Idempotency: when the latest snapshot ts in the file
             // matches what we'd write, skip. Closed calls converge to
             // a stable file after one write.

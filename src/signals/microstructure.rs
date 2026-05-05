@@ -14,6 +14,12 @@ pub struct MicroMetrics {
     pub window_seconds: i64,
 }
 
+impl Default for MicrostructureAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MicrostructureAnalyzer {
     pub fn new() -> Self {
         Self

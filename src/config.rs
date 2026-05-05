@@ -301,7 +301,7 @@ impl RpcConfig {
             if url.contains("helius-rpc.com") || url.contains("helius.xyz") {
                 if let Some(idx) = url.find("api-key=") {
                     let after = &url[idx + "api-key=".len()..];
-                    let key = after.split(|c: char| c == '&' || c == '#').next().unwrap_or("");
+                    let key = after.split(['&', '#']).next().unwrap_or("");
                     if !key.is_empty() {
                         return key.to_string();
                     }

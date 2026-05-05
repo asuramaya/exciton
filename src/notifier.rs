@@ -697,7 +697,7 @@ impl Notifier {
         first_seen: Option<i64>,
     ) -> Option<(&'static str, String)> {
         let class = a.confidence.classification.as_str();
-        let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
+        let class_ok = SIGNAL_REQUIRED_CLASSES.contains(&class);
         if !class_ok {
             return None; // structural miss
         }
@@ -774,7 +774,7 @@ impl Notifier {
                 return Some(("buy_sell_high", format!("b/s {:.2} > {:.2} (FOMO peak)", bsr, SIGNAL_MAX_BUY_SELL_RATIO)));
             }
         }
-        if a.delta.as_ref().map_or(true, |d| d.momentum_delta < 0) {
+        if a.delta.as_ref().is_none_or(|d| d.momentum_delta < 0) {
             if let Some(d) = a.delta.as_ref() {
                 return Some((
                     "momentum_delta",
@@ -786,27 +786,27 @@ impl Notifier {
         // Meta-dependent gates — without these tracked we can't see why
         // otherwise-clean candidates fail to fire.
         let liq = meta.and_then(|m| m.liquidity_usd);
-        if liq.map_or(true, |v| v < SIGNAL_MIN_LIQUIDITY_USD) {
+        if liq.is_none_or(|v| v < SIGNAL_MIN_LIQUIDITY_USD) {
             return Some(("liquidity", format!(
                 "liq ${:.0} < ${:.0}",
                 liq.unwrap_or(0.0), SIGNAL_MIN_LIQUIDITY_USD
             )));
         }
         let vol = meta.and_then(|m| m.volume_24h_usd);
-        if vol.map_or(true, |v| v < SIGNAL_MIN_VOLUME_24H_USD) {
+        if vol.is_none_or(|v| v < SIGNAL_MIN_VOLUME_24H_USD) {
             return Some(("volume24", format!(
                 "vol24 ${:.0} < ${:.0}",
                 vol.unwrap_or(0.0), SIGNAL_MIN_VOLUME_24H_USD
             )));
         }
         let mcap = meta.and_then(|m| m.market_cap_usd.or(m.fdv_usd));
-        if mcap.map_or(true, |v| v < SIGNAL_MIN_MCAP_USD) {
+        if mcap.is_none_or(|v| v < SIGNAL_MIN_MCAP_USD) {
             return Some(("mcap", format!(
                 "mcap ${:.0} < ${:.0}",
                 mcap.unwrap_or(0.0), SIGNAL_MIN_MCAP_USD
             )));
         }
-        if mcap.map_or(false, |v| v > SIGNAL_MAX_MCAP_USD) {
+        if mcap.is_some_and(|v| v > SIGNAL_MAX_MCAP_USD) {
             return Some(("mcap_high", format!(
                 "mcap ${:.0} > ${:.0} (mature-tape, low remaining upside)",
                 mcap.unwrap_or(0.0), SIGNAL_MAX_MCAP_USD
@@ -846,7 +846,7 @@ impl Notifier {
             return false;
         }
         let class = a.confidence.classification.as_str();
-        let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
+        let class_ok = SIGNAL_REQUIRED_CLASSES.contains(&class);
         // Runtime override snapshot. Read once per call from
         // signal_overrides — committed tunes from propose_tune/commit_tune
         // land here without a restart. Empty map = pure compile-time
@@ -883,7 +883,7 @@ impl Notifier {
         let top10_ok = a.top10_pct < SIGNAL_MAX_TOP10_PCT;
         // momentum_delta ≥ 0 means not fading. Missing delta (first-sight tokens)
         // counts as neutral — allowed through.
-        let momentum_ok = a.delta.as_ref().map_or(true, |d| d.momentum_delta >= 0);
+        let momentum_ok = a.delta.as_ref().is_none_or(|d| d.momentum_delta >= 0);
         // Require at least one prior snapshot — prevents first-sight signals.
         let history_ok = a.delta.is_some();
         // Market-data floors: prove the token has tradeable depth and is
@@ -894,16 +894,16 @@ impl Notifier {
             .unwrap_or(SIGNAL_MIN_LIQUIDITY_USD);
         let liq_ok = meta
             .and_then(|m| m.liquidity_usd)
-            .map_or(false, |v| v >= liq_floor);
+            .is_some_and(|v| v >= liq_floor);
         let vol_floor = overrides
             .get_f64("min_volume_24h_usd", "global")
             .unwrap_or(SIGNAL_MIN_VOLUME_24H_USD);
         let vol_ok = meta
             .and_then(|m| m.volume_24h_usd)
-            .map_or(false, |v| v >= vol_floor);
+            .is_some_and(|v| v >= vol_floor);
         let mcap_ok = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
-            .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD && v <= SIGNAL_MAX_MCAP_USD);
+            .is_some_and(|v| (SIGNAL_MIN_MCAP_USD..=SIGNAL_MAX_MCAP_USD).contains(&v));
         // h1 price-change ceiling. Already-pumped tokens (priceChange.h1
         // beyond the ceiling) bait the entry. Per-class override →
         // global override → compile-time default. Missing h1 data
@@ -918,7 +918,7 @@ impl Notifier {
             .unwrap_or(SIGNAL_MIN_H1_PRICE_CHANGE_PCT);
         let h1_ok = meta
             .and_then(|m| m.price_change_1h)
-            .map_or(true, |v| v <= h1_ceiling && v >= h1_floor);
+            .is_none_or(|v| v <= h1_ceiling && v >= h1_floor);
         // Pre-call peak vs entry ceiling. Catches the bait shape:
         // tokens where the recent 30m peak was well above the entry
         // price (we're entering on a fade from a local high). Lookup
@@ -932,7 +932,7 @@ impl Notifier {
         let peak_ok = if entry_price > 0.0 && peak_ceiling < 9_999.0 {
             self.db
                 .pre_call_peak_pct(&a.address, entry_price, 1800)
-                .map_or(true, |p| p <= peak_ceiling)
+                .is_none_or(|p| p <= peak_ceiling)
         } else {
             true
         };
@@ -940,7 +940,7 @@ impl Notifier {
         // (arxiv 2602.14860). Post-grad we use it to filter dead books.
         let tx_rate_ok = a.tx_rate >= SIGNAL_MIN_TX_RATE_PER_MIN;
         // Holder growth: convert delta over elapsed seconds → holders/hour.
-        let holder_growth_ok = a.delta.as_ref().map_or(false, |d| {
+        let holder_growth_ok = a.delta.as_ref().is_some_and(|d| {
             if d.time_elapsed_seconds <= 0 {
                 false
             } else {
@@ -984,8 +984,7 @@ impl Notifier {
             1.2
         };
         let bs_ok = total_txns < SIGNAL_MIN_HOUR_TXNS  // sample too small to gate
-            || (bs_ratio >= SIGNAL_MIN_BUY_SELL_RATIO
-                && bs_ratio <= SIGNAL_MAX_BUY_SELL_RATIO);
+            || (SIGNAL_MIN_BUY_SELL_RATIO..=SIGNAL_MAX_BUY_SELL_RATIO).contains(&bs_ratio);
         // Age floor: token must have existed long enough that the holder
         // base reflects organic distribution, not creator + initial 5
         // bonding-curve buyers.
@@ -993,7 +992,7 @@ impl Notifier {
         let age_floor = overrides
             .get_i64("min_token_age_secs", "global")
             .unwrap_or(SIGNAL_MIN_TOKEN_AGE_SECS);
-        let age_ok = first_seen.map_or(false, |fs| now - fs >= age_floor);
+        let age_ok = first_seen.is_some_and(|fs| now - fs >= age_floor);
         class_ok
             && conf_ok
             && holder_ok
@@ -1035,26 +1034,25 @@ impl Notifier {
             return false;
         }
         let class = a.confidence.classification.as_str();
-        let class_ok = SIGNAL_REQUIRED_CLASSES.iter().any(|c| *c == class);
+        let class_ok = SIGNAL_REQUIRED_CLASSES.contains(&class);
         // Mcap window — the shallow zone, $80k-$500k. Bigger tokens go SHORT.
         let mcap_val = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .unwrap_or(0.0);
-        let mcap_ok = mcap_val >= SCALP_MIN_MCAP_USD && mcap_val < SCALP_MAX_MCAP_USD;
+        let mcap_ok = (SCALP_MIN_MCAP_USD..SCALP_MAX_MCAP_USD).contains(&mcap_val);
         // Recent run — token must be moving NOW, not stale. Two-sided gate:
         // floor at +50% (must have run) AND ceiling at +350% (must not be at
         // exhaustion peak). The ceiling is the critical addition that catches
         // the pre-recoil FOMO band where most rugs happen.
         let pc1h = meta.and_then(|m| m.price_change_1h).unwrap_or(0.0);
-        let pc_ok = pc1h >= SCALP_MIN_PRICE_CHANGE_1H_PCT
-            && pc1h <= SCALP_MAX_PRICE_CHANGE_1H_PCT;
+        let pc_ok = (SCALP_MIN_PRICE_CHANGE_1H_PCT..=SCALP_MAX_PRICE_CHANGE_1H_PCT).contains(&pc1h);
         let tx_rate_ok = a.tx_rate >= SCALP_MIN_TX_RATE_PER_MIN;
         let holders_ok = (a.holder_count as i32) >= SCALP_MIN_HOLDER_COUNT;
         let now = chrono::Utc::now().timestamp();
-        let age_ok = first_seen.map_or(false, |fs| now - fs <= SCALP_MAX_AGE_SECS);
+        let age_ok = first_seen.is_some_and(|fs| now - fs <= SCALP_MAX_AGE_SECS);
         let liq_ok = meta
             .and_then(|m| m.liquidity_usd)
-            .map_or(false, |v| v >= SCALP_MIN_LIQUIDITY_USD);
+            .is_some_and(|v| v >= SCALP_MIN_LIQUIDITY_USD);
         // Concentration ceilings — shallow tokens have higher natural top1
         // (RPC top-20 dominate by accounting math). Trump/ALEXCOIN/BLIMP
         // ranged 9.3-13.4% top1, 28.7-36.1% top10.
@@ -1079,8 +1077,7 @@ impl Notifier {
             1.2
         };
         let bs_ok = total_txns < SIGNAL_MIN_HOUR_TXNS
-            || (bs_ratio >= SIGNAL_MIN_BUY_SELL_RATIO
-                && bs_ratio <= SIGNAL_MAX_BUY_SELL_RATIO);
+            || (SIGNAL_MIN_BUY_SELL_RATIO..=SIGNAL_MAX_BUY_SELL_RATIO).contains(&bs_ratio);
 
         class_ok
             && mcap_ok
@@ -1129,7 +1126,7 @@ impl Notifier {
         let mcap_val = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .unwrap_or(0.0);
-        let mcap_ok = mcap_val >= MOONSHOT_MIN_MCAP_USD && mcap_val <= MOONSHOT_MAX_MCAP_USD;
+        let mcap_ok = (MOONSHOT_MIN_MCAP_USD..=MOONSHOT_MAX_MCAP_USD).contains(&mcap_val);
         // Holders 15-60 — under 15 is too thin to read the distribution,
         // over 60 means the token already broke into a wider holder base
         // and the next leg up is incremental, not exponential.
@@ -1152,7 +1149,7 @@ impl Notifier {
         // 15min. Standard floor was killing every DEVELOPING-class entry
         // because the classification window only lasts 15-60 seconds.
         let now = chrono::Utc::now().timestamp();
-        let age_ok = first_seen.map_or(false, |fs| now - fs >= MOONSHOT_MIN_TOKEN_AGE_SECS);
+        let age_ok = first_seen.is_some_and(|fs| now - fs >= MOONSHOT_MIN_TOKEN_AGE_SECS);
 
         // Pre-DEV slope filter. Look back MOONSHOT_PRE_LOOKBACK_SECS
         // (30min) and find the oldest snapshot price for this token. If
@@ -1225,7 +1222,7 @@ impl Notifier {
         if class.starts_with("UNSAFE") {
             return true;
         }
-        FAIL_CLASSES.iter().any(|c| *c == class) || effective_conf < FAIL_MIN_EFFECTIVE_CONFIDENCE
+        FAIL_CLASSES.contains(&class) || effective_conf < FAIL_MIN_EFFECTIVE_CONFIDENCE
     }
 
     /// Whether a winner-state change is worth an in-place edit.
@@ -1392,9 +1389,9 @@ impl Notifier {
         if body["ok"].as_bool() != Some(true) {
             return Err(anyhow!("telegram sendPhoto failed: {}", body));
         }
-        Ok(body["result"]["message_id"]
+        body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("missing message_id"))?)
+            .ok_or_else(|| anyhow!("missing message_id"))
     }
 
     /// sendMessage with reply_to_message_id — used for milestone
@@ -1426,9 +1423,9 @@ impl Notifier {
         if body["ok"].as_bool() != Some(true) {
             return Err(anyhow!("telegram sendMessage(reply) failed: {}", body));
         }
-        Ok(body["result"]["message_id"]
+        body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("missing message_id"))?)
+            .ok_or_else(|| anyhow!("missing message_id"))
     }
 
     /// sendPhoto with reply_to_message_id — used for win-verdict cards
@@ -1465,9 +1462,9 @@ impl Notifier {
         if body["ok"].as_bool() != Some(true) {
             return Err(anyhow!("telegram sendPhoto (reply) failed: {}", body));
         }
-        Ok(body["result"]["message_id"]
+        body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("missing message_id"))?)
+            .ok_or_else(|| anyhow!("missing message_id"))
     }
 
     /// editMessageMedia — replaces both the photo and the caption in a
@@ -1915,9 +1912,9 @@ impl Notifier {
         if body["ok"].as_bool() != Some(true) {
             return Err(anyhow!("forwardMessage failed: {}", body));
         }
-        Ok(body["result"]["message_id"]
+        body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("forwardMessage missing result.message_id"))?)
+            .ok_or_else(|| anyhow!("forwardMessage missing result.message_id"))
     }
 
     /// "Always at the bottom" anchor. Telegram pins go to the TOP of a
@@ -2105,9 +2102,9 @@ impl Notifier {
         if body["ok"].as_bool() != Some(true) {
             return Err(anyhow!("telegram sendMessage failed: {}", body));
         }
-        Ok(body["result"]["message_id"]
+        body["result"]["message_id"]
             .as_i64()
-            .ok_or_else(|| anyhow!("missing message_id"))?)
+            .ok_or_else(|| anyhow!("missing message_id"))
     }
 
     async fn edit_message(&self, chat_id: &str, message_id: i64, text: &str) -> Result<()> {
@@ -2191,7 +2188,7 @@ impl Notifier {
                 format!("<code>{}…{}</code>", &address[..6.min(address.len())], &address[end..])
             }
         };
-        let (horizon, narrative) = crate::horizon::parse_with_clean(entry_note);
+        let (_horizon, narrative) = crate::horizon::parse_with_clean(entry_note);
         let exit_pct = parse_pct_prefix(exit_note);
         let peak_pct = parse_peak_pct(exit_note);
         let pct_signed = exit_pct.unwrap_or(0.0);
@@ -2669,7 +2666,7 @@ impl Notifier {
         // already formatted with the pct ("-32.8% · scalp stop"), so adding
         // another pct prefix produces "-32.8% · -32.8% · scalp stop". Only
         // prepend when exit_note doesn't already start with a percentage.
-        let already_has_pct = exit_note.trim_start().starts_with(|c: char| c == '+' || c == '-')
+        let already_has_pct = exit_note.trim_start().starts_with(['+', '-'])
             && exit_note.contains('%');
         let line = if already_has_pct {
             exit_note.to_string()
@@ -2722,9 +2719,7 @@ impl Notifier {
             let (horizon, _) = crate::horizon::parse_with_clean(&entry_note);
             let ticker = meta_ref.map(|m| m.symbol.as_str()).unwrap_or("?");
             let is_win = bucket == "won";
-            let reason = exit_note
-                .splitn(2, " · ")
-                .nth(1)
+            let reason = exit_note.split_once(" · ").map(|x| x.1)
                 .unwrap_or(exit_note)
                 .trim()
                 .to_string();

@@ -422,8 +422,8 @@ pub fn render_winner(a: &TokenAnalysis, meta: Option<&TokenMeta>) -> String {
     // Critical signal snippets
     let recency = esc(find_detail(a, "recency").unwrap_or(""));
     let success = esc(find_detail(a, "tx_success_rate").unwrap_or(""));
-    let exit = find_detail(a, "velocity_exit_warning").map(|s| esc(s));
-    let congestion = find_detail(a, "demand_congestion").map(|s| esc(s));
+    let exit = find_detail(a, "velocity_exit_warning").map(esc);
+    let congestion = find_detail(a, "demand_congestion").map(esc);
     let mut flags: Vec<String> = Vec::new();
     if !recency.is_empty() {
         flags.push(recency);

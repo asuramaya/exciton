@@ -3,6 +3,12 @@ use crate::ingester::{MintInfo, TokenHolderInfo};
 
 pub struct SafetyChecker;
 
+impl Default for SafetyChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SafetyChecker {
     pub fn new() -> Self {
         Self

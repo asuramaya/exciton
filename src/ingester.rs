@@ -70,15 +70,14 @@ impl Endpoint {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         self.error_count.fetch_add(1, Ordering::Relaxed);
         self.failure_total.fetch_add(1, Ordering::Relaxed);
-        if self.error_count.load(Ordering::Relaxed) > 3 {
-            if self.healthy.swap(false, Ordering::Relaxed) {
+        if self.error_count.load(Ordering::Relaxed) > 3
+            && self.healthy.swap(false, Ordering::Relaxed) {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 self.sidelined_at.store(now, Ordering::Relaxed);
             }
-        }
     }
 
     /// Health check with auto-rehab. Endpoints sidelined more than
@@ -1105,16 +1104,15 @@ pub fn parse_mint_account(address: &str, data: &[u8], owner: &Pubkey) -> Option<
                 let slice = &data[cursor..cursor + ext_len];
                 info.extensions.push(ext_name(ext_type).to_string());
                 match ext_type {
-                    EXT_PERMANENT_DELEGATE => {
-                        if slice.len() == 32 {
+                    EXT_PERMANENT_DELEGATE
+                        if slice.len() == 32 => {
                             if let Ok(pk) = Pubkey::try_from(slice) {
                                 info.permanent_delegate = Some(pk.to_string());
                             }
                         }
-                    }
-                    EXT_TRANSFER_HOOK => {
+                    EXT_TRANSFER_HOOK
                         // layout: authority (32) + program_id (32)
-                        if slice.len() >= 64 {
+                        if slice.len() >= 64 => {
                             if let Ok(pk) = Pubkey::try_from(&slice[32..64]) {
                                 // All-zero pubkey means hook disabled
                                 let all_zero = slice[32..64].iter().all(|b| *b == 0);
@@ -1123,24 +1121,21 @@ pub fn parse_mint_account(address: &str, data: &[u8], owner: &Pubkey) -> Option<
                                 }
                             }
                         }
-                    }
-                    EXT_TRANSFER_FEE_CONFIG => {
+                    EXT_TRANSFER_FEE_CONFIG
                         // TransferFeeConfig layout includes current fee basis_points at offset:
                         //   transfer_fee_config_authority (32) + withdraw_authority (32) +
                         //   withheld_amount (8) + older_fee (TransferFee = 24 bytes) +
                         //   newer_fee (TransferFee). TransferFee = { epoch(8), maximum_fee(8), basis_points(2) }.
                         // We read the newer_fee basis_points if buffer is big enough.
-                        if slice.len() >= 108 {
+                        if slice.len() >= 108 => {
                             let bps = u16::from_le_bytes([slice[106], slice[107]]);
                             info.transfer_fee_bps = Some(bps);
                         }
-                    }
-                    EXT_DEFAULT_ACCOUNT_STATE => {
+                    EXT_DEFAULT_ACCOUNT_STATE
                         // 1 byte: 0 = Uninitialized, 1 = Initialized, 2 = Frozen
-                        if !slice.is_empty() && slice[0] == 2 {
+                        if !slice.is_empty() && slice[0] == 2 => {
                             info.default_frozen = true;
                         }
-                    }
                     EXT_NON_TRANSFERABLE => {
                         info.non_transferable = true;
                     }

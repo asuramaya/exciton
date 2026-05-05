@@ -3,6 +3,12 @@ use crate::ingester::{MintInfo, SignatureInfo, TokenSupplyInfo};
 
 pub struct OnChainAnalyzer;
 
+impl Default for OnChainAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OnChainAnalyzer {
     pub fn new() -> Self {
         Self

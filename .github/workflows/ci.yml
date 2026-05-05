@@ -23,14 +23,14 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
-      # Errors-only gate for v0.1.0. Existing warnings are tracked
-      # outside CI so the build can ship today; tightening back to
-      # -D warnings is on the post-publication backlog.
-      # Examples are excluded — several dev-tooling examples have
-      # drifted from the current API surface and are scheduled for
-      # rewrite or removal alongside the test restoration.
-      - name: cargo clippy (lib + bins, warnings allowed)
-        run: cargo clippy --workspace --lib --bins
+      # Lint gate. Tightened back to -D warnings after the post-v0.1.0
+      # cleanup pass: 122 lib warnings → 0 (silenced via crate-level
+      # allows in lib.rs / main.rs for the lint categories the
+      # codebase intentionally favors). Examples are excluded — they
+      # carry their own conventions and are not on the published
+      # surface.
+      - name: cargo clippy (lib + bins, deny warnings)
+        run: cargo clippy --workspace --lib --bins -- -D warnings
 
       - name: cargo build --release (engine)
         run: cargo build --release --bin exciton
@@ -38,9 +38,8 @@ jobs:
       - name: cargo build --release (agent)
         run: cargo build --release -p exciton-claw --bin claw
 
-      # NOTE: cargo test is not yet wired. Several test files + examples
-      # have drifted from the current API surface and need rewriting.
-      # Tracked as a post-publication backlog item. The release.yml
-      # workflow will not run until tests are restored if a future
-      # release gates on this — for v0.1.0 the build step alone is
-      # the CI gate.
+      - name: cargo build --release (examples)
+        run: cargo build --release --examples
+
+      - name: cargo test
+        run: cargo test --release --tests --lib

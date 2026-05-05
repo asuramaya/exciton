@@ -8,7 +8,7 @@
 //! Both flows return the same `TokenSet` shape; the caller stamps it
 //! into an `AuthProfile` and persists it.
 
-use crate::auth::oauth_common::{generate_pkce_state, parse_query_params, url_encode, PkceState};
+use crate::auth::oauth_common::{parse_query_params, url_encode, PkceState};
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};

@@ -3315,7 +3315,7 @@ impl Db {
             SNAPSHOT_COLS,
         ))?;
         let snap = stmt
-            .query_row(params![address], |row| snapshot_from_row(row))
+            .query_row(params![address], snapshot_from_row)
             .optional()?;
         Ok(snap)
     }
@@ -3327,7 +3327,7 @@ impl Db {
             SNAPSHOT_COLS,
         ))?;
         let snaps = stmt
-            .query_map(params![address, limit], |row| snapshot_from_row(row))?
+            .query_map(params![address, limit], snapshot_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(snaps)
     }
@@ -3796,7 +3796,7 @@ impl Db {
                         // bloat the agent's context for no value.
                         if p.content.len() > 240 {
                             p.content.truncate(240);
-                            p.content.push_str("…");
+                            p.content.push('…');
                         }
                     }
                     p
