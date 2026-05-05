@@ -34,6 +34,12 @@ enum Cmd {
     /// Re-run any time to refresh the token before its access window
     /// expires (typically 1 hour for Codex).
     Login(auth::LoginArgs),
+    /// Import an OpenAI Codex auth profile from a local zeroclaw
+    /// installation. Reads zeroclaw's encrypted profile + secret key,
+    /// decrypts the access/refresh tokens, writes a claw-format
+    /// profile to ~/.exciton/auth.json. One-shot — claw stays
+    /// independent of zeroclaw afterwards.
+    MigrateFromZeroclaw(auth::MigrateArgs),
     /// Print the active auth profile + provider state. Read-only.
     Whoami,
     /// Run a self-review cycle. Reads outcomes via MCP, proposes a
@@ -55,6 +61,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Login(args) => auth::login(args).await,
+        Cmd::MigrateFromZeroclaw(args) => auth::migrate_from_zeroclaw(args).await,
         Cmd::Whoami => auth::whoami().await,
         Cmd::Review(args) => runtime::review::run(args).await,
     }

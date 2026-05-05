@@ -19,9 +19,11 @@ use std::time::Duration;
 mod oauth_common;
 mod openai_oauth;
 mod profile;
+mod zeroclaw_import;
 
 pub use profile::AuthProfile;
 pub use oauth_common::{generate_pkce_state, PkceState};
+pub use zeroclaw_import::{run as migrate_from_zeroclaw, MigrateArgs};
 
 #[derive(Args, Debug)]
 pub struct LoginArgs {
