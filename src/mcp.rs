@@ -3492,13 +3492,22 @@ impl ExcitonServer {
             .scopes
             .clone()
             .filter(|v| !v.is_empty());
+        // Default-fields = every sweepable field. Adding a tunable to
+        // field_is_sweepable automatically pulls it into the default
+        // ranker pass — no second registration step.
         let fields = fields_param
             .unwrap_or_else(|| {
-                vec![
-                    "min_effective_confidence".to_string(),
-                    "max_top_holder_pct".to_string(),
-                    "min_liquidity_usd".to_string(),
+                [
+                    "min_effective_confidence",
+                    "max_top_holder_pct",
+                    "min_liquidity_usd",
+                    "max_h1_price_change_pct",
+                    "min_h1_price_change_pct",
+                    "max_pre_call_peak_vs_entry_pct",
                 ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
             })
             .into_iter()
             .filter(|f| field_is_sweepable(f))
