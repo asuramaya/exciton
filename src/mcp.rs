@@ -2503,6 +2503,43 @@ impl ExcitonServer {
             );
         }
 
+        // Dedup: a pending proposal already exists on this (field, scope).
+        // Don't pile up: the agent must commit, revert, or wait for that
+        // one to be decided before proposing again on the same knob.
+        // Cool-down: reject if any proposal on this (field, scope) was
+        // committed or rejected within the last TUNE_COOLDOWN_SECS — gives
+        // realized-tape evidence time to accumulate before re-fighting.
+        if let Ok(prior) = self.db.list_tune_proposals(None, 200) {
+            for p in &prior {
+                if p.field != params.field || p.scope != params.scope {
+                    continue;
+                }
+                if p.status == "pending" {
+                    return reject_proposal(
+                        "duplicate_pending",
+                        &format!(
+                            "proposal {} is already pending on {}|{} ({} → {}); commit, revert, or reject it before proposing again on this knob",
+                            p.id, p.field, p.scope, p.old_value, p.new_value
+                        ),
+                    );
+                }
+                let decided = p.decided_at.unwrap_or(0);
+                if matches!(p.status.as_str(), "committed" | "rejected" | "reverted")
+                    && decided > 0
+                    && now - decided < TUNE_COOLDOWN_SECS
+                {
+                    let remaining = TUNE_COOLDOWN_SECS - (now - decided);
+                    return reject_proposal(
+                        "cooldown_active",
+                        &format!(
+                            "proposal {} on {}|{} was {} {}s ago; cool-down has {}s remaining (need realized-tape evidence to accumulate before re-fighting this knob)",
+                            p.id, p.field, p.scope, p.status, now - decided, remaining
+                        ),
+                    );
+                }
+            }
+        }
+
         let evidence: serde_json::Value = match serde_json::from_str(&params.evidence_json) {
             Ok(v) => v,
             Err(e) => return reject_proposal("evidence_json_invalid", &e.to_string()),
@@ -2561,6 +2598,25 @@ impl ExcitonServer {
                 return reject_proposal(
                     "holdout_negative",
                     &format!("holdout mean PnL {:.2}% < 0; proposed setup loses on the recent slice", h),
+                );
+            }
+        }
+
+        // Spread check: if the agent supplied rejected-cohort stats in
+        // the evidence, enforce the same separation floor the ranker
+        // uses. Falls through silently when the evidence shape lacks
+        // `rejected.mean_pnl_pct` — only ranker-built evidence carries
+        // it today, so manual proposals aren't penalized for the
+        // omission. When present, it's a hard gate.
+        if let Some(rej_pnl) = evidence["rejected"]["mean_pnl_pct"].as_f64() {
+            let spread = prop_pnl - rej_pnl;
+            if spread < SPREAD_FLOOR_PCT {
+                return reject_proposal(
+                    "insufficient_spread",
+                    &format!(
+                        "passing-vs-rejected cohort spread {:.2}% < floor of {:.1}% — the rejected cohort isn't visibly worse, so the cut may be noise",
+                        spread, SPREAD_FLOOR_PCT
+                    ),
                 );
             }
         }
@@ -3309,7 +3365,10 @@ impl ExcitonServer {
         let holdout_cutoff = sorted[cutoff_idx].called_at;
 
         let baseline = bucket_stats(&sorted);
-        let current_value = current_effective_value(&self.db, &params.field, &params.scope);
+        let current = resolve_current_value(&self.db, &params.field, &params.scope);
+        let current_value = current.as_str().to_string();
+        let current_source = current.source();
+        let current_narration = current.display_for_narration();
 
         let candidates: Vec<serde_json::Value> = params
             .candidates
@@ -3348,6 +3407,8 @@ impl ExcitonServer {
             "universe_n": sorted.len(),
             "baseline": baseline,
             "current_value": current_value,
+            "current_value_source": current_source,
+            "current_state_narration": current_narration,
             "candidates": candidates,
         })
         .to_string()
@@ -3421,7 +3482,10 @@ impl ExcitonServer {
                 let cutoff_idx = sorted.len() - holdout_size;
                 let holdout_cutoff = sorted[cutoff_idx].called_at;
 
-                let current_value = current_effective_value(&self.db, field, scope);
+                let current = resolve_current_value(&self.db, field, scope);
+                let current_value = current.as_str().to_string();
+                let current_source = current.source();
+                let current_narration = current.display_for_narration();
                 for cand in default_candidates_for_field(field) {
                     let row = evaluate_candidate(&sorted, field, &cand, holdout_cutoff);
                     if row.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -3441,10 +3505,27 @@ impl ExcitonServer {
                         .get("holdout")
                         .and_then(|v| v.get("mean_pnl_pct"))
                         .and_then(|v| v.as_f64());
+                    let mean_pass = row
+                        .get("mean_pnl_passing_pct")
+                        .and_then(|v| v.as_f64());
+                    let mean_rej = row
+                        .get("mean_pnl_rejected_pct")
+                        .and_then(|v| v.as_f64());
+                    // Spread check: reject candidates whose passing
+                    // cohort isn't visibly cleaner than the rejected
+                    // cohort. Without this, a candidate can clear the
+                    // 5% effect floor on a thin tail while rejecting a
+                    // group that's barely worse — i.e. noise. Require
+                    // mean_passing - mean_rejected ≥ SPREAD_FLOOR.
+                    let spread = match (mean_pass, mean_rej) {
+                        (Some(p), Some(r)) => Some(p - r),
+                        _ => None,
+                    };
                     if n < EVIDENCE_FLOOR
                         || effect < EFFECT_FLOOR_PCT
                         || holdout_n < 1
                         || holdout_pnl.map_or(true, |h| h < 0.0)
+                        || spread.map_or(true, |s| s < SPREAD_FLOOR_PCT)
                     {
                         continue;
                     }
@@ -3453,7 +3534,10 @@ impl ExcitonServer {
                     enriched["field"] = serde_json::json!(field);
                     enriched["scope"] = serde_json::json!(scope);
                     enriched["leverage"] = serde_json::json!(round2(leverage));
+                    enriched["spread_pct"] = serde_json::json!(spread.map(round2));
                     enriched["current_value"] = serde_json::json!(&current_value);
+                    enriched["current_value_source"] = serde_json::json!(current_source);
+                    enriched["current_state_narration"] = serde_json::json!(current_narration);
                     enriched["propose_tune_args"] = serde_json::json!({
                         "field": field,
                         "scope": scope,
@@ -4142,6 +4226,18 @@ pub const EVIDENCE_FLOOR: i64 = 10;
 /// proposal to pass the effect-size validator. Defaults to 5%.
 pub const EFFECT_FLOOR_PCT: f64 = 5.0;
 
+/// Minimum gap between mean_passing and mean_rejected cohort PnL.
+/// Without this, a candidate can clear the effect floor on a thin
+/// favorable tail while the rejected group is only marginally worse —
+/// classic noise. Set to 8% as a minimum visible separation.
+pub const SPREAD_FLOOR_PCT: f64 = 8.0;
+
+/// Cool-down between proposals on the same (field, scope) after a
+/// committed/rejected/reverted decision. 72h matches the typical span
+/// where realized-tape evidence accumulates enough to argue for a new
+/// move on the same knob. Lifted by re-running on a fresh DB.
+pub const TUNE_COOLDOWN_SECS: i64 = 72 * 60 * 60;
+
 const BODY_MD_MIN: usize = 200;
 const BODY_MD_MAX: usize = 4000;
 
@@ -4192,33 +4288,86 @@ fn classify_failure_mode(o: &crate::db::CallOutcome) -> &'static str {
     "slow_bleed"
 }
 
-/// Resolve the current effective value of a (field, scope) — the
-/// override if one exists, otherwise the compile-time default. Returns
-/// the value as a string so the agent can pass it directly as
-/// `old_value` to propose_tune. Eliminates a class of self-recovery
-/// turns where the agent had to grep list_overrides + describe_signal_filters
-/// just to learn the current value.
-fn current_effective_value(db: &crate::db::Db, field: &str, scope: &str) -> String {
+/// Source of truth for a (field, scope)'s current value. Three
+/// flavors:
+///   - `Override(value)` — a committed tune is currently in effect.
+///   - `Default(value)` — no override; compile-time default applies.
+///   - `Unset` — no override AND no compile-time default for this
+///     specific (field, scope). Notably true for global
+///     min_effective_confidence: per-class floors handle gating, the
+///     global is "0" only nominally. Surfacing this lets the agent
+///     narrate "introducing a global floor" instead of "raising 0 to 74".
+#[derive(Debug, Clone)]
+enum CurrentValue {
+    Override(String),
+    Default(String),
+    Unset,
+}
+
+impl CurrentValue {
+    fn as_str(&self) -> &str {
+        match self {
+            CurrentValue::Override(v) | CurrentValue::Default(v) => v.as_str(),
+            CurrentValue::Unset => "0",
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            CurrentValue::Override(_) => "override",
+            CurrentValue::Default(_) => "compile_time_default",
+            CurrentValue::Unset => "unset",
+        }
+    }
+
+    fn display_for_narration(&self) -> String {
+        match self {
+            CurrentValue::Override(v) => format!("{} (committed override)", v),
+            CurrentValue::Default(v) => format!("{} (compile-time default)", v),
+            CurrentValue::Unset => "unset (no per-scope floor; sibling scopes do the gating)".to_string(),
+        }
+    }
+}
+
+fn resolve_current_value(db: &crate::db::Db, field: &str, scope: &str) -> CurrentValue {
     if let Ok(Some(v)) = db.get_signal_override(field, scope) {
-        return v;
+        return CurrentValue::Override(v);
     }
     // Per-class scope falls back to global override before compile-time default.
     if scope.starts_with("class:") {
         if let Ok(Some(v)) = db.get_signal_override(field, "global") {
-            return v;
+            return CurrentValue::Override(v);
         }
     }
     match (field, scope) {
-        ("min_effective_confidence", "class:STAIRCASE") => "70".into(),
-        ("min_effective_confidence", "class:GRINDER") => "65".into(),
-        ("min_effective_confidence", "class:SPRING") => "0".into(),
-        ("min_effective_confidence", _) => "0".into(),
-        ("max_top_holder_pct", _) => format!("{}", crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT),
-        ("min_liquidity_usd", _) => format!("{}", crate::notifier::SIGNAL_MIN_LIQUIDITY_USD),
-        ("min_volume_24h_usd", _) => format!("{}", crate::notifier::SIGNAL_MIN_VOLUME_24H_USD),
-        ("min_token_age_secs", _) => format!("{}", crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS),
-        _ => "0".into(),
+        ("min_effective_confidence", "class:STAIRCASE") => CurrentValue::Default("70".into()),
+        ("min_effective_confidence", "class:GRINDER") => CurrentValue::Default("65".into()),
+        ("min_effective_confidence", "class:SPRING") => CurrentValue::Unset,
+        // Global min_effective_confidence is unset by design — per-class
+        // floors do the work; the global is "0" only because the validator
+        // needs an integer. Tag it as Unset so the agent narrates correctly.
+        ("min_effective_confidence", "global") => CurrentValue::Unset,
+        ("max_top_holder_pct", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT))
+        }
+        ("min_liquidity_usd", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_LIQUIDITY_USD))
+        }
+        ("min_volume_24h_usd", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_VOLUME_24H_USD))
+        }
+        ("min_token_age_secs", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS))
+        }
+        _ => CurrentValue::Unset,
     }
+}
+
+/// Backwards-compat shim — string form for callers that want the bare
+/// value. New callers should use `resolve_current_value` directly so
+/// they can render the source.
+fn current_effective_value(db: &crate::db::Db, field: &str, scope: &str) -> String {
+    resolve_current_value(db, field, scope).as_str().to_string()
 }
 
 /// Whether a tunable field can be swept against historical closed calls.
@@ -4391,6 +4540,10 @@ fn evaluate_candidate(
             "n": passing.len(),
             "mean_pnl_pct": prop_mean.map(round2),
             "win_rate_pct": round2(prop_win_rate),
+        },
+        "rejected": {
+            "n": rejected.len(),
+            "mean_pnl_pct": rej_mean.map(round2),
         },
         "holdout": {
             "n": holdout.len(),

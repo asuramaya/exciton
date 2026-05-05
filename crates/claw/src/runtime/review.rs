@@ -25,11 +25,12 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde_json::json;
 
-/// Hard cap on agent turns per review. With the D1+D2+D3 surface the
-/// happy path is review_log → list_tunes → rank_tune_candidates →
-/// propose_tune → review_log_write → final message ≈ 5-6 turns. 10
-/// leaves headroom for one diagnostic detour without runaway loops.
-const MAX_TURNS: usize = 10;
+/// Hard cap on agent turns per review. The robustness-check cycle
+/// runs review_log → list_tunes → rank_tune_candidates → analyze_drift
+/// → analyze_failure_modes → propose_tune → (commit_tune) →
+/// review_log_write → final ≈ 8-9 turns. 14 leaves headroom for one
+/// recovery turn (e.g. failed propose_tune retry) without runaway loops.
+const MAX_TURNS: usize = 14;
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 
@@ -72,26 +73,27 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     let since = now - args.window_secs;
     let user_kickoff = format!(
         "Review cycle starting now (started_at={}). Window: last {}s (since={}). Mode: {}.\n\n\
-         Suggested flow:\n\
-         1. `review_log(limit=5)` — check what you concluded last cycle. Don't restate yesterday's diagnosis; only act on new evidence.\n\
-         2. `list_tunes(limit=20)` — check prior moves still on file.\n\
-         3. `rank_tune_candidates(top_k=5, since={})` — pre-validated menu. n≥10, effect≥5%, holdout≥0 already enforced.\n\
-         4. If a row clears your robustness judgment, call `propose_tune` with that row's `evidence_json` verbatim. {}.\n\
-         5. **ALWAYS** finish by calling `review_log_write(started_at={}, mode=\"{}\", outcome=..., summary=..., proposal_id=...?, turns=..., tool_calls=...)`. This is how future cycles see what you did.\n\
-         6. Then output your final message and stop.\n\n\
-         Do not call `analyze_outcomes` or `sweep_threshold` unless `rank_tune_candidates` returned weak — the ranker already covers the deterministic search. The diagnostic tools (`analyze_drift`, `analyze_failure_modes`, `compare_periods`) are for narrating *why*, not for finding candidates.",
+         Required flow:\n\
+         1. `review_log(limit=5)` — check what you concluded last cycle.\n\
+         2. `list_tunes(limit=20)` — prior proposals still on file.\n\
+         3. `rank_tune_candidates(top_k=5, since={})` — pre-validated menu (n≥10, effect≥5%, spread≥8%, holdout≥0 already enforced server-side).\n\
+         4. If the menu is non-empty, run robustness checks on the TOP candidate before proposing:\n\
+            a. `analyze_drift(scope=<top.scope>, window_count=4)` — is the edge concentrated in one window? If `max_deviation_pct` is much larger than the effect, stand down.\n\
+            b. `analyze_failure_modes(scope=<top.scope>)` — is the candidate filtering real harm? If the dominant rejected mode is `flat` or `void`, stand down.\n\
+         5. If both checks pass: `propose_tune(...)` using the candidate's `propose_tune_args` and your authored narrative. {}.\n\
+         6. ALWAYS finish with `review_log_write(...)` — runtime auto-fills started_at/turns/tool_calls; you supply mode/outcome/summary/proposal_id.\n\
+         7. Final message and stop.\n\n\
+         Do NOT call `analyze_outcomes` or `sweep_threshold` unless the ranker came back weak. The ranker covers the deterministic search; analyze_drift + analyze_failure_modes are robustness gates, not candidate finders.",
         now,
         args.window_secs,
         since,
         args.mode,
         since,
         if args.mode == "commit" {
-            "Then call `commit_tune(proposal_id, body_md=...)` with your authored diary entry"
+            "Then `commit_tune(proposal_id, body_md=...)` with your authored diary entry"
         } else {
             "Stop after propose; no commit this cycle"
         },
-        now,
-        args.mode,
     );
 
     let mut messages = vec![
@@ -150,7 +152,7 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
 
         for call in &completion.tool_calls {
             tool_call_count += 1;
-            let result = run_tool(&mcp, call).await;
+            let result = run_tool(&mcp, call, turn, tool_call_count, now).await;
             let result_text = match result {
                 Ok(text) => text,
                 Err(e) => {
@@ -187,14 +189,32 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
 /// prompt to only call tools in the autonomy surface, but we route any
 /// name through `call_tool` — the server will reject anything not
 /// registered.
-async fn run_tool(mcp: &McpClient, call: &ToolCall) -> Result<String> {
-    let args: serde_json::Value =
+///
+/// Special case: `review_log_write` has its `turns`, `tool_calls`, and
+/// `started_at` fields overridden with the runtime's authoritative
+/// counters. The agent's self-reports are well-meaning but unreliable
+/// (it claimed turns:1 in a 6-turn cycle); the runtime knows the truth.
+async fn run_tool(
+    mcp: &McpClient,
+    call: &ToolCall,
+    current_turn: usize,
+    current_tool_count: usize,
+    cycle_started_at: i64,
+) -> Result<String> {
+    let mut args: serde_json::Value =
         serde_json::from_str(&call.arguments).with_context(|| {
             format!(
                 "tool {} returned arguments that don't parse as JSON: {}",
                 call.name, call.arguments
             )
         })?;
+    if call.name == "review_log_write" {
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("started_at".into(), serde_json::json!(cycle_started_at));
+            obj.insert("turns".into(), serde_json::json!(current_turn));
+            obj.insert("tool_calls".into(), serde_json::json!(current_tool_count));
+        }
+    }
     mcp.call_tool(&call.name, args).await
 }
 
