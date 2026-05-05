@@ -6,7 +6,7 @@ endpoints = [
 ]
 
 [wallet]
-public_key = "${PHOTON_WALLET_PUBLIC_KEY}"
+public_key = "${EXCITON_WALLET_PUBLIC_KEY}"
 
 [risk]
 max_position_pct = 15.0
@@ -29,7 +29,7 @@ bot_token = "${TELEGRAM_BOT_TOKEN}"
 signals_chat_id = "${TELEGRAM_SIGNALS_CHAT_ID}"
 ops_chat_id = "${TELEGRAM_OPS_CHAT_ID}"
 dm_enabled = true
-admin_user_ids = [5408654040]
+admin_user_ids = []  # Telegram user IDs allowed to issue operator commands
 dm_rate_limit_per_minute = 30
 
 [madapes]

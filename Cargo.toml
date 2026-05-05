@@ -1,7 +1,37 @@
+[workspace]
+members = [".", "crates/claw"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+rmcp = { version = "0.17", features = ["client", "transport-streamable-http-client", "transport-child-process"] }
+base64 = "0.22"
+url = "2"
+toml = "0.8"
+# Filesystem permission helpers — used by claw's auth profile.
+nix = { version = "0.29", features = ["fs"] }
+
 [package]
-name = "photon"
+name = "exciton"
 version = "0.1.0"
 edition = "2021"
+description = "Exciton — MCP-first Solana intelligence engine. Deterministic on-chain scanner, signal forecaster, Telegram surface, and JSON publisher in one Rust binary."
+license = "MIT"
+repository = "https://github.com/asuramaya/exciton"
+homepage = "https://github.com/asuramaya/exciton"
+readme = "README.md"
+keywords = ["solana", "mcp", "trading", "telegram", "signals"]
+categories = ["command-line-utilities"]
+authors = ["Exciton contributors"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

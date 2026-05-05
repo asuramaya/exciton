@@ -4,10 +4,10 @@
 //!
 //! Pure data extractors — the operator (or LLM) synthesizes.
 
-use photon::db::Db;
-use photon::ingester::{resolve_endpoints, RpcRouter};
-use photon::market;
-use photon::scout;
+use exciton::db::Db;
+use exciton::ingester::{resolve_endpoints, RpcRouter};
+use exciton::market;
+use exciton::scout;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,10 +38,10 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: deep_scout <mint>"))?;
 
-    let cfg = photon::config::Config::load(&PathBuf::from("config.toml"))?;
+    let cfg = exciton::config::Config::load(&PathBuf::from("config.toml"))?;
     let endpoints = resolve_endpoints(&cfg.rpc.endpoints);
     let rpc = Arc::new(RpcRouter::new(&endpoints)?);
-    let db = Arc::new(Db::open(&PathBuf::from("photon.db"))?);
+    let db = Arc::new(Db::open(&PathBuf::from("exciton.db"))?);
 
     let market_data = market::get_market(&mint).await.ok().flatten();
     let (symbol, name, mcap, liq, dex, pair_addr, socials, websites) = match &market_data {

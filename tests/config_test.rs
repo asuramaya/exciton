@@ -1,4 +1,4 @@
-use photon::config::Config;
+use exciton::config::Config;
 use std::path::PathBuf;
 
 #[test]

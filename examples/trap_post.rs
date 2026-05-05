@@ -2,9 +2,9 @@
 //! Uses the exact same notifier code path as production, so what you see here
 //! is what the scanner would post at hour rollover.
 
-use photon::config::TelegramConfig;
-use photon::db::Db;
-use photon::notifier::Notifier;
+use exciton::config::TelegramConfig;
+use exciton::db::Db;
+use exciton::notifier::Notifier;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,12 +16,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(now - (now % 3600) - 3600);
 
-    let db = Arc::new(Db::open(&PathBuf::from("photon.db"))?);
+    let db = Arc::new(Db::open(&PathBuf::from("exciton.db"))?);
     let cfg = TelegramConfig {
         enabled: true,
         bot_token: std::env::var("TELEGRAM_BOT_TOKEN")?,
-        signals_chat_id: "-1003735501034".into(),
-        ops_chat_id: "-1003869647282".into(),
+        signals_chat_id: std::env::var("SIGNALS_CHAT_ID")?,
+        ops_chat_id: std::env::var("OPS_CHAT_ID")?,
     };
     let notifier = Notifier::new(cfg, db.clone(), None)?;
 
@@ -53,10 +53,11 @@ async fn main() -> anyhow::Result<()> {
     // Post to ops chat
     let client = reqwest::Client::new();
     let token = std::env::var("TELEGRAM_BOT_TOKEN")?;
+    let ops_chat_id = std::env::var("OPS_CHAT_ID")?;
     let resp = client
         .post(format!("https://api.telegram.org/bot{}/sendMessage", token))
         .form(&[
-            ("chat_id", "-1003869647282".to_string()),
+            ("chat_id", ops_chat_id),
             ("text", text),
             ("parse_mode", "HTML".to_string()),
             (

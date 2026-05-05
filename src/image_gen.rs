@@ -1,6 +1,6 @@
 //! Recraft image-generation client — server-side only. The API key never
 //! leaves this module, never lands in the public repo, never travels over
-//! a channel that isn't the photon process itself talking to Recraft.
+//! a channel that isn't the exciton process itself talking to Recraft.
 //!
 //! Used by the thought-image processor to render placeholder captions in
 //! the jungle notes into cinematic 2:1 photorealistic imagery.
@@ -15,7 +15,7 @@ const RECRAFT_ENDPOINT: &str = "https://external.api.recraft.ai/v1/images/genera
 /// roughly 35% smaller on the wire. Page CSS normalizes display to 2:1
 /// so the visual rhythm is preserved.
 pub const DEFAULT_SIZE: &str = "1820x1024";
-/// Photorealistic output — the user-facing style for MadApes notes.
+/// Photorealistic output — the user-facing style for narrative notes.
 pub const DEFAULT_STYLE: &str = "realistic_image";
 /// Prompt suffix that consistently nudges Recraft toward the editorial
 /// moody-photo look we want for the narrative device.

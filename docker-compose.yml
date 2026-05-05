@@ -1,20 +1,20 @@
 services:
-  photon:
+  exciton:
     build:
       context: .
       dockerfile: Dockerfile
-    image: photon:latest
-    container_name: photon
+    image: exciton:latest
+    container_name: exciton
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      PHOTON_DB_PATH: /data/photon.db
+      EXCITON_DB_PATH: /data/exciton.db
     working_dir: /data
     volumes:
-      - ${PHOTON_STATE_DIR:-./state}:/data
-      - ${MADAPES_REPO_DIR:-./MadApes.ai}:/srv/MadApes.ai
-      - ${PHOTON_SSH_DIR:-./ssh}:/root/.ssh
-      - ${PHOTON_CONFIG_PATH:-./deploy/config.container.toml.example}:/etc/photon/config.toml:ro
+      - ${EXCITON_STATE_DIR:-./state}:/data
+      - ${PUBLISHER_REPO_DIR:-./publisher-target}:/srv/publisher-target
+      - ${EXCITON_SSH_DIR:-./ssh}:/root/.ssh
+      - ${EXCITON_CONFIG_PATH:-./deploy/config.container.toml.example}:/etc/exciton/config.toml:ro
     stdin_open: true
     tty: true

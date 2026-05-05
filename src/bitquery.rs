@@ -8,7 +8,7 @@
 //! Auth: Ory access token passed via `connection_init` payload as
 //! `{ "headers": { "Authorization": "Bearer <token>" } }`. The token
 //! comes from `BITQUERY_API_TOKEN` env. When the token is empty the
-//! module logs a single warning and exits cleanly — photon stays
+//! module logs a single warning and exits cleanly — exciton stays
 //! functional without it.
 //!
 //! What this scaffold does today: connects, authenticates, subscribes

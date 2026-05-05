@@ -1,4 +1,4 @@
-//! Pump.fun bonding-curve coverage. Lets photon observe the 0→graduation
+//! Pump.fun bonding-curve coverage. Lets exciton observe the 0→graduation
 //! ride that's invisible to DexScreener.
 //!
 //! The pump.fun program (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)
@@ -67,7 +67,7 @@ pub struct CurveState {
     pub real_sol_reserves: f64,
     /// Total token supply (UI units) — pump.fun mints fix this at 1B.
     pub token_total_supply: f64,
-    /// True once the curve graduated to PumpSwap. Once set, photon's
+    /// True once the curve graduated to PumpSwap. Once set, exciton's
     /// curve observation drops the token; post-grad pipeline takes over.
     pub complete: bool,
 }

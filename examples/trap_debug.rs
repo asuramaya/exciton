@@ -4,9 +4,9 @@
 //!   cargo run --release --example trap_debug 1776661200   # specific hour
 //!   cargo run --release --example trap_debug               # defaults to 1h ago
 
-use photon::config::TelegramConfig;
-use photon::db::Db;
-use photon::notifier::Notifier;
+use exciton::config::TelegramConfig;
+use exciton::db::Db;
+use exciton::notifier::Notifier;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,13 +19,14 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(now - (now % 3600) - 3600);
 
-    let db = Arc::new(Db::open(&PathBuf::from("photon.db"))?);
+    let db = Arc::new(Db::open(&PathBuf::from("exciton.db"))?);
 
     let cfg = TelegramConfig {
         enabled: true,
         bot_token: std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set"),
-        signals_chat_id: "-1003735501034".into(),
-        ops_chat_id: "-1003869647282".into(),
+        signals_chat_id: std::env::var("SIGNALS_CHAT_ID")
+            .expect("SIGNALS_CHAT_ID must be set"),
+        ops_chat_id: std::env::var("OPS_CHAT_ID").expect("OPS_CHAT_ID must be set"),
     };
     let notifier = Notifier::new(cfg, db.clone(), None)?;
 

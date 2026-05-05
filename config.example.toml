@@ -1,16 +1,31 @@
+# Exciton — example configuration. Copy to config.toml and edit.
+# Secrets reference env vars via ${VAR_NAME}; never inline keys here.
+# Anything you set in `.env` is loaded into the process environment at startup.
+
+# ─────────────────────────────────────────────────────────────
+# RPC — Solana endpoint(s) for the scanner.
+# Multiple endpoints get round-robin'd with health tracking and
+# 3-fail sideline. Free tiers from Helius / Alchemy / QuickNode
+# stack well; rate-limit ceilings combine.
+# ─────────────────────────────────────────────────────────────
 [rpc]
-# Endpoints support ${ENV_VAR} syntax for API keys.
-# Stack multiple providers for failover and combined rate limits.
-# Keys are NEVER stored here — only env var references.
 endpoints = [
-    "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}",
     "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}",
+    # "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}",
+    # "https://your-shard.solana-mainnet.quiknode.pro/${QUICKNODE_API_KEY}/",
 ]
 
+# ─────────────────────────────────────────────────────────────
+# Wallet — only the public key. Private key (if execution enabled)
+# loaded from the OS keychain at signing time, never from this file.
+# ─────────────────────────────────────────────────────────────
 [wallet]
-# Public key only — private key loaded from OS keychain at signing time
-public_key = ""
+public_key = "${EXCITON_WALLET_PUBLIC_KEY}"
 
+# ─────────────────────────────────────────────────────────────
+# Risk — position sizing defaults consulted by execution path.
+# Ignored when [execution] is absent or `enabled = false`.
+# ─────────────────────────────────────────────────────────────
 [risk]
 max_position_pct = 15.0
 default_position_pct = 0.5
@@ -19,13 +34,100 @@ slippage_bps = 100
 priority_fee_lamports = 10000
 call_expiry_days = 14
 
+# ─────────────────────────────────────────────────────────────
+# Tracking — wallets to watch for smart-money signals.
+# ─────────────────────────────────────────────────────────────
 [tracking]
-# Wallet addresses to track for smart money signals
+# Solana wallet addresses. Each cycle, exciton diffs their SPL
+# holdings vs the stored view; new mints fire `smart_wallet_buy` alerts.
 wallets = []
-# For 15s scan cycles this keeps revisit cadence near ~5 minutes/token,
-# which is enough to build a real short-term tape instead of 1-2 frames.
+# Watchlist cap. With 15s cycles, ~200 keeps revisit cadence near
+# 5 min/token — enough tape for delta detection without overloading RPC.
 max_active_tokens = 200
 
+# ─────────────────────────────────────────────────────────────
+# Alerts — confidence floors for the auto-call gate.
+# ─────────────────────────────────────────────────────────────
 [alerts]
 confidence_threshold = 70
 stale_feed_seconds = 30
+
+# ─────────────────────────────────────────────────────────────
+# Telegram — optional. Omit the section to disable all Telegram I/O.
+# Two bots recommended (channel poster + DM long-poll); one works
+# if you skip the operator DM surface.
+# ─────────────────────────────────────────────────────────────
+[telegram]
+enabled = false
+# Bot token for channel posts (sendMessage, editMessageText).
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+# Optional separate bot token for the DM long-poll.
+# Leave empty to use bot_token (won't work if channel and DM share traffic).
+dm_bot_token = "${TELEGRAM_DM_BOT_TOKEN}"
+# Chat IDs for posted cards. Get them by messaging a bot in the channel
+# and inspecting `getUpdates`.
+signals_chat_id = "${TELEGRAM_SIGNALS_CHAT_ID}"
+ops_chat_id = "${TELEGRAM_OPS_CHAT_ID}"
+# Optional structural-card mirror channel (full numbers + timeline).
+# Falls back to ops_chat_id when empty.
+lounge_chat_id = ""
+
+# Optional public site URL — when set, every call card includes
+# a "track live" link to <public_url>/#call=<address>. Empty = no link.
+public_url = ""
+
+# Bot usernames (no @) used in cross-route routing hints. Empty falls
+# back to generic "the public bot" / "the operator bot" wording.
+public_bot_username = ""
+private_bot_username = ""
+
+# Operator DM bot — long-polls for /commands. Hard-gated to admin_user_ids.
+dm_enabled = false
+admin_user_ids = []
+dm_rate_limit_per_minute = 30
+
+# /claw LLM agent — leave both keys empty to disable.
+claw_username = ""
+anthropic_api_key = "${ANTHROPIC_API_KEY}"
+openai_api_key = "${OPENAI_API_KEY}"
+claw_api_secret = ""
+claw_api_port = 8081
+
+# ─────────────────────────────────────────────────────────────
+# Publisher — writes JSON snapshots into a target git repo.
+# Omit the section to disable. The target repo must already be
+# a git checkout with push credentials available in the env.
+# ─────────────────────────────────────────────────────────────
+[madapes]
+enabled = false
+# Absolute path to the target repo checkout (e.g. your public site).
+repo_path = "${MADAPES_REPO_PATH}"
+# Publish cadence in seconds.
+interval_seconds = 300
+# Fallback SOL/USD when live price fetch fails.
+sol_price_fallback_usd = 150.0
+# Optional Recraft API key for thought-note image generation.
+recraft_api_key = "${RECRAFT_API_KEY}"
+image_interval_seconds = 900
+# Featured token (project's own coin) — pinned section on the site.
+featured_mint = ""
+featured_buy_url = ""
+
+# ─────────────────────────────────────────────────────────────
+# Execution — trade execution. EXPERIMENTAL.
+# Master kill: `enabled = false` (default) keeps exciton paper-only.
+# When enabled, exciton signs Jupiter swaps using the keypair loaded
+# from EXCITON_PRIVATE_KEY. Read execution.rs before flipping this on.
+# ─────────────────────────────────────────────────────────────
+# [execution]
+# enabled = false
+# bucket_a_size_pct = 5.0
+# bucket_b_size_pct = 5.0
+# long_size_pct = 5.0
+# scalp_size_pct = 5.0
+# min_trade_sol = 0.001
+# slippage_bps = 1000
+# max_simultaneous_positions = 5
+# max_daily_position_sol = 1.0
+# buy_confirm_timeout_secs = 60
+# sell_retry_max = 6

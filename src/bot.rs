@@ -2,10 +2,10 @@
 //!
 //! Two distinct surfaces share this module:
 //!
-//! - **Private** (@Claudeinatorbot, `dm_bot_token`): operator + admin commands
+//! - **Private** (operator bot, `dm_bot_token`): operator + admin commands
 //!   plus `/claw`. Hard-gated by `admin_user_ids`; non-admins get a routing
 //!   hint to the public bot. Built for the operator only.
-//! - **Public** (@MadApesAIBot, `bot_token`): read-only intel + per-user
+//! - **Public** (public bot, `bot_token`): read-only intel + per-user
 //!   watchlist for anyone. Same per-user 30/min rate limit as before plus a
 //!   global 1-per-minute ceiling on RPC-heavy lookup commands so random
 //!   traffic can't drain the cache.
@@ -28,10 +28,10 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
-    /// Operator-only DM bot (Claudeinatorbot). All commands gated to admins;
+    /// Operator-only DM bot. All commands gated to admins;
     /// hosts /claw plus the runtime control surface (halt/resume/threshold/etc).
     Private,
-    /// Public-facing bot (MadApesAIBot). Read-only intel + per-user state.
+    /// Public-facing bot. Read-only intel + per-user state.
     /// No admin gate; global 1/min ceiling on RPC-heavy lookup commands.
     Public,
 }
@@ -475,16 +475,27 @@ impl DmBot {
                     // anything to non-admins. Stops a curious stranger who
                     // discovered the bot from invoking /claw or /halt.
                     if !is_admin {
-                        return Some(
-                            "🚫 <i>This bot is operator-only.</i> Try @MadApesAIBot for public commands."
-                                .to_string(),
-                        );
+                        let public_hint = if self.cfg.public_bot_username.is_empty() {
+                            "the public bot".to_string()
+                        } else {
+                            format!("@{}", self.cfg.public_bot_username)
+                        };
+                        return Some(format!(
+                            "🚫 <i>This bot is operator-only.</i> Try {} for public commands.",
+                            public_hint
+                        ));
                     }
                     None
                 } else if PUBLIC_COMMANDS.contains(&cmd) {
+                    let public_hint = if self.cfg.public_bot_username.is_empty() {
+                        "the public bot".to_string()
+                    } else {
+                        format!("@{}", self.cfg.public_bot_username)
+                    };
                     Some(format!(
-                        "↪️ <code>/{}</code> lives on @MadApesAIBot. This bot is operator-only.",
-                        html_escape(cmd)
+                        "↪️ <code>/{}</code> lives on {}. This bot is operator-only.",
+                        html_escape(cmd),
+                        public_hint,
                     ))
                 } else {
                     None // unknown — let the dispatcher's default arm handle it
@@ -494,9 +505,15 @@ impl DmBot {
                 if PUBLIC_COMMANDS.contains(&cmd) {
                     None
                 } else if PRIVATE_COMMANDS.contains(&cmd) {
+                    let private_hint = if self.cfg.private_bot_username.is_empty() {
+                        "the operator bot".to_string()
+                    } else {
+                        format!("@{}", self.cfg.private_bot_username)
+                    };
                     Some(format!(
-                        "🔒 <code>/{}</code> is operator-only and lives on @Claudeinatorbot.",
-                        html_escape(cmd)
+                        "🔒 <code>/{}</code> is operator-only and lives on {}.",
+                        html_escape(cmd),
+                        private_hint,
                     ))
                 } else {
                     None
@@ -576,7 +593,7 @@ impl DmBot {
             ),
             Surface::Public => format!(
                 "{greeting}\n\n\
-                 MadApesAI — Solana signal forecaster. Type <code>/</code> to autocomplete.\n\n\
+                 Solana signal forecaster. Type <code>/</code> to autocomplete.\n\n\
                  Quick: /scan · /signals · /calls · /traps · /help"
             ),
         };
@@ -686,9 +703,15 @@ impl DmBot {
             ),
             Surface::Private => {
                 if !is_admin {
-                    String::from(
+                    let public_hint = if self.cfg.public_bot_username.is_empty() {
+                        "the public bot".to_string()
+                    } else {
+                        format!("@{}", self.cfg.public_bot_username)
+                    };
+                    format!(
                         "🚫 <i>This bot is operator-only.</i>\n\n\
-                         Public commands live on @MadApesAIBot.",
+                         Public commands live on {}.",
+                        public_hint,
                     )
                 } else {
                     String::from(
@@ -703,8 +726,8 @@ impl DmBot {
                          /ref_mint &lt;addr&gt; [label] · /unref_mint\n\n\
                          <b>Runtime</b>\n\
                          /halt · /resume · /threshold &lt;N&gt; · /stats\n\n\
-                         <i>Public intel (/scan, /inspect, /signals, etc.) lives on @MadApesAIBot.</i></blockquote>",
-                    )
+                         <i>Public intel (/scan, /inspect, /signals, etc.) lives on the public bot.</i></blockquote>",
+                    ).into()
                 }
             }
         };
@@ -1301,6 +1324,8 @@ impl DmBot {
         let inserted = self.db.insert_call(
             mint, &sym, "MANUAL", 0, called_at, mcap, price, liq, top_pct, &dex, &full_note, "dm",
             entry_tx_rate,
+            None, // manual DM: no recent meta to source price_change_1h from
+            None, // manual DM: no pre-call peak window
         )?;
 
         if inserted.is_none() {

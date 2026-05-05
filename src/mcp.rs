@@ -16,7 +16,7 @@ use solana_sdk::signature::Signer;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct PhotonServer {
+pub struct ExcitonServer {
     db: Arc<Db>,
     config: Config,
     rpc: Arc<RpcRouter>,
@@ -207,6 +207,319 @@ pub struct TradeParams {
     #[serde(default)]
     pub confirmed: bool,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposeTuneParams {
+    /// Field to override. Must be in the tunable allow-list — see
+    /// `tunable_fields` doc on the server. Examples:
+    /// "min_effective_confidence", "max_top_holder_pct",
+    /// "min_liquidity_usd", "min_volume_24h_usd", "min_token_age_secs".
+    pub field: String,
+    /// Scope of the override. "global" or "class:STAIRCASE" /
+    /// "class:GRINDER" / "class:SPRING". Per-class scope only valid
+    /// for fields that support it.
+    pub scope: String,
+    /// Current value (stringified). For numeric fields, the agent passes
+    /// the integer or float as a string. The server validates type.
+    pub old_value: String,
+    /// Proposed new value (stringified). Must parse to the same type as
+    /// old_value. Validators check effect-size and holdout against the
+    /// evidence the agent supplies.
+    pub new_value: String,
+    /// Required: evidence_json must contain `current` and `proposed`
+    /// objects each with `n` and `mean_pnl_pct` (and ideally
+    /// `win_rate_pct`), plus a `holdout` object with `n` and
+    /// `mean_pnl_pct`. Validators reject anything missing these.
+    pub evidence_json: String,
+    /// Trader-voice 3-4 sentence narrative explaining what changed and
+    /// why. Goes into the diary entry verbatim. Must be non-empty and
+    /// not a placeholder.
+    pub narrative: String,
+    /// Identifier of the proposing agent — "claw" by default; operator
+    /// proposals (manual MCP calls from a human) should pass "operator".
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitTuneParams {
+    /// Proposal id returned by propose_tune. Must be in `pending` status.
+    pub proposal_id: i64,
+    /// Agent-authored markdown for the public diary entry. The renderer
+    /// validates structure (non-empty, must include the narrative + an
+    /// evidence section) but does NOT enforce a fixed template — voice
+    /// is whatever the agent's prompt produces. Length bounded to
+    /// 200..=4000 characters.
+    pub body_md: String,
+    /// Optional one-line headline for the diary entry. When omitted,
+    /// `record_evolution` derives one from field/old/new.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTunesParams {
+    /// Filter by status: "pending" | "committed" | "rejected" | "reverted".
+    /// None = all.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Cap on rows returned. Default 50, max 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RevertTuneParams {
+    /// Proposal id to revert. Must be in `committed` status. Deletes the
+    /// matching signal_overrides row (so should_signal falls back to
+    /// the compile-time default) and marks the proposal `reverted`.
+    pub proposal_id: i64,
+    /// Why the revert is happening. Goes into the audit log. Required.
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposePromptParams {
+    /// Full new system prompt content (markdown). Length 200..=20000.
+    /// Replaces the current prompt verbatim — this is not a diff.
+    pub content: String,
+    /// Why the prompt should change. 3-4 sentence trader-voice
+    /// explanation citing what didn't work or what the agent learned.
+    pub why: String,
+    /// "claw" (default) | "operator". Operator-authored prompts skip
+    /// the propose/commit dance and go straight to commit.
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitPromptParams {
+    /// Proposal id from `propose_prompt`. Must be `pending`.
+    pub proposal_id: i64,
+    /// Agent-authored markdown for the diary entry that will accompany
+    /// this prompt change. Same body_md rules as commit_tune
+    /// (200..=4000 chars, must reference the change).
+    pub body_md: String,
+    /// Optional one-line headline. Auto-derived if omitted.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListPromptsParams {
+    /// Cap on revisions returned. Default 20, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// When true, includes the full markdown of each prompt revision.
+    /// Default false to keep payloads compact — call with
+    /// `include_content=true` when the agent actually needs to see
+    /// what its previous voice looked like.
+    #[serde(default)]
+    pub include_content: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitSiteChangeParams {
+    /// One-line headline of the site change (e.g. "added per-classification
+    /// win rate page"). Becomes the evolution event summary.
+    pub summary: String,
+    /// Agent-authored markdown for the diary entry. Same length rules
+    /// as commit_tune.
+    pub body_md: String,
+    /// Optional structured payload describing what changed (paths,
+    /// before/after pointers, etc.) — stored verbatim in
+    /// evolution_events.evidence_json.
+    #[serde(default)]
+    pub evidence_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeOutcomesParams {
+    /// Optional classification filter (e.g. "STAIRCASE", "GRINDER", "SPRING").
+    /// None = all classifications.
+    #[serde(default)]
+    pub classification: Option<String>,
+    /// Optional horizon filter (SHORT | LONG | MOONSHOT | SCALP).
+    /// None = all horizons.
+    #[serde(default)]
+    pub horizon: Option<String>,
+    /// Earliest called_at to include (epoch seconds). None = unlimited
+    /// history. The agent typically passes `now - 30d`.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// When true, the response includes the raw call list (capped by `limit`)
+    /// in addition to the bucketed aggregates. Useful when the agent wants
+    /// to cite specific calls in its narrative. Default false to keep the
+    /// payload compact.
+    #[serde(default)]
+    pub include_raw: bool,
+    /// Cap on raw rows returned when `include_raw` is true. Default 50,
+    /// max 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SweepThresholdParams {
+    /// Tunable field to sweep. Currently supported by sweep:
+    /// "min_effective_confidence", "max_top_holder_pct",
+    /// "min_liquidity_usd". The other tunables
+    /// (min_volume_24h_usd, min_token_age_secs) are gated pre-call so
+    /// historical sweep is meaningless — propose those manually with
+    /// dedicated evidence.
+    pub field: String,
+    /// Scope: "global" or "class:STAIRCASE" / "class:GRINDER" /
+    /// "class:SPRING" / "class:DEVELOPING". The sweep filters the
+    /// closed-call universe by this scope before applying candidates.
+    pub scope: String,
+    /// Candidate values (stringified) to test. Each becomes one row in
+    /// the response. Skipped silently if it doesn't parse for the
+    /// field's type.
+    pub candidates: Vec<String>,
+    /// Earliest called_at to include (epoch seconds). None = unlimited
+    /// history. Default: trailing 30 days.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Holdout split as percent of universe (newest by called_at).
+    /// Default 25. Range: 10..=50.
+    #[serde(default)]
+    pub holdout_pct: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RankTuneCandidatesParams {
+    /// Restrict to specific scopes (e.g. ["class:GRINDER", "global"]).
+    /// Default: all scopes the field supports.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    /// Restrict to specific fields. Default: every field that
+    /// sweep_threshold supports today.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Number of top candidates to return, ranked by effect × √n.
+    /// Default 5, max 20.
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    /// Earliest called_at to include. Default: trailing 30 days.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Holdout split percent. Default 25.
+    #[serde(default)]
+    pub holdout_pct: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeDriftParams {
+    /// Scope of the analysis. "global" or "class:STAIRCASE" /
+    /// "class:GRINDER" / "class:SPRING" / "class:DEVELOPING".
+    pub scope: String,
+    /// Number of time windows to slice the universe into. Default 4.
+    /// Range 2..=12.
+    #[serde(default)]
+    pub window_count: Option<i64>,
+    /// Total trailing span in seconds. Default: 30 days.
+    #[serde(default)]
+    pub window_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeFailureModesParams {
+    /// Scope filter — same shape as analyze_drift.
+    pub scope: String,
+    /// Earliest called_at to include. Default: now - 30d.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListEvolutionEventsParams {
+    /// Optional kind filter: "strategy" | "tool" | "site". None = all.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Cap on rows. Default 20, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// When true, includes the full body_md. Default false to keep
+    /// payloads compact.
+    #[serde(default)]
+    pub include_body: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ComparePeriodsParams {
+    /// Scope filter.
+    pub scope: String,
+    /// Pivot timestamp (epoch seconds) — typically a prior tune's
+    /// committed_at. before_secs of universe up to this point becomes
+    /// the "before" window; after_secs from this point becomes the
+    /// "after" window. Defaults to now (use this with after_secs=0
+    /// to ask "what did the trailing window look like").
+    #[serde(default)]
+    pub anchor_at: Option<i64>,
+    /// "before" window length in seconds. Default 30 days.
+    #[serde(default)]
+    pub before_secs: Option<i64>,
+    /// "after" window length in seconds. Default = (now - anchor_at).
+    #[serde(default)]
+    pub after_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DescribeClassificationsParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SimulateOverridesParams {
+    /// List of overrides to apply on top of current state. Each entry
+    /// must be a (field, scope, new_value) triple. Stacks atop already-
+    /// committed overrides; if a (field, scope) is in this list and
+    /// also a real override, the simulation uses this list's value.
+    pub overrides: Vec<SimulateOverrideEntry>,
+    /// Earliest called_at to include. Default: trailing 30d.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SimulateOverrideEntry {
+    pub field: String,
+    pub scope: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewLogParams {
+    /// How many recent cycles to return. Default 10, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewLogWriteParams {
+    /// Epoch seconds when the cycle started.
+    pub started_at: i64,
+    /// "propose" | "commit".
+    pub mode: String,
+    /// "proposed" | "committed" | "stopped" | "failed".
+    pub outcome: String,
+    /// One-paragraph summary of what the cycle did and why. Becomes
+    /// the agent's note-to-future-self.
+    pub summary: String,
+    /// Optional proposal id this cycle produced.
+    #[serde(default)]
+    pub proposal_id: Option<i64>,
+    /// Optional turn count (claw fills this in).
+    #[serde(default)]
+    pub turns: Option<i64>,
+    /// Optional tool-call count (claw fills this in).
+    #[serde(default)]
+    pub tool_calls: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DescribeSignalFiltersParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListOverridesParams {}
 
 // -- Response types --
 
@@ -425,7 +738,7 @@ fn to_json<T: Serialize>(data: &T) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("Error: {e}"))
 }
 
-impl PhotonServer {
+impl ExcitonServer {
     pub fn new(
         db: Arc<Db>,
         config: Config,
@@ -467,7 +780,7 @@ impl PhotonServer {
 }
 
 #[tool_router]
-impl PhotonServer {
+impl ExcitonServer {
     /// Scan the market: read alerts from background scanner, show pending opportunities.
     /// The background scanner runs every 30s discovering and analyzing new tokens.
     ///
@@ -962,7 +1275,7 @@ impl PhotonServer {
             .unwrap_or(0);
         let wallet_sol = wallet_lamports as f64 / 1e9;
 
-        // Publisher freshness: mtime on data/health.json in the MadApes repo.
+        // Publisher freshness: mtime on data/health.json in the publisher repo.
         let (publisher_path, publisher_age_seconds): (String, i64) =
             match self.config.madapes.as_ref() {
                 Some(mp) => {
@@ -1088,7 +1401,7 @@ impl PhotonServer {
         }
     }
 
-    /// Append a new note to MadApes.ai/thoughts, update the index, commit
+    /// Append a new note to the publisher repo's `thoughts/` folder, update the index, commit
     /// with the `note:` prefix and push. Respects append-only — fails with
     /// an error if the target filename already exists. The image processor
     /// picks up any `<div class="img-placeholder">[IMAGE: ...]</div>` blocks
@@ -1227,6 +1540,8 @@ impl PhotonServer {
             &note,
             "mcp",
             entry_tx_rate,
+            None, // operator-MCP manual: no DexScreener fetch in this path
+            None, // operator-MCP manual: no pre-call peak window computed
         );
         let id = match inserted {
             Ok(Some(id)) => id,
@@ -1523,9 +1838,9 @@ impl PhotonServer {
     /// Bump the lounge anchor — delete the previous copy of the
     /// configured "always at the bottom" message and copyMessage from
     /// the source again as a fresh post. Photon does this automatically
-    /// after every photon-originated lounge send; this tool lets
+    /// after every exciton-originated lounge send; this tool lets
     /// zeroclaw or the operator trigger it manually after posting to
-    /// the lounge through some path photon doesn't observe.
+    /// the lounge through some path exciton doesn't observe.
     #[tool]
     async fn bump_lounge_anchor(&self) -> String {
         let _ = self.db.audit_log("claude", "bump_lounge_anchor", "");
@@ -1630,7 +1945,7 @@ impl PhotonServer {
     /// For buys: amount = SOL to spend.
     /// For sells: amount = token UI amount to sell (e.g. 50000.0 tokens).
     ///
-    /// Requires PHOTON_PRIVATE_KEY env var (base58 secret key).
+    /// Requires EXCITON_PRIVATE_KEY env var (base58 secret key).
     #[tool]
     async fn trade(&self, Parameters(params): Parameters<TradeParams>) -> String {
         let _ = self.db.audit_log(
@@ -1785,7 +2100,7 @@ impl PhotonServer {
                 return serde_json::json!({
                     "error": "keypair not available",
                     "reason": e.to_string(),
-                    "hint": "export PHOTON_PRIVATE_KEY=<base58 secret key>",
+                    "hint": "export EXCITON_PRIVATE_KEY=<base58 secret key>",
                 })
                 .to_string();
             }
@@ -1797,7 +2112,7 @@ impl PhotonServer {
         {
             return serde_json::json!({
                 "error": "keypair mismatch",
-                "reason": "PHOTON_PRIVATE_KEY pubkey does not match wallet.public_key in config",
+                "reason": "EXCITON_PRIVATE_KEY pubkey does not match wallet.public_key in config",
                 "env_pubkey": keypair.pubkey().to_string(),
                 "config_pubkey": self.config.wallet.public_key,
             })
@@ -1995,24 +2310,2526 @@ impl PhotonServer {
             message,
         })
     }
+
+    /// Read-only outcome analyzer. Pulls closed calls (withdrew / failed /
+    /// expired / closed), groups by (classification, horizon), returns
+    /// per-bucket aggregates: count, win-rate, PnL distribution, hold time,
+    /// verdict breakdown. The agent's primary input when proposing a
+    /// strategy tune.
+    ///
+    /// Output structure:
+    /// ```text
+    /// {
+    ///   "since": <i64>,
+    ///   "raw_count": <usize>,
+    ///   "aggregates": [
+    ///     { "classification": "STAIRCASE", "horizon": "SHORT",
+    ///       "n": 14, "win_rate_pct": 42.8, "mean_pnl_pct": 3.2,
+    ///       "median_pnl_pct": -10.5, "p25_pnl_pct": -28.1,
+    ///       "p75_pnl_pct": 12.4, "mean_hold_secs": 4231,
+    ///       "verdicts": { "withdrew": 6, "failed": 5, "expired": 3 } },
+    ///     ...
+    ///   ],
+    ///   "outcomes": [...]   // present only when include_raw = true
+    /// }
+    /// ```
+    ///
+    /// Win rate is `withdrew / n`. PnL stats ignore rows missing exit_price.
+    /// Buckets with n < 1 are omitted.
+    #[tool]
+    async fn analyze_outcomes(
+        &self,
+        Parameters(params): Parameters<AnalyzeOutcomesParams>,
+    ) -> String {
+        // Treat empty strings as "omit this filter" — the agent often
+        // emits "" instead of leaving the field out entirely.
+        let class = params
+            .classification
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let horizon = params
+            .horizon
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let since = params.since;
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        // Pull a generous slice — bucketing happens here; cap at 5000 to
+        // avoid degenerate full-table scans on giant DBs.
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class, horizon, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+
+        let _ = self.db.audit_log(
+            "claude",
+            "analyze_outcomes",
+            &format!(
+                "class={} horizon={} since={} n={}",
+                class.unwrap_or("*"),
+                horizon.unwrap_or("*"),
+                since.map(|s| s.to_string()).unwrap_or_else(|| "*".into()),
+                outcomes.len()
+            ),
+        );
+
+        // Group by (classification, horizon) into ordered buckets. We use a
+        // BTreeMap so the output is deterministic across calls.
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<(String, String), Vec<&crate::db::CallOutcome>> = BTreeMap::new();
+        for o in &outcomes {
+            buckets
+                .entry((o.classification.clone(), o.horizon.clone()))
+                .or_default()
+                .push(o);
+        }
+
+        let aggregates: Vec<serde_json::Value> = buckets
+            .into_iter()
+            .map(|((classification, horizon), rows)| {
+                let n = rows.len() as i64;
+                let mut pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+                pnls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let pct = |p: f64| -> Option<f64> {
+                    if pnls.is_empty() {
+                        None
+                    } else {
+                        let i = ((pnls.len() as f64 - 1.0) * p).round() as usize;
+                        pnls.get(i).copied()
+                    }
+                };
+                let median = pct(0.50);
+                let p25 = pct(0.25);
+                let p75 = pct(0.75);
+
+                let win_count = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+                let win_rate = if n > 0 {
+                    100.0 * win_count as f64 / n as f64
+                } else {
+                    0.0
+                };
+
+                let holds: Vec<i64> = rows.iter().filter_map(|r| r.hold_secs).collect();
+                let mean_hold = if holds.is_empty() {
+                    None
+                } else {
+                    Some(holds.iter().sum::<i64>() / holds.len() as i64)
+                };
+
+                let mut verdicts: BTreeMap<&str, i64> = BTreeMap::new();
+                for r in &rows {
+                    *verdicts.entry(r.status.as_str()).or_insert(0) += 1;
+                }
+
+                serde_json::json!({
+                    "classification": classification,
+                    "horizon": horizon,
+                    "n": n,
+                    "win_rate_pct": round2(win_rate),
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "median_pnl_pct": median.map(round2),
+                    "p25_pnl_pct": p25.map(round2),
+                    "p75_pnl_pct": p75.map(round2),
+                    "mean_hold_secs": mean_hold,
+                    "verdicts": verdicts,
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "since": since,
+            "raw_count": outcomes.len(),
+            "aggregates": aggregates,
+        });
+        if params.include_raw {
+            // Hard byte budget so the agent can't accidentally pull
+            // 90KB of raw rows (which it did in the D1 smoke test).
+            // Trim until under budget; the limit param is a soft cap
+            // on top of this.
+            const RAW_BYTE_BUDGET: usize = 12_000;
+            let mut take = (limit as usize).min(outcomes.len());
+            loop {
+                let raw: Vec<&crate::db::CallOutcome> = outcomes.iter().take(take).collect();
+                let serialized = serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null);
+                let size = serialized.to_string().len();
+                if size <= RAW_BYTE_BUDGET || take <= 5 {
+                    payload["outcomes"] = serialized;
+                    payload["raw_truncated_to"] = serde_json::json!(take);
+                    payload["raw_byte_budget"] = serde_json::json!(RAW_BYTE_BUDGET);
+                    break;
+                }
+                take = (take as f64 * 0.7) as usize;
+                if take == 0 {
+                    take = 1;
+                }
+            }
+        }
+        payload.to_string()
+    }
+
+    /// Propose a strategy tune. Server-side validators reject anything
+    /// that fails: allow-list field, parseable value, n ≥ 10, effect
+    /// size ≥ EFFECT_FLOOR_PCT, holdout non-negative, narrative present.
+    /// Returns the proposal id on success or an error JSON on rejection.
+    /// Pending proposals do NOT take effect — the agent must follow up
+    /// with commit_tune to activate.
+    #[tool]
+    async fn propose_tune(
+        &self,
+        Parameters(params): Parameters<ProposeTuneParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+
+        if let Err(e) = validate_field_scope(&params.field, &params.scope) {
+            return reject_proposal("invalid_field_or_scope", &e);
+        }
+        if let Err(e) = validate_field_value(&params.field, &params.new_value) {
+            return reject_proposal("invalid_new_value", &e);
+        }
+        if let Err(e) = validate_field_value(&params.field, &params.old_value) {
+            return reject_proposal("invalid_old_value", &e);
+        }
+        if params.narrative.trim().len() < 40 {
+            return reject_proposal(
+                "narrative_too_short",
+                "narrative must be ≥ 40 chars; supply 3-4 trader-voice sentences",
+            );
+        }
+
+        // Dedup: a pending proposal already exists on this (field, scope).
+        // Don't pile up: the agent must commit, revert, or wait for that
+        // one to be decided before proposing again on the same knob.
+        // Cool-down: reject if any proposal on this (field, scope) was
+        // committed or rejected within the last TUNE_COOLDOWN_SECS — gives
+        // realized-tape evidence time to accumulate before re-fighting.
+        if let Ok(prior) = self.db.list_tune_proposals(None, 200) {
+            for p in &prior {
+                if p.field != params.field || p.scope != params.scope {
+                    continue;
+                }
+                if p.status == "pending" {
+                    return reject_proposal(
+                        "duplicate_pending",
+                        &format!(
+                            "proposal {} is already pending on {}|{} ({} → {}); commit, revert, or reject it before proposing again on this knob",
+                            p.id, p.field, p.scope, p.old_value, p.new_value
+                        ),
+                    );
+                }
+                let decided = p.decided_at.unwrap_or(0);
+                if matches!(p.status.as_str(), "committed" | "rejected" | "reverted")
+                    && decided > 0
+                    && now - decided < TUNE_COOLDOWN_SECS
+                {
+                    let remaining = TUNE_COOLDOWN_SECS - (now - decided);
+                    return reject_proposal(
+                        "cooldown_active",
+                        &format!(
+                            "proposal {} on {}|{} was {} {}s ago; cool-down has {}s remaining (need realized-tape evidence to accumulate before re-fighting this knob)",
+                            p.id, p.field, p.scope, p.status, now - decided, remaining
+                        ),
+                    );
+                }
+            }
+        }
+
+        let evidence: serde_json::Value = match serde_json::from_str(&params.evidence_json) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("evidence_json_invalid", &e.to_string()),
+        };
+
+        let n = match evidence["current"]["n"].as_i64() {
+            Some(v) if v >= EVIDENCE_FLOOR => v,
+            Some(v) => {
+                return reject_proposal(
+                    "insufficient_evidence",
+                    &format!("current.n = {} < floor of {}", v, EVIDENCE_FLOOR),
+                )
+            }
+            None => return reject_proposal("missing_current_n", "evidence.current.n required"),
+        };
+
+        let cur_pnl = match evidence["current"]["mean_pnl_pct"].as_f64() {
+            Some(v) => v,
+            None => {
+                return reject_proposal(
+                    "missing_current_pnl",
+                    "evidence.current.mean_pnl_pct required",
+                )
+            }
+        };
+        let prop_pnl = match evidence["proposed"]["mean_pnl_pct"].as_f64() {
+            Some(v) => v,
+            None => {
+                return reject_proposal(
+                    "missing_proposed_pnl",
+                    "evidence.proposed.mean_pnl_pct required",
+                )
+            }
+        };
+        let effect = prop_pnl - cur_pnl;
+        if effect < EFFECT_FLOOR_PCT {
+            return reject_proposal(
+                "insufficient_effect_size",
+                &format!(
+                    "proposed mean PnL improvement {:.2}% < floor of {:.1}%",
+                    effect, EFFECT_FLOOR_PCT
+                ),
+            );
+        }
+
+        let holdout_n = evidence["holdout"]["n"].as_i64().unwrap_or(0);
+        let holdout_pnl = evidence["holdout"]["mean_pnl_pct"].as_f64();
+        if holdout_n < 1 {
+            return reject_proposal(
+                "missing_holdout",
+                "evidence.holdout.n must be ≥ 1 — show the proposed setup beats current on a recent slice",
+            );
+        }
+        if let Some(h) = holdout_pnl {
+            if h < 0.0 {
+                return reject_proposal(
+                    "holdout_negative",
+                    &format!("holdout mean PnL {:.2}% < 0; proposed setup loses on the recent slice", h),
+                );
+            }
+        }
+
+        // Spread check: if the agent supplied rejected-cohort stats in
+        // the evidence, enforce the same separation floor the ranker
+        // uses. Falls through silently when the evidence shape lacks
+        // `rejected.mean_pnl_pct` — only ranker-built evidence carries
+        // it today, so manual proposals aren't penalized for the
+        // omission. When present, it's a hard gate.
+        if let Some(rej_pnl) = evidence["rejected"]["mean_pnl_pct"].as_f64() {
+            let spread = prop_pnl - rej_pnl;
+            if spread < SPREAD_FLOOR_PCT {
+                return reject_proposal(
+                    "insufficient_spread",
+                    &format!(
+                        "passing-vs-rejected cohort spread {:.2}% < floor of {:.1}% — the rejected cohort isn't visibly worse, so the cut may be noise",
+                        spread, SPREAD_FLOOR_PCT
+                    ),
+                );
+            }
+        }
+
+        let new_proposal = crate::db::NewTuneProposal {
+            proposed_at: now,
+            proposed_by: params
+                .proposed_by
+                .clone()
+                .unwrap_or_else(|| "claw".to_string()),
+            field: params.field.clone(),
+            scope: params.scope.clone(),
+            old_value: params.old_value.clone(),
+            new_value: params.new_value.clone(),
+            sample_size: n,
+            effect_size: Some(round2(effect)),
+            holdout_metric: holdout_pnl.map(round2),
+            evidence_json: params.evidence_json.clone(),
+            narrative: params.narrative.clone(),
+        };
+        let id = match self.db.insert_tune_proposal(&new_proposal) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "propose_tune",
+            &format!(
+                "id={} field={} scope={} {} → {} effect={:+.2}% n={}",
+                id, params.field, params.scope, params.old_value, params.new_value, effect, n
+            ),
+        );
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": id,
+            "status": "pending",
+            "field": params.field,
+            "scope": params.scope,
+            "effect_size_pct": round2(effect),
+            "sample_size": n,
+            "next_step": "call commit_tune(proposal_id, body_md) to activate + post the diary entry"
+        })
+        .to_string()
+    }
+
+    /// Commit a pending proposal — writes the signal_overrides row that
+    /// makes the change effective for future scan cycles, and creates an
+    /// evolution_events row with the agent-authored body_md. Channel post
+    /// + diary file write happen here too once Phase A4 is wired in.
+    #[tool]
+    async fn commit_tune(
+        &self,
+        Parameters(params): Parameters<CommitTuneParams>,
+    ) -> String {
+        let proposal = match self.db.get_tune_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "pending" {
+            return reject_proposal(
+                "not_pending",
+                &format!(
+                    "proposal {} is in status '{}', cannot commit",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+        // Soft structural check: the body must reference the change
+        // (old or new value, or the field name) so the diary entry isn't
+        // disconnected from the proposal it narrates.
+        let body_lc = body.to_lowercase();
+        if !body_lc.contains(&proposal.field.to_lowercase())
+            && !body.contains(&proposal.old_value)
+            && !body.contains(&proposal.new_value)
+        {
+            return reject_proposal(
+                "body_md_disconnected",
+                "body_md must reference either the field name, old_value, or new_value",
+            );
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self.db.upsert_signal_override(
+            &proposal.field,
+            &proposal.scope,
+            &proposal.new_value,
+            now,
+            Some(proposal.id),
+        ) {
+            return reject_proposal("db_error_override", &e.to_string());
+        }
+
+        let summary = params.summary.unwrap_or_else(|| {
+            format!(
+                "{} ({}): {} → {}",
+                proposal.field, proposal.scope, proposal.old_value, proposal.new_value
+            )
+        });
+        let evo_id = match self.db.insert_evolution_event(
+            "strategy",
+            &summary,
+            body,
+            Some(&proposal.evidence_json),
+            Some(proposal.id),
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+
+        if let Err(e) = self.db.update_proposal_status(
+            proposal.id,
+            "committed",
+            "claw",
+            now,
+            None,
+            Some(evo_id),
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_tune",
+            &format!(
+                "id={} field={} scope={} new_value={} evo_id={}",
+                proposal.id, proposal.field, proposal.scope, proposal.new_value, evo_id
+            ),
+        );
+
+        // Broadcast: post to evolution channel + write markdown to the
+        // publisher's thoughts dir + git push. Failures here are NON-fatal
+        // — the evolution row is already in DB, so the website diary will
+        // pick it up on the next sync, and a channel re-post can be done
+        // manually by reading the row.
+        let publish = self
+            .publish_evolution(evo_id, "STRATEGY", &summary, body)
+            .await;
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "evolution_event_id": evo_id,
+            "status": "committed",
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
+    /// List tune proposals, optionally filtered by status. Returns the
+    /// full proposal records (status, sample_size, effect_size, etc.)
+    /// so the agent can audit its own history before proposing again.
+    #[tool]
+    async fn list_tunes(
+        &self,
+        Parameters(params): Parameters<ListTunesParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        // Treat empty status as no filter — same coercion as analyze_outcomes.
+        let status_filter = params
+            .status
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let rows = match self.db.list_tune_proposals(status_filter, limit) {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        serde_json::json!({
+            "ok": true,
+            "count": rows.len(),
+            "proposals": rows
+        })
+        .to_string()
+    }
+
+    /// Revert a previously-committed proposal. Deletes the matching
+    /// signal_overrides row (gate falls back to compile-time default)
+    /// and marks the proposal `reverted` with a reason. Does NOT
+    /// auto-fire an evolution event — the agent should narrate the
+    /// revert with a fresh propose+commit cycle if it wants the diary
+    /// to record it.
+    #[tool]
+    async fn revert_tune(
+        &self,
+        Parameters(params): Parameters<RevertTuneParams>,
+    ) -> String {
+        let reason = params.reason.trim();
+        if reason.len() < 20 {
+            return reject_proposal(
+                "reason_too_short",
+                "reason must be ≥ 20 chars — explain why the override is being removed",
+            );
+        }
+        let proposal = match self.db.get_tune_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "committed" {
+            return reject_proposal(
+                "not_committed",
+                &format!(
+                    "proposal {} is '{}', not 'committed' — only committed tunes can be reverted",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+        if let Err(e) = self.db.delete_signal_override(&proposal.field, &proposal.scope) {
+            return reject_proposal("db_error_override", &e.to_string());
+        }
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self.db.update_proposal_status(
+            proposal.id,
+            "reverted",
+            "claw",
+            now,
+            Some(reason),
+            proposal.evolution_event_id,
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+        let _ = self.db.audit_log(
+            "claude",
+            "revert_tune",
+            &format!(
+                "id={} field={} scope={} reason={}",
+                proposal.id, proposal.field, proposal.scope, reason
+            ),
+        );
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "status": "reverted"
+        })
+        .to_string()
+    }
+
+    /// Propose a new system prompt revision. The agent supplies the full
+    /// new content (markdown) plus a `why` explaining what motivated the
+    /// rewrite. No statistical floor here — voice is qualitative — but
+    /// the content has length bounds and `why` must read like a real
+    /// explanation, not a placeholder.
+    #[tool]
+    async fn propose_prompt(
+        &self,
+        Parameters(params): Parameters<ProposePromptParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let content = params.content.trim();
+        if !(PROMPT_MIN..=PROMPT_MAX).contains(&content.len()) {
+            return reject_proposal(
+                "content_length",
+                &format!(
+                    "content must be {}..={} chars (got {})",
+                    PROMPT_MIN,
+                    PROMPT_MAX,
+                    content.len()
+                ),
+            );
+        }
+        let why = params.why.trim();
+        if why.len() < 60 {
+            return reject_proposal(
+                "why_too_short",
+                "why must be ≥ 60 chars — a prompt rewrite is high-blast-radius, explain it",
+            );
+        }
+        let base_version = self
+            .db
+            .get_current_prompt()
+            .ok()
+            .flatten()
+            .map(|p| p.version);
+        let new_proposal = crate::db::NewPromptProposal {
+            proposed_at: now,
+            proposed_by: params
+                .proposed_by
+                .clone()
+                .unwrap_or_else(|| "claw".to_string()),
+            content: content.to_string(),
+            why: why.to_string(),
+            base_version,
+        };
+        let id = match self.db.insert_prompt_proposal(&new_proposal) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "propose_prompt",
+            &format!(
+                "id={} base_version={:?} content_len={}",
+                id,
+                base_version,
+                content.len()
+            ),
+        );
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": id,
+            "status": "pending",
+            "base_version": base_version,
+            "next_step": "call commit_prompt(proposal_id, body_md) to activate the new prompt + post the diary entry"
+        })
+        .to_string()
+    }
+
+    /// Commit a pending prompt revision. Inserts the new content into
+    /// `agent_prompt` (auto-incremented version), creates an evolution
+    /// event with kind=tool, marks the proposal committed, and publishes.
+    #[tool]
+    async fn commit_prompt(
+        &self,
+        Parameters(params): Parameters<CommitPromptParams>,
+    ) -> String {
+        let proposal = match self.db.get_prompt_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no prompt proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "pending" {
+            return reject_proposal(
+                "not_pending",
+                &format!(
+                    "prompt proposal {} is in status '{}', cannot commit",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let new_version = match self.db.append_prompt(
+            &proposal.content,
+            now,
+            &proposal.proposed_by,
+            Some(&proposal.why),
+            Some(proposal.id),
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_prompt", &e.to_string()),
+        };
+
+        let summary = params
+            .summary
+            .unwrap_or_else(|| format!("agent prompt rewritten (v{})", new_version));
+        let evidence = serde_json::json!({
+            "base_version": proposal.base_version,
+            "new_version": new_version,
+            "why": proposal.why,
+            "content_chars": proposal.content.len(),
+        })
+        .to_string();
+        let evo_id = match self.db.insert_evolution_event(
+            "tool",
+            &summary,
+            body,
+            Some(&evidence),
+            Some(proposal.id),
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+
+        if let Err(e) = self.db.update_prompt_proposal_status(
+            proposal.id,
+            "committed",
+            "claw",
+            now,
+            None,
+            Some(evo_id),
+            Some(new_version),
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_prompt",
+            &format!(
+                "proposal={} version={} evo_id={}",
+                proposal.id, new_version, evo_id
+            ),
+        );
+
+        let publish = self.publish_evolution(evo_id, "TOOL", &summary, body).await;
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "evolution_event_id": evo_id,
+            "agent_prompt_version": new_version,
+            "status": "committed",
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
+    /// List prompt revisions + proposals. By default returns lightweight
+    /// rows (content truncated to a preview); pass `include_content=true`
+    /// to fetch full markdown bodies.
+    #[tool]
+    async fn list_prompts(
+        &self,
+        Parameters(params): Parameters<ListPromptsParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(20).clamp(1, 200);
+        let proposals = match self
+            .db
+            .list_prompt_proposals(limit, params.include_content)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        // Always also surface the currently-active prompt so the agent
+        // doesn't have to mentally diff against a copy in its head.
+        let current = self.db.get_current_prompt().ok().flatten().map(|p| {
+            let content_preview = if params.include_content {
+                p.content.clone()
+            } else {
+                let mut s = p.content;
+                if s.len() > 240 {
+                    s.truncate(240);
+                    s.push_str("…");
+                }
+                s
+            };
+            serde_json::json!({
+                "version": p.version,
+                "created_at": p.created_at,
+                "created_by": p.created_by,
+                "why": p.why,
+                "content": content_preview,
+            })
+        });
+        serde_json::json!({
+            "ok": true,
+            "current": current,
+            "proposals": proposals,
+        })
+        .to_string()
+    }
+
+    /// Record an agent-driven site change as an evolution event. The agent
+    /// calls this AFTER it has performed a deliberate site mutation (e.g.
+    /// added a new visualization, restructured the diary index). This is
+    /// NOT auto-fired by file mutations from the publisher tick — those
+    /// are routine, not evolutions.
+    #[tool]
+    async fn commit_site_change(
+        &self,
+        Parameters(params): Parameters<CommitSiteChangeParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let summary = params.summary.trim();
+        if summary.is_empty() || summary.len() > 200 {
+            return reject_proposal(
+                "summary_length",
+                "summary must be 1..=200 chars",
+            );
+        }
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+
+        let evo_id = match self.db.insert_evolution_event(
+            "site",
+            summary,
+            body,
+            params.evidence_json.as_deref(),
+            None,
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_site_change",
+            &format!("evo_id={} summary={}", evo_id, summary),
+        );
+        let publish = self.publish_evolution(evo_id, "SITE", summary, body).await;
+        serde_json::json!({
+            "ok": true,
+            "evolution_event_id": evo_id,
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
+    /// Read the tunable knob inventory: name, current effective value,
+    /// compile-time default, valid range, supported scopes. The agent
+    /// uses this so its prompt doesn't have to hardcode the field list
+    /// — and the operator can extend the surface without re-prompting
+    /// the agent.
+    #[tool]
+    async fn describe_signal_filters(
+        &self,
+        Parameters(_): Parameters<DescribeSignalFiltersParams>,
+    ) -> String {
+        let overrides = match self.db.list_signal_overrides() {
+            Ok(rows) => rows,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        let active = |field: &str, scope: &str| -> Option<String> {
+            overrides
+                .iter()
+                .find(|(f, s, _, _)| f == field && s == scope)
+                .map(|(_, _, v, _)| v.clone())
+        };
+        let entries = serde_json::json!([
+            {
+                "field": "min_effective_confidence",
+                "kind": "minimum",
+                "value_type": "i32",
+                "range": {"min": 0, "max": 100},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {
+                    "STAIRCASE": 70,
+                    "GRINDER": 65,
+                    "DEVELOPING": 60,
+                },
+                "active_overrides": {
+                    "global": active("min_effective_confidence", "global"),
+                    "class:STAIRCASE": active("min_effective_confidence", "class:STAIRCASE"),
+                    "class:GRINDER": active("min_effective_confidence", "class:GRINDER"),
+                    "class:SPRING": active("min_effective_confidence", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "Per-class confidence floor. Calls below the floor are blocked. Higher = stricter.",
+            },
+            {
+                "field": "max_top_holder_pct",
+                "kind": "maximum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": 100.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT},
+                "active_overrides": {
+                    "global": active("max_top_holder_pct", "global"),
+                    "class:STAIRCASE": active("max_top_holder_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("max_top_holder_pct", "class:GRINDER"),
+                    "class:SPRING": active("max_top_holder_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "Top-1 holder concentration ceiling. Higher top-holder = more rug-prone. Lower = stricter.",
+            },
+            {
+                "field": "min_liquidity_usd",
+                "kind": "minimum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_LIQUIDITY_USD},
+                "active_overrides": {
+                    "global": active("min_liquidity_usd", "global"),
+                },
+                "sweepable": true,
+                "description": "Pool-liquidity floor. Calls below the floor have unhealthy depth. Higher = stricter.",
+            },
+            {
+                "field": "min_volume_24h_usd",
+                "kind": "minimum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_VOLUME_24H_USD},
+                "active_overrides": {
+                    "global": active("min_volume_24h_usd", "global"),
+                },
+                "sweepable": false,
+                "description": "24h volume floor. NOT sweepable from history (rejected calls aren't stored). Tune manually with snapshot evidence.",
+            },
+            {
+                "field": "min_token_age_secs",
+                "kind": "minimum",
+                "value_type": "i64",
+                "range": {"min": 0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS},
+                "active_overrides": {
+                    "global": active("min_token_age_secs", "global"),
+                },
+                "sweepable": false,
+                "description": "Minimum token age at signal time. NOT sweepable from history.",
+            },
+            {
+                "field": "max_h1_price_change_pct",
+                "kind": "maximum",
+                "value_type": "f64",
+                "range": {"min": -100.0, "max": 10000.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MAX_H1_PRICE_CHANGE_PCT},
+                "active_overrides": {
+                    "global": active("max_h1_price_change_pct", "global"),
+                    "class:STAIRCASE": active("max_h1_price_change_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("max_h1_price_change_pct", "class:GRINDER"),
+                    "class:SPRING": active("max_h1_price_change_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "DexScreener priceChange.h1 ceiling at signal time. Block tokens with too much trend in the last hour. Lower = stricter. Default 10000 = gate off.",
+            },
+            {
+                "field": "min_h1_price_change_pct",
+                "kind": "minimum",
+                "value_type": "f64",
+                "range": {"min": -100.0, "max": 10000.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_H1_PRICE_CHANGE_PCT},
+                "active_overrides": {
+                    "global": active("min_h1_price_change_pct", "global"),
+                    "class:STAIRCASE": active("min_h1_price_change_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("min_h1_price_change_pct", "class:GRINDER"),
+                    "class:SPRING": active("min_h1_price_change_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "DexScreener priceChange.h1 floor at signal time. Require trend confirmation before entering. Higher = stricter. Default -100 = gate off.",
+            },
+            {
+                "field": "max_pre_call_peak_vs_entry_pct",
+                "kind": "maximum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": 10000.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MAX_PRE_CALL_PEAK_PCT},
+                "active_overrides": {
+                    "global": active("max_pre_call_peak_vs_entry_pct", "global"),
+                    "class:STAIRCASE": active("max_pre_call_peak_vs_entry_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("max_pre_call_peak_vs_entry_pct", "class:GRINDER"),
+                    "class:SPRING": active("max_pre_call_peak_vs_entry_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "Pre-call peak vs entry ceiling. Computed as max(snapshot_price in last 30m) / entry_price - 1. High value = entered on a fade from a recent local high (the bait pattern from the 2026-05-05 diagnostic). Lower = stricter. Default 10000 = gate off.",
+            },
+        ]);
+        serde_json::json!({
+            "ok": true,
+            "fields": entries,
+            "evidence_floor": EVIDENCE_FLOOR,
+            "effect_floor_pct": EFFECT_FLOOR_PCT,
+        })
+        .to_string()
+    }
+
+    /// List active runtime overrides (committed tunes). Read counterpart
+    /// to commit_tune writes — lets the agent see its own current state
+    /// without grepping the DB. Each row is one (field, scope, value)
+    /// triple with set_at timestamp.
+    #[tool]
+    async fn list_overrides(
+        &self,
+        Parameters(_): Parameters<ListOverridesParams>,
+    ) -> String {
+        match self.db.list_signal_overrides() {
+            Ok(rows) => {
+                let entries: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(field, scope, value, set_at)| {
+                        serde_json::json!({
+                            "field": field,
+                            "scope": scope,
+                            "value": value,
+                            "set_at": set_at,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "count": entries.len(),
+                    "overrides": entries,
+                })
+                .to_string()
+            }
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Threshold sweep — for one (field, scope), test a list of
+    /// candidate values against the closed-call universe. Returns per
+    /// candidate the validator-ready evidence_json (current/proposed/
+    /// holdout) plus summary stats. The agent picks one row and feeds
+    /// the embedded evidence_json straight into propose_tune — no math
+    /// in token-space.
+    #[tool]
+    async fn sweep_threshold(
+        &self,
+        Parameters(params): Parameters<SweepThresholdParams>,
+    ) -> String {
+        if let Err(e) = validate_field_scope(&params.field, &params.scope) {
+            return serde_json::json!({"ok": false, "error": "invalid_field_or_scope", "message": e}).to_string();
+        }
+        if !field_is_sweepable(&params.field) {
+            return serde_json::json!({
+                "ok": false,
+                "error": "field_not_sweepable",
+                "message": format!("field '{}' is gated pre-call so historical calls don't carry the value needed to sweep — propose manually with operator evidence", params.field),
+            })
+            .to_string();
+        }
+        let holdout_pct = params.holdout_pct.unwrap_or(25).clamp(10, 50) as f64 / 100.0;
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string();
+            }
+        };
+
+        if outcomes.is_empty() {
+            return serde_json::json!({
+                "ok": true,
+                "field": params.field,
+                "scope": params.scope,
+                "since": since,
+                "baseline": null,
+                "candidates": [],
+                "note": "no closed calls in window",
+            })
+            .to_string();
+        }
+
+        // Time split: holdout = newest holdout_pct of universe by called_at.
+        let mut sorted = outcomes.clone();
+        sorted.sort_by_key(|o| o.called_at);
+        let holdout_size = ((sorted.len() as f64) * holdout_pct).round() as usize;
+        let holdout_size = holdout_size.max(1).min(sorted.len() - 1);
+        let cutoff_idx = sorted.len() - holdout_size;
+        let holdout_cutoff = sorted[cutoff_idx].called_at;
+
+        let baseline = bucket_stats(&sorted);
+        let current = resolve_current_value(&self.db, &params.field, &params.scope);
+        let current_value = current.as_str().to_string();
+        let current_source = current.source();
+        let current_narration = current.display_for_narration();
+
+        let candidates: Vec<serde_json::Value> = params
+            .candidates
+            .iter()
+            .filter_map(|cand_str| {
+                if validate_field_value(&params.field, cand_str).is_err() {
+                    return Some(serde_json::json!({
+                        "value": cand_str,
+                        "ok": false,
+                        "error": "value_invalid",
+                    }));
+                }
+                let mut row = evaluate_candidate(
+                    &sorted,
+                    &params.field,
+                    cand_str,
+                    holdout_cutoff,
+                );
+                row["propose_tune_args"] = serde_json::json!({
+                    "field": params.field,
+                    "scope": params.scope,
+                    "old_value": current_value,
+                    "new_value": cand_str,
+                    "evidence_json": row.get("evidence_json").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                Some(row)
+            })
+            .collect();
+
+        serde_json::json!({
+            "ok": true,
+            "field": params.field,
+            "scope": params.scope,
+            "since": since,
+            "holdout_cutoff": holdout_cutoff,
+            "universe_n": sorted.len(),
+            "baseline": baseline,
+            "current_value": current_value,
+            "current_value_source": current_source,
+            "current_state_narration": current_narration,
+            "candidates": candidates,
+        })
+        .to_string()
+    }
+
+    /// Rank tunable candidates across (scope × field × candidate-grid)
+    /// using a built-in candidate set per field. Returns the top-K
+    /// ranked by `effect_pct × √n_passing`, each with a fully-formed
+    /// evidence_json the agent can pass to propose_tune verbatim.
+    /// This is the "what should I tune?" endpoint — it surveys the
+    /// space deterministically so the LLM doesn't have to enumerate.
+    #[tool]
+    async fn rank_tune_candidates(
+        &self,
+        Parameters(params): Parameters<RankTuneCandidatesParams>,
+    ) -> String {
+        let top_k = params.top_k.unwrap_or(5).clamp(1, 20) as usize;
+        let holdout_pct = params.holdout_pct.unwrap_or(25).clamp(10, 50) as f64 / 100.0;
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+
+        // Treat empty arrays as "use defaults" — matches the coercion
+        // pattern elsewhere (empty string → no filter). The agent often
+        // passes `fields:[]` when it means "all of them."
+        let fields_param = params
+            .fields
+            .clone()
+            .filter(|v| !v.is_empty());
+        let scopes_param = params
+            .scopes
+            .clone()
+            .filter(|v| !v.is_empty());
+        // Default-fields = every sweepable field. Adding a tunable to
+        // field_is_sweepable automatically pulls it into the default
+        // ranker pass — no second registration step.
+        let fields = fields_param
+            .unwrap_or_else(|| {
+                [
+                    "min_effective_confidence",
+                    "max_top_holder_pct",
+                    "min_liquidity_usd",
+                    "max_h1_price_change_pct",
+                    "min_h1_price_change_pct",
+                    "max_pre_call_peak_vs_entry_pct",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+            })
+            .into_iter()
+            .filter(|f| field_is_sweepable(f))
+            .collect::<Vec<_>>();
+
+        let mut all_candidates: Vec<serde_json::Value> = Vec::new();
+
+        for field in &fields {
+            let scopes_to_try: Vec<String> = scopes_param
+                .clone()
+                .unwrap_or_else(|| default_scopes_for_field(field));
+            for scope in &scopes_to_try {
+                if validate_field_scope(field, scope).is_err() {
+                    continue;
+                }
+                let class = scope_class(scope);
+                let outcomes = match self
+                    .db
+                    .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+                {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if outcomes.len() < EVIDENCE_FLOOR as usize {
+                    continue;
+                }
+                let mut sorted = outcomes;
+                sorted.sort_by_key(|o| o.called_at);
+                let holdout_size = ((sorted.len() as f64) * holdout_pct).round() as usize;
+                let holdout_size = holdout_size.max(1).min(sorted.len() - 1);
+                let cutoff_idx = sorted.len() - holdout_size;
+                let holdout_cutoff = sorted[cutoff_idx].called_at;
+
+                let current = resolve_current_value(&self.db, field, scope);
+                let current_value = current.as_str().to_string();
+                let current_source = current.source();
+                let current_narration = current.display_for_narration();
+                for cand in default_candidates_for_field(field) {
+                    let row = evaluate_candidate(&sorted, field, &cand, holdout_cutoff);
+                    if row.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        continue;
+                    }
+                    let n = row.get("n_passing").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let effect = row
+                        .get("effect_vs_baseline_pct")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let holdout_n = row
+                        .get("holdout")
+                        .and_then(|v| v.get("n"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let holdout_pnl = row
+                        .get("holdout")
+                        .and_then(|v| v.get("mean_pnl_pct"))
+                        .and_then(|v| v.as_f64());
+                    let mean_pass = row
+                        .get("mean_pnl_passing_pct")
+                        .and_then(|v| v.as_f64());
+                    let mean_rej = row
+                        .get("mean_pnl_rejected_pct")
+                        .and_then(|v| v.as_f64());
+                    // Spread check: reject candidates whose passing
+                    // cohort isn't visibly cleaner than the rejected
+                    // cohort. Without this, a candidate can clear the
+                    // 5% effect floor on a thin tail while rejecting a
+                    // group that's barely worse — i.e. noise. Require
+                    // mean_passing - mean_rejected ≥ SPREAD_FLOOR.
+                    let spread = match (mean_pass, mean_rej) {
+                        (Some(p), Some(r)) => Some(p - r),
+                        _ => None,
+                    };
+                    if n < EVIDENCE_FLOOR
+                        || effect < EFFECT_FLOOR_PCT
+                        || holdout_n < 1
+                        || holdout_pnl.map_or(true, |h| h < 0.0)
+                        || spread.map_or(true, |s| s < SPREAD_FLOOR_PCT)
+                    {
+                        continue;
+                    }
+                    let leverage = effect * (n as f64).sqrt();
+                    let mut enriched = row.clone();
+                    enriched["field"] = serde_json::json!(field);
+                    enriched["scope"] = serde_json::json!(scope);
+                    enriched["leverage"] = serde_json::json!(round2(leverage));
+                    enriched["spread_pct"] = serde_json::json!(spread.map(round2));
+                    enriched["current_value"] = serde_json::json!(&current_value);
+                    enriched["current_value_source"] = serde_json::json!(current_source);
+                    enriched["current_state_narration"] = serde_json::json!(current_narration);
+                    enriched["propose_tune_args"] = serde_json::json!({
+                        "field": field,
+                        "scope": scope,
+                        "old_value": current_value,
+                        "new_value": cand,
+                        "evidence_json": enriched.get("evidence_json").cloned().unwrap_or(serde_json::Value::Null),
+                    });
+                    all_candidates.push(enriched);
+                }
+            }
+        }
+
+        all_candidates.sort_by(|a, b| {
+            let la = a.get("leverage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let lb = b.get("leverage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_candidates.truncate(top_k);
+
+        serde_json::json!({
+            "ok": true,
+            "since": since,
+            "fields_searched": fields,
+            "candidate_count": all_candidates.len(),
+            "candidates": all_candidates,
+            "note": "All candidates pre-validated against the same floors propose_tune enforces (n>=10, effect>=5%, holdout n>=1 and mean>=0). evidence_json on each row can be passed to propose_tune verbatim.",
+        })
+        .to_string()
+    }
+
+    /// Time-windowed drift detector. Slices the closed-call universe
+    /// into N equal time windows and reports per-window (n, mean_pnl,
+    /// win_rate). The agent uses this to spot "this bucket was +12%
+    /// for the first 3 weeks then -8% in week 4" patterns that
+    /// `analyze_outcomes` smoothes over.
+    #[tool]
+    async fn analyze_drift(
+        &self,
+        Parameters(params): Parameters<AnalyzeDriftParams>,
+    ) -> String {
+        let window_count = params.window_count.unwrap_or(4).clamp(2, 12);
+        let span = params.window_secs.unwrap_or(30 * 24 * 60 * 60);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - span;
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, Some(since), 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let window_size = span / window_count;
+        let windows: Vec<serde_json::Value> = (0..window_count)
+            .map(|i| {
+                let start = since + i * window_size;
+                let end = start + window_size;
+                let slice: Vec<&crate::db::CallOutcome> = outcomes
+                    .iter()
+                    .filter(|o| o.called_at >= start && o.called_at < end)
+                    .collect();
+                let n = slice.len() as i64;
+                let pnls: Vec<f64> = slice.iter().filter_map(|r| r.pnl_pct).collect();
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let wins = slice.iter().filter(|r| r.status == "withdrew").count() as i64;
+                let win_rate = if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 };
+                serde_json::json!({
+                    "window_index": i,
+                    "start": start,
+                    "end": end,
+                    "n": n,
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "win_rate_pct": round2(win_rate),
+                })
+            })
+            .collect();
+        let overall_pnls: Vec<f64> = outcomes.iter().filter_map(|r| r.pnl_pct).collect();
+        let overall_mean = if overall_pnls.is_empty() {
+            None
+        } else {
+            Some(overall_pnls.iter().sum::<f64>() / overall_pnls.len() as f64)
+        };
+        // Drift signal: largest absolute delta of any window's mean from
+        // the overall mean, plus the trend direction (last - first).
+        let mut max_dev: f64 = 0.0;
+        let mut max_dev_idx: i64 = -1;
+        if let Some(om) = overall_mean {
+            for w in &windows {
+                if let Some(m) = w.get("mean_pnl_pct").and_then(|v| v.as_f64()) {
+                    let dev = (m - om).abs();
+                    if dev > max_dev {
+                        max_dev = dev;
+                        max_dev_idx = w.get("window_index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    }
+                }
+            }
+        }
+        let first_mean = windows
+            .first()
+            .and_then(|w| w.get("mean_pnl_pct"))
+            .and_then(|v| v.as_f64());
+        let last_mean = windows
+            .last()
+            .and_then(|w| w.get("mean_pnl_pct"))
+            .and_then(|v| v.as_f64());
+        let trend = match (first_mean, last_mean) {
+            (Some(f), Some(l)) => Some(l - f),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "since": since,
+            "window_count": window_count,
+            "window_size_secs": window_size,
+            "universe_n": outcomes.len(),
+            "overall_mean_pnl_pct": overall_mean.map(round2),
+            "windows": windows,
+            "max_deviation_pct": round2(max_dev),
+            "max_deviation_window": max_dev_idx,
+            "trend_first_to_last_pct": trend.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Failure-mode taxonomy. For closed calls in scope, classify each
+    /// non-winning outcome into a category by status + exit_note pattern,
+    /// returning counts + mean PnL per category. Lets the agent name
+    /// what's broken (rug vs timeout vs slow-bleed) instead of just
+    /// reporting "lots of failures."
+    #[tool]
+    async fn analyze_failure_modes(
+        &self,
+        Parameters(params): Parameters<AnalyzeFailureModesParams>,
+    ) -> String {
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<&str, Vec<&crate::db::CallOutcome>> = BTreeMap::new();
+        for o in &outcomes {
+            let mode = classify_failure_mode(o);
+            buckets.entry(mode).or_default().push(o);
+        }
+        let summaries: Vec<serde_json::Value> = buckets
+            .into_iter()
+            .map(|(mode, rows)| {
+                let n = rows.len() as i64;
+                let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+                let mean_pnl = if pnls.is_empty() {
+                    None
+                } else {
+                    Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+                };
+                let median = if pnls.is_empty() {
+                    None
+                } else {
+                    let mut sorted = pnls.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(sorted[sorted.len() / 2])
+                };
+                serde_json::json!({
+                    "mode": mode,
+                    "n": n,
+                    "share_pct": round2(100.0 * n as f64 / outcomes.len().max(1) as f64),
+                    "mean_pnl_pct": mean_pnl.map(round2),
+                    "median_pnl_pct": median.map(round2),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "since": since,
+            "universe_n": outcomes.len(),
+            "modes": summaries,
+        })
+        .to_string()
+    }
+
+    /// Read the public diary so the agent can avoid repeating itself
+    /// and can cite prior moves when narrating a new one. Body_md is
+    /// omitted by default to keep payloads small — set
+    /// `include_body=true` when the agent specifically wants to see
+    /// what its previous voice looked like.
+    #[tool]
+    async fn list_evolution_events(
+        &self,
+        Parameters(params): Parameters<ListEvolutionEventsParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(20).clamp(1, 200);
+        let kind_filter = params
+            .kind
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        match self.db.list_evolution_events(kind_filter, limit) {
+            Ok(rows) => {
+                let entries: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|e| {
+                        let mut obj = serde_json::json!({
+                            "id": e.id,
+                            "kind": e.kind,
+                            "summary": e.summary,
+                            "committed_at": e.committed_at,
+                            "posted_at": e.posted_at,
+                            "proposal_id": e.proposal_id,
+                            "diary_path": e.diary_path,
+                        });
+                        if params.include_body {
+                            obj["body_md"] = serde_json::json!(e.body_md);
+                        }
+                        obj
+                    })
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "count": entries.len(),
+                    "events": entries,
+                })
+                .to_string()
+            }
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Before/after comparison anchored at a timestamp (e.g. a prior
+    /// tune's committed_at). Returns per-window aggregates + delta.
+    /// "Did my last tune actually work?" tool. anchor_at defaults to
+    /// now; use the tune's committed_at to compare pre-tune vs
+    /// post-tune performance.
+    #[tool]
+    async fn compare_periods(
+        &self,
+        Parameters(params): Parameters<ComparePeriodsParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let anchor = params.anchor_at.unwrap_or(now);
+        let before_span = params.before_secs.unwrap_or(30 * 24 * 60 * 60);
+        let after_span = params.after_secs.unwrap_or((now - anchor).max(0));
+        let before_start = anchor - before_span;
+        let before_end = anchor;
+        let after_start = anchor;
+        let after_end = anchor + after_span;
+        let class = scope_class(&params.scope);
+        // Pull a wide superset and partition in-memory; cheaper than two
+        // round trips and keeps the bucket math identical.
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, Some(before_start), 5000)
+        {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let before: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|o| o.called_at >= before_start && o.called_at < before_end)
+            .collect();
+        let after: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|o| o.called_at >= after_start && o.called_at < after_end)
+            .collect();
+        let stats = |rows: &[&crate::db::CallOutcome]| -> serde_json::Value {
+            let n = rows.len() as i64;
+            let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+            let mean = if pnls.is_empty() {
+                None
+            } else {
+                Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+            };
+            let wins = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+            let win_rate = if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 };
+            serde_json::json!({
+                "n": n,
+                "mean_pnl_pct": mean.map(round2),
+                "win_rate_pct": round2(win_rate),
+            })
+        };
+        let before_stats = stats(&before);
+        let after_stats = stats(&after);
+        let delta_mean = match (
+            after_stats.get("mean_pnl_pct").and_then(|v| v.as_f64()),
+            before_stats.get("mean_pnl_pct").and_then(|v| v.as_f64()),
+        ) {
+            (Some(a), Some(b)) => Some(a - b),
+            _ => None,
+        };
+        let delta_win = match (
+            after_stats.get("win_rate_pct").and_then(|v| v.as_f64()),
+            before_stats.get("win_rate_pct").and_then(|v| v.as_f64()),
+        ) {
+            (Some(a), Some(b)) => Some(a - b),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "scope": params.scope,
+            "anchor_at": anchor,
+            "before": {"start": before_start, "end": before_end, "stats": before_stats},
+            "after": {"start": after_start, "end": after_end, "stats": after_stats},
+            "delta_mean_pnl_pct": delta_mean.map(round2),
+            "delta_win_rate_pct": delta_win.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Glossary of classifications + horizons in voice. Returns the
+    /// agent's frame for what each label *means* — so the prompt
+    /// doesn't have to carry the glossary and so a future operator
+    /// can extend the surface without re-prompting.
+    #[tool]
+    async fn describe_classifications(
+        &self,
+        Parameters(_): Parameters<DescribeClassificationsParams>,
+    ) -> String {
+        serde_json::json!({
+            "ok": true,
+            "classifications": [
+                {
+                    "name": "STAIRCASE",
+                    "voice": "stair-stepping accumulation; volume + price advancing in steps. Higher confidence threshold because false positives on this shape are usually still alive — the strategy wants the cleanest stair, not the questionable one.",
+                    "default_floor": 70,
+                },
+                {
+                    "name": "GRINDER",
+                    "voice": "slow upward drift, narrow ATR, persistent bid. Forgivable on confidence (lower default floor) because the shape itself is anti-rug — quiet tape, organic distribution.",
+                    "default_floor": 65,
+                },
+                {
+                    "name": "SPRING",
+                    "voice": "compression + release; basing range broken. Newer pattern — no per-class default floor in production yet.",
+                    "default_floor": null,
+                },
+                {
+                    "name": "DEVELOPING",
+                    "voice": "still forming; not yet committed to a shape. Conservative floor (60) because the pattern is unproven; mostly a watch class.",
+                    "default_floor": 60,
+                }
+            ],
+            "horizons": [
+                {"name": "SCALP", "voice": "minutes-scale flip; exit on first stall."},
+                {"name": "SHORT", "voice": "hours-scale; ride the first leg, exit at first lower-high."},
+                {"name": "LONG", "voice": "days-scale; let position breathe through normal pullbacks."},
+                {"name": "MOONSHOT", "voice": "low-probability multi-x runner; size small, hold through most drawdowns."},
+            ],
+            "tunable_classes": ["STAIRCASE", "GRINDER", "SPRING"],
+            "note": "DEVELOPING has a compile-time floor but is not in the per-class scope allow-list for tunes — only STAIRCASE/GRINDER/SPRING accept class:X overrides."
+        })
+        .to_string()
+    }
+
+    /// Counterfactual replay applying multiple overrides at once.
+    /// Lets the agent test combined effects ("what if I tighten BOTH
+    /// confidence and liquidity?") deterministically — no LLM math.
+    /// Returns the would-have-been bucket aggregates plus delta vs the
+    /// current bucket.
+    #[tool]
+    async fn simulate_overrides(
+        &self,
+        Parameters(params): Parameters<SimulateOverridesParams>,
+    ) -> String {
+        if params.overrides.is_empty() {
+            return serde_json::json!({"ok": false, "error": "empty_overrides", "message": "at least one override required"}).to_string();
+        }
+        for o in &params.overrides {
+            if let Err(e) = validate_field_scope(&o.field, &o.scope) {
+                return serde_json::json!({"ok": false, "error": "invalid_field_or_scope", "detail": e}).to_string();
+            }
+            if let Err(e) = validate_field_value(&o.field, &o.new_value) {
+                return serde_json::json!({"ok": false, "error": "invalid_value", "detail": e}).to_string();
+            }
+            if !field_is_sweepable(&o.field) {
+                return serde_json::json!({"ok": false, "error": "field_not_sweepable", "field": o.field}).to_string();
+            }
+        }
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let outcomes = match self.db.list_closed_call_outcomes(None, None, since, 5000) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        };
+        let baseline = bucket_stats(&outcomes);
+
+        // For each call, check if it passes ALL the simulated overrides.
+        // Per-class scopes only apply when call.classification matches.
+        let passing: Vec<&crate::db::CallOutcome> = outcomes
+            .iter()
+            .filter(|c| {
+                params.overrides.iter().all(|ov| {
+                    let scope_class = ov.scope.strip_prefix("class:");
+                    if let Some(sc) = scope_class {
+                        if c.classification != sc {
+                            // Override doesn't apply to this call's class — pass.
+                            return true;
+                        }
+                    }
+                    call_passes(c, &ov.field, &ov.new_value)
+                })
+            })
+            .collect();
+        let pnls: Vec<f64> = passing.iter().filter_map(|r| r.pnl_pct).collect();
+        let mean = if pnls.is_empty() {
+            None
+        } else {
+            Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+        };
+        let wins = passing.iter().filter(|r| r.status == "withdrew").count() as i64;
+        let win_rate = if !passing.is_empty() {
+            100.0 * wins as f64 / passing.len() as f64
+        } else {
+            0.0
+        };
+        let cur_mean = baseline.get("mean_pnl_pct").and_then(|v| v.as_f64());
+        let delta = match (mean, cur_mean) {
+            (Some(p), Some(c)) => Some(p - c),
+            _ => None,
+        };
+        serde_json::json!({
+            "ok": true,
+            "since": since,
+            "overrides": params.overrides.iter().map(|o| serde_json::json!({
+                "field": o.field, "scope": o.scope, "new_value": o.new_value
+            })).collect::<Vec<_>>(),
+            "baseline": baseline,
+            "simulated": {
+                "n": passing.len(),
+                "mean_pnl_pct": mean.map(round2),
+                "win_rate_pct": round2(win_rate),
+            },
+            "delta_mean_pnl_pct": delta.map(round2),
+        })
+        .to_string()
+    }
+
+    /// Read recent claw review cycles. Lets the agent recall what it
+    /// looked at + concluded last time so the cycles aren't independent.
+    #[tool]
+    async fn review_log(
+        &self,
+        Parameters(params): Parameters<ReviewLogParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(10).clamp(1, 200);
+        match self.db.list_review_cycles(limit) {
+            Ok(rows) => serde_json::json!({
+                "ok": true,
+                "count": rows.len(),
+                "cycles": rows,
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Write a review-cycle ledger row. Claw calls this once per cycle
+    /// at the end with a one-paragraph summary; future cycles read via
+    /// `review_log`. The agent's memory across runs.
+    #[tool]
+    async fn review_log_write(
+        &self,
+        Parameters(params): Parameters<ReviewLogWriteParams>,
+    ) -> String {
+        if !["propose", "commit"].contains(&params.mode.as_str()) {
+            return serde_json::json!({"ok": false, "error": "invalid_mode"}).to_string();
+        }
+        if !["proposed", "committed", "stopped", "failed"].contains(&params.outcome.as_str()) {
+            return serde_json::json!({"ok": false, "error": "invalid_outcome"}).to_string();
+        }
+        let summary = params.summary.trim();
+        if summary.is_empty() || summary.len() > 2000 {
+            return serde_json::json!({"ok": false, "error": "summary_length", "message": "summary must be 1..=2000 chars"}).to_string();
+        }
+        let now = chrono::Utc::now().timestamp();
+        match self.db.insert_review_cycle(
+            params.started_at,
+            Some(now),
+            &params.mode,
+            &params.outcome,
+            params.proposal_id,
+            summary,
+            params.turns,
+            params.tool_calls,
+        ) {
+            Ok(id) => serde_json::json!({
+                "ok": true,
+                "review_cycle_id": id,
+                "ended_at": now,
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string(),
+        }
+    }
+
+    /// Internal helper — publishes a freshly-inserted evolution event to
+    /// the operator's surfaces (Telegram channel + publisher diary). All
+    /// failures are non-fatal; the evolution row already lives in DB and
+    /// can be re-published manually from the operator surface. Returns a
+    /// JSON value the caller surfaces to the agent so it can see the
+    /// fan-out result.
+    async fn publish_evolution(
+        &self,
+        evo_id: i64,
+        kind_label: &str,
+        summary: &str,
+        body_md: &str,
+    ) -> serde_json::Value {
+        let mut channel_msg_id: Option<i64> = None;
+        let mut diary_path: Option<String> = None;
+        let mut errors: Vec<String> = Vec::new();
+        let now = chrono::Utc::now().timestamp();
+
+        // Telegram channel post — short HTML preview + link to diary.
+        if let Some(tg) = &self.config.telegram {
+            if tg.enabled && !tg.bot_token.is_empty() {
+                let chat_id = if !tg.evolution_chat_id.is_empty() {
+                    tg.evolution_chat_id.as_str()
+                } else if !tg.ops_chat_id.is_empty() {
+                    tg.ops_chat_id.as_str()
+                } else {
+                    ""
+                };
+                if !chat_id.is_empty() {
+                    let preview = body_md
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let preview = html_escape_basic(&preview);
+                    let link = if !tg.public_url.is_empty() {
+                        format!(
+                            "\n\n📜 <a href=\"{}/#diary={}\">full diary entry</a>",
+                            tg.public_url.trim_end_matches('/'),
+                            evo_id
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let text = format!(
+                        "🧬 <b>EVOLVED — {kind}</b> · {summary_html}\n\n{preview}{link}",
+                        kind = kind_label,
+                        summary_html = html_escape_basic(summary),
+                    );
+                    let url = format!(
+                        "https://api.telegram.org/bot{}/sendMessage",
+                        tg.bot_token
+                    );
+                    let resp = self
+                        .http
+                        .post(&url)
+                        .form(&[
+                            ("chat_id", chat_id),
+                            ("text", text.as_str()),
+                            ("parse_mode", "HTML"),
+                            ("disable_web_page_preview", "true"),
+                        ])
+                        .send()
+                        .await;
+                    match resp {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(v) if v["ok"].as_bool() == Some(true) => {
+                                channel_msg_id = v["result"]["message_id"].as_i64();
+                            }
+                            Ok(v) => errors.push(format!("telegram: {}", v)),
+                            Err(e) => errors.push(format!("telegram parse: {}", e)),
+                        },
+                        Err(e) => errors.push(format!("telegram post: {}", e)),
+                    }
+                }
+            }
+        }
+
+        // Diary file write + git push to the publisher repo.
+        if let Some(mp) = self.config.madapes.clone() {
+            if mp.enabled && !mp.repo_path.is_empty() {
+                let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let slug = slugify(summary);
+                let file = format!("{}_evo-{}-{}.md", date, kind_label.to_lowercase(), slug);
+                let thoughts_dir = std::path::PathBuf::from(&mp.repo_path).join("thoughts");
+                if let Err(e) = std::fs::create_dir_all(&thoughts_dir) {
+                    errors.push(format!("diary mkdir: {}", e));
+                } else {
+                    let path = thoughts_dir.join(&file);
+                    let title = format!("EVOLVED — {kind_label} · {summary}");
+                    let frontmatter = format!(
+                        "---\nkind: evolution\ncategory: {}\ndate: {}\nevolution_event_id: {}\ntitle: {}\n---\n\n",
+                        kind_label.to_lowercase(),
+                        date,
+                        evo_id,
+                        title
+                    );
+                    let contents = format!("{}{}\n", frontmatter, body_md);
+                    if let Err(e) = std::fs::write(&path, &contents) {
+                        errors.push(format!("diary write: {}", e));
+                    } else {
+                        diary_path = Some(format!("thoughts/{}", file));
+                        // Update index.json so the front end picks it up.
+                        let index_path = thoughts_dir.join("index.json");
+                        let mut index_val: serde_json::Value = std::fs::read_to_string(&index_path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_else(|| serde_json::json!({"thoughts": []}));
+                        if let Some(arr) =
+                            index_val.get_mut("thoughts").and_then(|v| v.as_array_mut())
+                        {
+                            arr.insert(
+                                0,
+                                serde_json::json!({
+                                    "date": date,
+                                    "file": file,
+                                    "title": title,
+                                    "kind": "evolution",
+                                    "category": kind_label.to_lowercase(),
+                                }),
+                            );
+                        }
+                        let _ = std::fs::write(
+                            &index_path,
+                            serde_json::to_string_pretty(&index_val).unwrap_or_default(),
+                        );
+                        let repo = &mp.repo_path;
+                        let msg = format!("evo: {kind_label} · {summary}");
+                        let _ = run_git_with_timeout(&["-C", repo, "add", "thoughts/"]).await;
+                        let commit =
+                            run_git_with_timeout(&["-C", repo, "commit", "-m", &msg]).await;
+                        let committed =
+                            commit.as_ref().map(|o| o.status.success()).unwrap_or(false);
+                        if committed {
+                            let _ = run_git_with_timeout(&["-C", repo, "push", "--quiet"]).await;
+                        } else if let Ok(out) = commit {
+                            errors.push(format!(
+                                "diary commit non-zero: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = self.db.update_evolution_posted(
+            evo_id,
+            now,
+            channel_msg_id,
+            diary_path.as_deref(),
+        ) {
+            errors.push(format!("db update: {}", e));
+        }
+
+        serde_json::json!({
+            "channel_msg_id": channel_msg_id,
+            "diary_path": diary_path,
+            "errors": errors,
+        })
+    }
+}
+
+/// Minimal HTML escape for the Telegram preview body. Telegram parses a
+/// small HTML subset; we only need to neutralize `< > &` to prevent the
+/// agent's markdown from breaking the bot's <b>/<a> tags.
+fn html_escape_basic(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// ── autonomy support: validators + constants ──────────────────────────
+
+/// Hardcoded floor on closed-call sample size in the agent's evidence.
+/// Anything below this is "noise pretending to be a pattern" and gets
+/// rejected with `insufficient_evidence`. Lifting the floor requires
+/// a code change — by design.
+pub const EVIDENCE_FLOOR: i64 = 10;
+
+/// Minimum mean-PnL improvement (proposed - current) required for a
+/// proposal to pass the effect-size validator. Defaults to 5%.
+pub const EFFECT_FLOOR_PCT: f64 = 5.0;
+
+/// Minimum gap between mean_passing and mean_rejected cohort PnL.
+/// Without this, a candidate can clear the effect floor on a thin
+/// favorable tail while the rejected group is only marginally worse —
+/// classic noise. Set to 8% as a minimum visible separation.
+pub const SPREAD_FLOOR_PCT: f64 = 8.0;
+
+/// Cool-down between proposals on the same (field, scope) after a
+/// committed/rejected/reverted decision. 72h matches the typical span
+/// where realized-tape evidence accumulates enough to argue for a new
+/// move on the same knob. Lifted by re-running on a fresh DB.
+pub const TUNE_COOLDOWN_SECS: i64 = 72 * 60 * 60;
+
+const BODY_MD_MIN: usize = 200;
+const BODY_MD_MAX: usize = 4000;
+
+/// System prompt content bounds. Wider than body_md because the prompt
+/// itself carries the agent's full identity and instructions; cap at
+/// 20K to prevent runaway prompt sprawl.
+const PROMPT_MIN: usize = 200;
+const PROMPT_MAX: usize = 20_000;
+
+/// Validates that (field, scope) is in the tunable allow-list. Adding a
+/// new tunable requires editing this map AND wiring it into should_signal
+/// (Phase A5). Until both are done, the agent gets `invalid_field_or_scope`
+/// — preventing the agent from inventing fields the runtime won't honor.
+/// Classify a closed call into a failure-mode bucket based on status
+/// + exit_note text. Coarse but useful: `winner` (positive PnL),
+/// `flat` (small abs PnL), `slow_bleed` (negative + slow exit),
+/// `drawdown_cap` (note mentions stop/dropped), `rug_or_fast_dump`
+/// (large negative + fast exit), `timeout` (status=expired), `void`
+/// (status=voided / failed-but-no-fill).
+fn classify_failure_mode(o: &crate::db::CallOutcome) -> &'static str {
+    if o.status == "voided" {
+        return "void";
+    }
+    if o.status == "expired" {
+        return "timeout";
+    }
+    let pnl = o.pnl_pct.unwrap_or(0.0);
+    if pnl >= 5.0 {
+        return "winner";
+    }
+    if pnl >= -5.0 {
+        return "flat";
+    }
+    let note = o.exit_note.as_deref().unwrap_or("").to_lowercase();
+    if note.contains("rug") || note.contains("dump") || note.contains("trap") {
+        return "rug_or_fast_dump";
+    }
+    if note.contains("stop") || note.contains("dropped") || note.contains("cap") {
+        return "drawdown_cap";
+    }
+    let hold = o.hold_secs.unwrap_or(0);
+    if pnl <= -25.0 && hold < 600 {
+        return "rug_or_fast_dump";
+    }
+    if pnl <= -15.0 && hold > 1800 {
+        return "slow_bleed";
+    }
+    "slow_bleed"
+}
+
+/// Source of truth for a (field, scope)'s current value. Three
+/// flavors:
+///   - `Override(value)` — a committed tune is currently in effect.
+///   - `Default(value)` — no override; compile-time default applies.
+///   - `Unset` — no override AND no compile-time default for this
+///     specific (field, scope). Notably true for global
+///     min_effective_confidence: per-class floors handle gating, the
+///     global is "0" only nominally. Surfacing this lets the agent
+///     narrate "introducing a global floor" instead of "raising 0 to 74".
+#[derive(Debug, Clone)]
+enum CurrentValue {
+    Override(String),
+    Default(String),
+    Unset,
+}
+
+impl CurrentValue {
+    fn as_str(&self) -> &str {
+        match self {
+            CurrentValue::Override(v) | CurrentValue::Default(v) => v.as_str(),
+            CurrentValue::Unset => "0",
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            CurrentValue::Override(_) => "override",
+            CurrentValue::Default(_) => "compile_time_default",
+            CurrentValue::Unset => "unset",
+        }
+    }
+
+    fn display_for_narration(&self) -> String {
+        match self {
+            CurrentValue::Override(v) => format!("{} (committed override)", v),
+            CurrentValue::Default(v) => format!("{} (compile-time default)", v),
+            CurrentValue::Unset => "unset (no per-scope floor; sibling scopes do the gating)".to_string(),
+        }
+    }
+}
+
+fn resolve_current_value(db: &crate::db::Db, field: &str, scope: &str) -> CurrentValue {
+    if let Ok(Some(v)) = db.get_signal_override(field, scope) {
+        return CurrentValue::Override(v);
+    }
+    // Per-class scope falls back to global override before compile-time default.
+    if scope.starts_with("class:") {
+        if let Ok(Some(v)) = db.get_signal_override(field, "global") {
+            return CurrentValue::Override(v);
+        }
+    }
+    match (field, scope) {
+        ("min_effective_confidence", "class:STAIRCASE") => CurrentValue::Default("70".into()),
+        ("min_effective_confidence", "class:GRINDER") => CurrentValue::Default("65".into()),
+        ("min_effective_confidence", "class:SPRING") => CurrentValue::Unset,
+        // Global min_effective_confidence is unset by design — per-class
+        // floors do the work; the global is "0" only because the validator
+        // needs an integer. Tag it as Unset so the agent narrates correctly.
+        ("min_effective_confidence", "global") => CurrentValue::Unset,
+        ("max_top_holder_pct", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT))
+        }
+        ("min_liquidity_usd", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_LIQUIDITY_USD))
+        }
+        ("min_volume_24h_usd", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_VOLUME_24H_USD))
+        }
+        ("min_token_age_secs", _) => {
+            CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS))
+        }
+        ("max_h1_price_change_pct", _) => CurrentValue::Default(format!(
+            "{}",
+            crate::notifier::SIGNAL_MAX_H1_PRICE_CHANGE_PCT
+        )),
+        ("min_h1_price_change_pct", _) => CurrentValue::Default(format!(
+            "{}",
+            crate::notifier::SIGNAL_MIN_H1_PRICE_CHANGE_PCT
+        )),
+        ("max_pre_call_peak_vs_entry_pct", _) => CurrentValue::Default(format!(
+            "{}",
+            crate::notifier::SIGNAL_MAX_PRE_CALL_PEAK_PCT
+        )),
+        _ => CurrentValue::Unset,
+    }
+}
+
+/// Backwards-compat shim — string form for callers that want the bare
+/// value. New callers should use `resolve_current_value` directly so
+/// they can render the source.
+fn current_effective_value(db: &crate::db::Db, field: &str, scope: &str) -> String {
+    resolve_current_value(db, field, scope).as_str().to_string()
+}
+
+/// Whether a tunable field can be swept against historical closed calls.
+/// Fields gated *pre-call* (volume, age) don't store the value on the
+/// CallOutcome row so we have nothing to filter against — the agent
+/// must propose those manually with operator-supplied evidence.
+fn field_is_sweepable(field: &str) -> bool {
+    matches!(
+        field,
+        "min_effective_confidence"
+            | "max_top_holder_pct"
+            | "min_liquidity_usd"
+            | "max_h1_price_change_pct"
+            | "min_h1_price_change_pct"
+            | "max_pre_call_peak_vs_entry_pct"
+    )
+}
+
+/// Map a scope string to a classification filter for
+/// `list_closed_call_outcomes`. "global" / unknown → None (no filter);
+/// "class:STAIRCASE" → Some("STAIRCASE").
+fn scope_class(scope: &str) -> Option<String> {
+    scope.strip_prefix("class:").map(|s| s.to_string())
+}
+
+/// Default scope set per field for `rank_tune_candidates` when the
+/// caller doesn't specify. Per-class scopes only for fields that
+/// support them; global-only otherwise.
+fn default_scopes_for_field(field: &str) -> Vec<String> {
+    match field {
+        "min_effective_confidence"
+        | "max_top_holder_pct"
+        | "max_h1_price_change_pct"
+        | "min_h1_price_change_pct"
+        | "max_pre_call_peak_vs_entry_pct" => vec![
+            "global".into(),
+            "class:STAIRCASE".into(),
+            "class:GRINDER".into(),
+            "class:SPRING".into(),
+        ],
+        _ => vec!["global".into()],
+    }
+}
+
+/// Default candidate grid per field. Picked to span "stricter than today"
+/// without overshooting the realistic operating range.
+fn default_candidates_for_field(field: &str) -> Vec<String> {
+    match field {
+        "min_effective_confidence" => vec!["62", "66", "70", "74", "78", "82"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "max_top_holder_pct" => vec!["10", "15", "20", "25", "30"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "min_liquidity_usd" => {
+            vec!["20000", "30000", "50000", "75000", "100000", "150000"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        // Diagnostic 2026-05-05: pre-call h1 run-up >+15% averaged
+        // -25% PnL; flat tape (-5..+5%) was the only positive cohort.
+        // Grid spans the diagnostic-suggested band.
+        "max_h1_price_change_pct" => vec!["10", "15", "25", "50", "100", "200"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        // 2026-05-05 sweep showed h1-trend cohort >+200% had the
+        // healthier mean PnL. As a min-floor: require the token to
+        // have momentum confirmation before signaling.
+        "min_h1_price_change_pct" => vec!["10", "25", "50", "100", "200", "500"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        // Pre-call peak window is fixed at 30m by the SQL backfill;
+        // grid spans the diagnostic-suggested band where the bait
+        // shape lives (>+15%).
+        "max_pre_call_peak_vs_entry_pct" => vec!["10", "15", "25", "50", "100"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Pull the bucket-level baseline stats — n, mean PnL, win rate.
+fn bucket_stats(rows: &[crate::db::CallOutcome]) -> serde_json::Value {
+    let n = rows.len() as i64;
+    let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+    let mean_pnl = if pnls.is_empty() {
+        None
+    } else {
+        Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+    };
+    let wins = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+    let win_rate = if n > 0 {
+        100.0 * wins as f64 / n as f64
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "n": n,
+        "mean_pnl_pct": mean_pnl.map(round2),
+        "win_rate_pct": round2(win_rate),
+    })
+}
+
+/// Decide if a closed call would still pass under a candidate value
+/// for `field`. Direction depends on the field semantic:
+///   - min_X: pass when call's value ≥ candidate
+///   - max_X: pass when call's value ≤ candidate
+fn call_passes(call: &crate::db::CallOutcome, field: &str, candidate_str: &str) -> bool {
+    match field {
+        "min_effective_confidence" => candidate_str
+            .parse::<i32>()
+            .map_or(false, |c| call.confidence >= c),
+        "max_top_holder_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |c| call.entry_top_holder_pct <= c),
+        "min_liquidity_usd" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |c| call.entry_liquidity_usd >= c),
+        "max_h1_price_change_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |cap| match call.entry_price_change_h1 {
+                Some(pc) => pc <= cap,
+                None => true,
+            }),
+        "min_h1_price_change_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |floor| match call.entry_price_change_h1 {
+                Some(pc) => pc >= floor,
+                None => true,
+            }),
+        "max_pre_call_peak_vs_entry_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |cap| match call.entry_pre_call_peak_pct {
+                Some(p) => p <= cap,
+                None => true,
+            }),
+        _ => false,
+    }
+}
+
+/// Run one candidate through the (sorted-by-called_at) universe; emit
+/// the validator-shaped evidence_json plus summary stats. Returns
+/// `{ok:false, error: "insufficient_passing_n"}` when the proposed
+/// gate would leave fewer than EVIDENCE_FLOOR / 2 calls — sweep can
+/// still surface this to the agent as "we tried but it's too tight".
+fn evaluate_candidate(
+    sorted: &[crate::db::CallOutcome],
+    field: &str,
+    candidate_str: &str,
+    holdout_cutoff: i64,
+) -> serde_json::Value {
+    let baseline = bucket_stats(sorted);
+    let cur_pnl = baseline
+        .get("mean_pnl_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cur_n = baseline.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let passing: Vec<&crate::db::CallOutcome> = sorted
+        .iter()
+        .filter(|c| call_passes(c, field, candidate_str))
+        .collect();
+    let rejected: Vec<&crate::db::CallOutcome> = sorted
+        .iter()
+        .filter(|c| !call_passes(c, field, candidate_str))
+        .collect();
+
+    let prop_pnls: Vec<f64> = passing.iter().filter_map(|r| r.pnl_pct).collect();
+    let prop_mean = if prop_pnls.is_empty() {
+        None
+    } else {
+        Some(prop_pnls.iter().sum::<f64>() / prop_pnls.len() as f64)
+    };
+    let rej_pnls: Vec<f64> = rejected.iter().filter_map(|r| r.pnl_pct).collect();
+    let rej_mean = if rej_pnls.is_empty() {
+        None
+    } else {
+        Some(rej_pnls.iter().sum::<f64>() / rej_pnls.len() as f64)
+    };
+    let prop_wins = passing.iter().filter(|r| r.status == "withdrew").count() as i64;
+    let prop_win_rate = if !passing.is_empty() {
+        100.0 * prop_wins as f64 / passing.len() as f64
+    } else {
+        0.0
+    };
+
+    // Holdout = passing calls with called_at >= cutoff.
+    let holdout: Vec<&crate::db::CallOutcome> = passing
+        .iter()
+        .copied()
+        .filter(|c| c.called_at >= holdout_cutoff)
+        .collect();
+    let holdout_pnls: Vec<f64> = holdout.iter().filter_map(|r| r.pnl_pct).collect();
+    let holdout_mean = if holdout_pnls.is_empty() {
+        None
+    } else {
+        Some(holdout_pnls.iter().sum::<f64>() / holdout_pnls.len() as f64)
+    };
+
+    let effect = match prop_mean {
+        Some(p) => p - cur_pnl,
+        None => 0.0,
+    };
+
+    let evidence = serde_json::json!({
+        "current": {
+            "n": cur_n,
+            "mean_pnl_pct": baseline.get("mean_pnl_pct").cloned().unwrap_or(serde_json::Value::Null),
+            "win_rate_pct": baseline.get("win_rate_pct").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "proposed": {
+            "n": passing.len(),
+            "mean_pnl_pct": prop_mean.map(round2),
+            "win_rate_pct": round2(prop_win_rate),
+        },
+        "rejected": {
+            "n": rejected.len(),
+            "mean_pnl_pct": rej_mean.map(round2),
+        },
+        "holdout": {
+            "n": holdout.len(),
+            "mean_pnl_pct": holdout_mean.map(round2),
+            "cutoff": holdout_cutoff,
+        },
+        "method": format!("sweep_threshold field={} cand={}", field, candidate_str),
+    });
+
+    serde_json::json!({
+        "ok": true,
+        "value": candidate_str,
+        "n_passing": passing.len(),
+        "n_rejected": rejected.len(),
+        "mean_pnl_passing_pct": prop_mean.map(round2),
+        "mean_pnl_rejected_pct": rej_mean.map(round2),
+        "win_rate_passing_pct": round2(prop_win_rate),
+        "effect_vs_baseline_pct": round2(effect),
+        "holdout": {
+            "n": holdout.len(),
+            "mean_pnl_pct": holdout_mean.map(round2),
+        },
+        "evidence_json": evidence.to_string(),
+    })
+}
+
+fn validate_field_scope(field: &str, scope: &str) -> Result<(), String> {
+    let per_class_ok = matches!(
+        scope,
+        "global" | "class:STAIRCASE" | "class:GRINDER" | "class:SPRING"
+    );
+    let global_only_ok = scope == "global";
+    match field {
+        "min_effective_confidence"
+        | "max_top_holder_pct"
+        | "max_h1_price_change_pct"
+        | "min_h1_price_change_pct"
+        | "max_pre_call_peak_vs_entry_pct" => {
+            if !per_class_ok {
+                return Err(format!(
+                    "field '{}' supports scope 'global' or 'class:STAIRCASE|GRINDER|SPRING' (got '{}')",
+                    field, scope
+                ));
+            }
+        }
+        "min_liquidity_usd" | "min_volume_24h_usd" | "min_token_age_secs" => {
+            if !global_only_ok {
+                return Err(format!(
+                    "field '{}' supports scope 'global' only (got '{}')",
+                    field, scope
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "field '{}' is not in the tunable allow-list. Allowed: \
+                 min_effective_confidence, max_top_holder_pct, \
+                 max_h1_price_change_pct, min_h1_price_change_pct, \
+                 max_pre_call_peak_vs_entry_pct, min_liquidity_usd, \
+                 min_volume_24h_usd, min_token_age_secs",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates that `value` parses to the expected type for `field`. The
+/// agent passes everything as strings; we coerce here.
+fn validate_field_value(field: &str, value: &str) -> Result<(), String> {
+    match field {
+        "min_effective_confidence" => value
+            .parse::<i64>()
+            .map_err(|_| format!("'{}' is not a valid integer", value))
+            .and_then(|n| {
+                if (0..=100).contains(&n) {
+                    Ok(())
+                } else {
+                    Err(format!("expected 0..=100, got {}", n))
+                }
+            }),
+        "max_top_holder_pct" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                if (0.0..=100.0).contains(&x) {
+                    Ok(())
+                } else {
+                    Err(format!("expected 0.0..=100.0, got {}", x))
+                }
+            }),
+        "min_liquidity_usd" | "min_volume_24h_usd" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                if x >= 0.0 {
+                    Ok(())
+                } else {
+                    Err(format!("expected ≥ 0, got {}", x))
+                }
+            }),
+        "min_token_age_secs" => value
+            .parse::<i64>()
+            .map_err(|_| format!("'{}' is not a valid integer", value))
+            .and_then(|n| {
+                if n >= 0 {
+                    Ok(())
+                } else {
+                    Err(format!("expected ≥ 0, got {}", n))
+                }
+            }),
+        "max_h1_price_change_pct" | "min_h1_price_change_pct" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                if (-100.0..=10000.0).contains(&x) {
+                    Ok(())
+                } else {
+                    Err(format!("expected -100.0..=10000.0, got {}", x))
+                }
+            }),
+        "max_pre_call_peak_vs_entry_pct" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                // 0..=10000. Negative would mean "the recent peak was
+                // below entry" — semantically impossible since peak
+                // is max(price). 10000 = effectively unlimited.
+                if (0.0..=10000.0).contains(&x) {
+                    Ok(())
+                } else {
+                    Err(format!("expected 0.0..=10000.0, got {}", x))
+                }
+            }),
+        _ => Err(format!("no value validator for field '{}'", field)),
+    }
+}
+
+fn reject_proposal(code: &str, message: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": code,
+        "message": message
+    })
+    .to_string()
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 #[tool_handler]
-impl ServerHandler for PhotonServer {
+impl ServerHandler for ExcitonServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "photon".to_string(),
-                title: Some("Photon Signal Forecaster".to_string()),
+                name: "exciton".to_string(),
+                title: Some("Exciton".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 description: Some("Collaborative Solana trading intelligence".to_string()),
                 icons: None,
                 website_url: None,
             },
             instructions: Some(
-                "Photon Signal Forecaster — collaborative Solana trading intelligence. \
+                "Exciton — collaborative Solana trading intelligence. \
                  Use scan() for market overview, inspect() for deep analysis, \
                  scout()/deep_scout() for raw token forensics, \
                  historical_analysis()/holder_forensics()/wallet_xray()/deep_signals() \

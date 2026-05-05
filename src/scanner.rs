@@ -32,7 +32,7 @@ pub struct BackgroundScanner {
     /// straight to the DB). When stale, the sig-walks resume as
     /// fallback. Connectivity is the gate; no separate flag.
     pumpportal_health: Option<Arc<crate::pumpportal::PumpPortalHealth>>,
-    /// Optional execution context. Some(_) only when PHOTON_PRIVATE_KEY is
+    /// Optional execution context. Some(_) only when EXCITON_PRIVATE_KEY is
     /// loaded AND [execution].enabled=true. None = settle is paper-only.
     /// Sells fire BEFORE the call row's status flips (`withdrew`/`failed`/
     /// `expired`) so the on-chain action precedes the public verdict.
@@ -881,7 +881,7 @@ impl BackgroundScanner {
             // each multiple threshold, fire a reply under the original
             // call card so the channel sees the run live. One reply
             // per milestone, ever — the peak_announced_pct column on
-            // the call gates re-fires across ticks AND across photon
+            // the call gates re-fires across ticks AND across exciton
             // restarts. Tiers:
             //   +50%  → 1.5x
             //   +100% → 2x
@@ -1414,7 +1414,7 @@ impl BackgroundScanner {
             // handles all four canonical outcomes (active/withdrew/failed/expired);
             // we pass the same status verbatim so the card header matches the DB.
             // Same task also DMs the operator(s) a one-line notification via
-            // Claudeinatorbot — channel is for the audience, DM is for the human
+            // the private bot — channel is for the audience, DM is for the human
             // running the system.
             if let Some(ref n) = self.notifier {
                 let mint = call.mint.clone();

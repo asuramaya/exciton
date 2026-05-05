@@ -34,7 +34,7 @@ static CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> =
 static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
-        .user_agent("photon/0.1 holders-fetch")
+        .user_agent("exciton/0.1 holders-fetch")
         .build()
         .expect("reqwest client init")
 });

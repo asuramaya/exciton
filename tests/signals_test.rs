@@ -1,5 +1,5 @@
-use photon::signals::safety::SafetyChecker;
-use photon::signals::{Confidence, SignalLayer, SignalScore};
+use exciton::signals::safety::SafetyChecker;
+use exciton::signals::{Confidence, SignalLayer, SignalScore};
 
 #[test]
 fn test_signal_score_creation() {

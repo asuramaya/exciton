@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
-        .user_agent("photon/0.1")
+        .user_agent("exciton/0.1")
         .build()
         .expect("market::HTTP client init")
 });

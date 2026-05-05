@@ -6,9 +6,9 @@
 //!   cargo run --release --example intel_probe -- history <mint> [limit] [window_hours]
 //!   cargo run --release --example intel_probe -- signals <mint>
 
-use photon::db::Db;
-use photon::ingester::{resolve_endpoints, RpcRouter};
-use photon::intel;
+use exciton::db::Db;
+use exciton::ingester::{resolve_endpoints, RpcRouter};
+use exciton::intel;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,10 +22,10 @@ async fn main() -> anyhow::Result<()> {
     let command = args.get(1).ok_or_else(usage)?.as_str();
     let target = args.get(2).ok_or_else(usage)?;
 
-    let cfg = photon::config::Config::load(&PathBuf::from("config.toml"))?;
+    let cfg = exciton::config::Config::load(&PathBuf::from("config.toml"))?;
     let endpoints = resolve_endpoints(&cfg.rpc.endpoints);
     let rpc = Arc::new(RpcRouter::new(&endpoints)?);
-    let db = Arc::new(Db::open(&PathBuf::from("photon.db"))?);
+    let db = Arc::new(Db::open(&PathBuf::from("exciton.db"))?);
 
     let output = match command {
         "wallet" => {
