@@ -66,10 +66,30 @@ struct CodexRequest<'a> {
     include: Vec<&'a str>,
 }
 
+/// Each item in the Responses API `input` array. Three shapes:
+///   - role-based message (user / assistant text)
+///   - function_call (assistant requested a tool)
+///   - function_call_output (the tool's result we feed back)
 #[derive(Serialize)]
-struct CodexInput {
-    role: String,
-    content: Vec<CodexInputContent>,
+#[serde(untagged)]
+enum CodexInput {
+    Message {
+        role: String,
+        content: Vec<CodexInputContent>,
+    },
+    FunctionCall {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        call_id: String,
+        output: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -206,10 +226,10 @@ impl Provider for OpenAiCodexProvider {
 
 /// Map claw's `Message` shape onto the codex Responses API input shape.
 /// System messages collapse into the request's `instructions` field;
-/// user + assistant messages become input items. Tool messages aren't
-/// supported on this transport in v0 — the runtime is expected to
-/// fall through to the api-key provider when it needs to send tool
-/// results back to the model.
+/// user + assistant text become role-based message items; assistant
+/// `tool_calls` become `function_call` items; role="tool" messages
+/// become `function_call_output` items. Empty assistant content is
+/// dropped so we don't send blank turns alongside the function_calls.
 fn build_codex_input(messages: &[Message]) -> (String, Vec<CodexInput>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut input: Vec<CodexInput> = Vec::new();
@@ -217,7 +237,7 @@ fn build_codex_input(messages: &[Message]) -> (String, Vec<CodexInput>) {
         match msg.role.as_str() {
             "system" => system_parts.push(msg.content.clone()),
             "user" => {
-                input.push(CodexInput {
+                input.push(CodexInput::Message {
                     role: "user".into(),
                     content: vec![CodexInputContent {
                         kind: "input_text".into(),
@@ -226,19 +246,34 @@ fn build_codex_input(messages: &[Message]) -> (String, Vec<CodexInput>) {
                 });
             }
             "assistant" => {
-                input.push(CodexInput {
-                    role: "assistant".into(),
-                    content: vec![CodexInputContent {
-                        kind: "output_text".into(),
-                        text: Some(msg.content.clone()),
-                    }],
-                });
+                if !msg.content.trim().is_empty() {
+                    input.push(CodexInput::Message {
+                        role: "assistant".into(),
+                        content: vec![CodexInputContent {
+                            kind: "output_text".into(),
+                            text: Some(msg.content.clone()),
+                        }],
+                    });
+                }
+                for call in &msg.tool_calls {
+                    input.push(CodexInput::FunctionCall {
+                        kind: "function_call",
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
+                }
             }
-            _ => {
-                // role="tool" not yet supported on this transport.
-                // Cascade should have already fallen through to api-key
-                // when tool messages are present in the transcript.
+            "tool" => {
+                if let Some(call_id) = &msg.tool_call_id {
+                    input.push(CodexInput::FunctionCallOutput {
+                        kind: "function_call_output",
+                        call_id: call_id.clone(),
+                        output: msg.content.clone(),
+                    });
+                }
             }
+            _ => {}
         }
     }
     let instructions = system_parts.join("\n\n");
