@@ -29,8 +29,9 @@ use serde_json::json;
 /// With the D1 deterministic-tools surface (rank_tune_candidates does the
 /// search) a normal cycle lands in 3-4 turns: list_tunes →
 /// rank_tune_candidates → propose_tune → (commit_tune if mode=commit).
-/// 6 leaves headroom for one diagnostic detour without runaway loops.
-const MAX_TURNS: usize = 6;
+/// 8 leaves headroom for one diagnostic detour + final message without
+/// runaway loops.
+const MAX_TURNS: usize = 8;
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 

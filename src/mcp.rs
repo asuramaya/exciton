@@ -3202,6 +3202,7 @@ impl ExcitonServer {
         let holdout_cutoff = sorted[cutoff_idx].called_at;
 
         let baseline = bucket_stats(&sorted);
+        let current_value = current_effective_value(&self.db, &params.field, &params.scope);
 
         let candidates: Vec<serde_json::Value> = params
             .candidates
@@ -3214,12 +3215,20 @@ impl ExcitonServer {
                         "error": "value_invalid",
                     }));
                 }
-                Some(evaluate_candidate(
+                let mut row = evaluate_candidate(
                     &sorted,
                     &params.field,
                     cand_str,
                     holdout_cutoff,
-                ))
+                );
+                row["propose_tune_args"] = serde_json::json!({
+                    "field": params.field,
+                    "scope": params.scope,
+                    "old_value": current_value,
+                    "new_value": cand_str,
+                    "evidence_json": row.get("evidence_json").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                Some(row)
             })
             .collect();
 
@@ -3231,6 +3240,7 @@ impl ExcitonServer {
             "holdout_cutoff": holdout_cutoff,
             "universe_n": sorted.len(),
             "baseline": baseline,
+            "current_value": current_value,
             "candidates": candidates,
         })
         .to_string()
@@ -3304,6 +3314,7 @@ impl ExcitonServer {
                 let cutoff_idx = sorted.len() - holdout_size;
                 let holdout_cutoff = sorted[cutoff_idx].called_at;
 
+                let current_value = current_effective_value(&self.db, field, scope);
                 for cand in default_candidates_for_field(field) {
                     let row = evaluate_candidate(&sorted, field, &cand, holdout_cutoff);
                     if row.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -3335,6 +3346,14 @@ impl ExcitonServer {
                     enriched["field"] = serde_json::json!(field);
                     enriched["scope"] = serde_json::json!(scope);
                     enriched["leverage"] = serde_json::json!(round2(leverage));
+                    enriched["current_value"] = serde_json::json!(&current_value);
+                    enriched["propose_tune_args"] = serde_json::json!({
+                        "field": field,
+                        "scope": scope,
+                        "old_value": current_value,
+                        "new_value": cand,
+                        "evidence_json": enriched.get("evidence_json").cloned().unwrap_or(serde_json::Value::Null),
+                    });
                     all_candidates.push(enriched);
                 }
             }
@@ -3554,6 +3573,35 @@ const PROMPT_MAX: usize = 20_000;
 /// new tunable requires editing this map AND wiring it into should_signal
 /// (Phase A5). Until both are done, the agent gets `invalid_field_or_scope`
 /// — preventing the agent from inventing fields the runtime won't honor.
+/// Resolve the current effective value of a (field, scope) — the
+/// override if one exists, otherwise the compile-time default. Returns
+/// the value as a string so the agent can pass it directly as
+/// `old_value` to propose_tune. Eliminates a class of self-recovery
+/// turns where the agent had to grep list_overrides + describe_signal_filters
+/// just to learn the current value.
+fn current_effective_value(db: &crate::db::Db, field: &str, scope: &str) -> String {
+    if let Ok(Some(v)) = db.get_signal_override(field, scope) {
+        return v;
+    }
+    // Per-class scope falls back to global override before compile-time default.
+    if scope.starts_with("class:") {
+        if let Ok(Some(v)) = db.get_signal_override(field, "global") {
+            return v;
+        }
+    }
+    match (field, scope) {
+        ("min_effective_confidence", "class:STAIRCASE") => "70".into(),
+        ("min_effective_confidence", "class:GRINDER") => "65".into(),
+        ("min_effective_confidence", "class:SPRING") => "0".into(),
+        ("min_effective_confidence", _) => "0".into(),
+        ("max_top_holder_pct", _) => format!("{}", crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT),
+        ("min_liquidity_usd", _) => format!("{}", crate::notifier::SIGNAL_MIN_LIQUIDITY_USD),
+        ("min_volume_24h_usd", _) => format!("{}", crate::notifier::SIGNAL_MIN_VOLUME_24H_USD),
+        ("min_token_age_secs", _) => format!("{}", crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS),
+        _ => "0".into(),
+    }
+}
+
 /// Whether a tunable field can be swept against historical closed calls.
 /// Fields gated *pre-call* (volume, age) don't store the value on the
 /// CallOutcome row so we have nothing to filter against — the agent
