@@ -279,6 +279,61 @@ pub struct RevertTuneParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposePromptParams {
+    /// Full new system prompt content (markdown). Length 200..=20000.
+    /// Replaces the current prompt verbatim — this is not a diff.
+    pub content: String,
+    /// Why the prompt should change. 3-4 sentence trader-voice
+    /// explanation citing what didn't work or what the agent learned.
+    pub why: String,
+    /// "claw" (default) | "operator". Operator-authored prompts skip
+    /// the propose/commit dance and go straight to commit.
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitPromptParams {
+    /// Proposal id from `propose_prompt`. Must be `pending`.
+    pub proposal_id: i64,
+    /// Agent-authored markdown for the diary entry that will accompany
+    /// this prompt change. Same body_md rules as commit_tune
+    /// (200..=4000 chars, must reference the change).
+    pub body_md: String,
+    /// Optional one-line headline. Auto-derived if omitted.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListPromptsParams {
+    /// Cap on revisions returned. Default 20, max 200.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// When true, includes the full markdown of each prompt revision.
+    /// Default false to keep payloads compact — call with
+    /// `include_content=true` when the agent actually needs to see
+    /// what its previous voice looked like.
+    #[serde(default)]
+    pub include_content: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitSiteChangeParams {
+    /// One-line headline of the site change (e.g. "added per-classification
+    /// win rate page"). Becomes the evolution event summary.
+    pub summary: String,
+    /// Agent-authored markdown for the diary entry. Same length rules
+    /// as commit_tune.
+    pub body_md: String,
+    /// Optional structured payload describing what changed (paths,
+    /// before/after pointers, etc.) — stored verbatim in
+    /// evolution_events.evidence_json.
+    #[serde(default)]
+    pub evidence_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AnalyzeOutcomesParams {
     /// Optional classification filter (e.g. "STAIRCASE", "GRINDER", "SPRING").
     /// None = all classifications.
@@ -2577,6 +2632,289 @@ impl ExcitonServer {
         .to_string()
     }
 
+    /// Propose a new system prompt revision. The agent supplies the full
+    /// new content (markdown) plus a `why` explaining what motivated the
+    /// rewrite. No statistical floor here — voice is qualitative — but
+    /// the content has length bounds and `why` must read like a real
+    /// explanation, not a placeholder.
+    #[tool]
+    async fn propose_prompt(
+        &self,
+        Parameters(params): Parameters<ProposePromptParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let content = params.content.trim();
+        if !(PROMPT_MIN..=PROMPT_MAX).contains(&content.len()) {
+            return reject_proposal(
+                "content_length",
+                &format!(
+                    "content must be {}..={} chars (got {})",
+                    PROMPT_MIN,
+                    PROMPT_MAX,
+                    content.len()
+                ),
+            );
+        }
+        let why = params.why.trim();
+        if why.len() < 60 {
+            return reject_proposal(
+                "why_too_short",
+                "why must be ≥ 60 chars — a prompt rewrite is high-blast-radius, explain it",
+            );
+        }
+        let base_version = self
+            .db
+            .get_current_prompt()
+            .ok()
+            .flatten()
+            .map(|p| p.version);
+        let new_proposal = crate::db::NewPromptProposal {
+            proposed_at: now,
+            proposed_by: params
+                .proposed_by
+                .clone()
+                .unwrap_or_else(|| "claw".to_string()),
+            content: content.to_string(),
+            why: why.to_string(),
+            base_version,
+        };
+        let id = match self.db.insert_prompt_proposal(&new_proposal) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "propose_prompt",
+            &format!(
+                "id={} base_version={:?} content_len={}",
+                id,
+                base_version,
+                content.len()
+            ),
+        );
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": id,
+            "status": "pending",
+            "base_version": base_version,
+            "next_step": "call commit_prompt(proposal_id, body_md) to activate the new prompt + post the diary entry"
+        })
+        .to_string()
+    }
+
+    /// Commit a pending prompt revision. Inserts the new content into
+    /// `agent_prompt` (auto-incremented version), creates an evolution
+    /// event with kind=tool, marks the proposal committed, and publishes.
+    #[tool]
+    async fn commit_prompt(
+        &self,
+        Parameters(params): Parameters<CommitPromptParams>,
+    ) -> String {
+        let proposal = match self.db.get_prompt_proposal(params.proposal_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return reject_proposal(
+                    "not_found",
+                    &format!("no prompt proposal with id {}", params.proposal_id),
+                )
+            }
+            Err(e) => return reject_proposal("db_error", &e.to_string()),
+        };
+        if proposal.status != "pending" {
+            return reject_proposal(
+                "not_pending",
+                &format!(
+                    "prompt proposal {} is in status '{}', cannot commit",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let new_version = match self.db.append_prompt(
+            &proposal.content,
+            now,
+            &proposal.proposed_by,
+            Some(&proposal.why),
+            Some(proposal.id),
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_prompt", &e.to_string()),
+        };
+
+        let summary = params
+            .summary
+            .unwrap_or_else(|| format!("agent prompt rewritten (v{})", new_version));
+        let evidence = serde_json::json!({
+            "base_version": proposal.base_version,
+            "new_version": new_version,
+            "why": proposal.why,
+            "content_chars": proposal.content.len(),
+        })
+        .to_string();
+        let evo_id = match self.db.insert_evolution_event(
+            "tool",
+            &summary,
+            body,
+            Some(&evidence),
+            Some(proposal.id),
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+
+        if let Err(e) = self.db.update_prompt_proposal_status(
+            proposal.id,
+            "committed",
+            "claw",
+            now,
+            None,
+            Some(evo_id),
+            Some(new_version),
+        ) {
+            return reject_proposal("db_error_status", &e.to_string());
+        }
+
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_prompt",
+            &format!(
+                "proposal={} version={} evo_id={}",
+                proposal.id, new_version, evo_id
+            ),
+        );
+
+        let publish = self.publish_evolution(evo_id, "TOOL", &summary, body).await;
+
+        serde_json::json!({
+            "ok": true,
+            "proposal_id": proposal.id,
+            "evolution_event_id": evo_id,
+            "agent_prompt_version": new_version,
+            "status": "committed",
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
+    /// List prompt revisions + proposals. By default returns lightweight
+    /// rows (content truncated to a preview); pass `include_content=true`
+    /// to fetch full markdown bodies.
+    #[tool]
+    async fn list_prompts(
+        &self,
+        Parameters(params): Parameters<ListPromptsParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(20).clamp(1, 200);
+        let proposals = match self
+            .db
+            .list_prompt_proposals(limit, params.include_content)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        // Always also surface the currently-active prompt so the agent
+        // doesn't have to mentally diff against a copy in its head.
+        let current = self.db.get_current_prompt().ok().flatten().map(|p| {
+            let content_preview = if params.include_content {
+                p.content.clone()
+            } else {
+                let mut s = p.content;
+                if s.len() > 240 {
+                    s.truncate(240);
+                    s.push_str("…");
+                }
+                s
+            };
+            serde_json::json!({
+                "version": p.version,
+                "created_at": p.created_at,
+                "created_by": p.created_by,
+                "why": p.why,
+                "content": content_preview,
+            })
+        });
+        serde_json::json!({
+            "ok": true,
+            "current": current,
+            "proposals": proposals,
+        })
+        .to_string()
+    }
+
+    /// Record an agent-driven site change as an evolution event. The agent
+    /// calls this AFTER it has performed a deliberate site mutation (e.g.
+    /// added a new visualization, restructured the diary index). This is
+    /// NOT auto-fired by file mutations from the publisher tick — those
+    /// are routine, not evolutions.
+    #[tool]
+    async fn commit_site_change(
+        &self,
+        Parameters(params): Parameters<CommitSiteChangeParams>,
+    ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let summary = params.summary.trim();
+        if summary.is_empty() || summary.len() > 200 {
+            return reject_proposal(
+                "summary_length",
+                "summary must be 1..=200 chars",
+            );
+        }
+        let body = params.body_md.trim();
+        if body.len() < BODY_MD_MIN || body.len() > BODY_MD_MAX {
+            return reject_proposal(
+                "body_md_length",
+                &format!(
+                    "body_md must be {}..={} chars (got {})",
+                    BODY_MD_MIN,
+                    BODY_MD_MAX,
+                    body.len()
+                ),
+            );
+        }
+
+        let evo_id = match self.db.insert_evolution_event(
+            "site",
+            summary,
+            body,
+            params.evidence_json.as_deref(),
+            None,
+            now,
+        ) {
+            Ok(v) => v,
+            Err(e) => return reject_proposal("db_error_evolution", &e.to_string()),
+        };
+        let _ = self.db.audit_log(
+            "claude",
+            "commit_site_change",
+            &format!("evo_id={} summary={}", evo_id, summary),
+        );
+        let publish = self.publish_evolution(evo_id, "SITE", summary, body).await;
+        serde_json::json!({
+            "ok": true,
+            "evolution_event_id": evo_id,
+            "summary": summary,
+            "publish": publish,
+        })
+        .to_string()
+    }
+
     /// Internal helper — publishes a freshly-inserted evolution event to
     /// the operator's surfaces (Telegram channel + publisher diary). All
     /// failures are non-fatal; the evolution row already lives in DB and
@@ -2762,6 +3100,12 @@ pub const EFFECT_FLOOR_PCT: f64 = 5.0;
 
 const BODY_MD_MIN: usize = 200;
 const BODY_MD_MAX: usize = 4000;
+
+/// System prompt content bounds. Wider than body_md because the prompt
+/// itself carries the agent's full identity and instructions; cap at
+/// 20K to prevent runaway prompt sprawl.
+const PROMPT_MIN: usize = 200;
+const PROMPT_MAX: usize = 20_000;
 
 /// Validates that (field, scope) is in the tunable allow-list. Adding a
 /// new tunable requires editing this map AND wiring it into should_signal

@@ -75,6 +75,32 @@ pub struct AgentPrompt {
     pub proposal_id: Option<i64>,
 }
 
+/// Insert payload for prompt proposals.
+#[derive(Debug, Clone)]
+pub struct NewPromptProposal {
+    pub proposed_at: i64,
+    pub proposed_by: String,
+    pub content: String,
+    pub why: String,
+    pub base_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PromptProposal {
+    pub id: i64,
+    pub proposed_at: i64,
+    pub proposed_by: String,
+    pub content: String,
+    pub why: String,
+    pub base_version: Option<i64>,
+    pub status: String,
+    pub decided_at: Option<i64>,
+    pub decided_by: Option<String>,
+    pub rejection_reason: Option<String>,
+    pub evolution_event_id: Option<i64>,
+    pub committed_version: Option<i64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EvolutionEvent {
     pub id: i64,
@@ -697,6 +723,27 @@ impl Db {
                 why TEXT,
                 proposal_id INTEGER
             );
+
+            -- Pending prompt revisions. Mirrors tune_proposals shape but
+            -- content lives in a TEXT column (no effect-size math).
+            -- agent_prompt holds the COMMITTED versioned prompts; this
+            -- table is the proposal staging area + audit trail.
+            CREATE TABLE IF NOT EXISTS prompt_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposed_at INTEGER NOT NULL,
+                proposed_by TEXT NOT NULL,
+                content TEXT NOT NULL,
+                why TEXT NOT NULL,
+                base_version INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decided_at INTEGER,
+                decided_by TEXT,
+                rejection_reason TEXT,
+                evolution_event_id INTEGER,
+                committed_version INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_proposals_status
+                ON prompt_proposals(status);
 
             -- Public diary. Every committed self-change writes one row.
             -- body_md is agent-authored markdown — voice is whatever the
@@ -3643,6 +3690,95 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Insert a new prompt proposal in pending state.
+    pub fn insert_prompt_proposal(&self, p: &NewPromptProposal) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO prompt_proposals
+                (proposed_at, proposed_by, content, why, base_version)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![p.proposed_at, p.proposed_by, p.content, p.why, p.base_version],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_prompt_proposal(&self, id: i64) -> Result<Option<PromptProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, proposed_at, proposed_by, content, why, base_version,
+                        status, decided_at, decided_by, rejection_reason,
+                        evolution_event_id, committed_version
+                   FROM prompt_proposals WHERE id = ?1",
+                params![id],
+                row_to_prompt_proposal,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_prompt_proposals(
+        &self,
+        limit: i64,
+        include_content: bool,
+    ) -> Result<Vec<PromptProposal>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, proposed_at, proposed_by, content, why, base_version,
+                    status, decided_at, decided_by, rejection_reason,
+                    evolution_event_id, committed_version
+               FROM prompt_proposals ORDER BY proposed_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], row_to_prompt_proposal)?
+            .map(|r| {
+                r.map(|mut p| {
+                    if !include_content {
+                        // Truncate to a preview when the caller said
+                        // include_content=false; full markdown bodies
+                        // bloat the agent's context for no value.
+                        if p.content.len() > 240 {
+                            p.content.truncate(240);
+                            p.content.push_str("…");
+                        }
+                    }
+                    p
+                })
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_prompt_proposal_status(
+        &self,
+        id: i64,
+        status: &str,
+        decided_by: &str,
+        decided_at: i64,
+        reason: Option<&str>,
+        evolution_event_id: Option<i64>,
+        committed_version: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE prompt_proposals
+                SET status = ?1, decided_by = ?2, decided_at = ?3,
+                    rejection_reason = ?4, evolution_event_id = ?5,
+                    committed_version = ?6
+              WHERE id = ?7",
+            params![
+                status,
+                decided_by,
+                decided_at,
+                reason,
+                evolution_event_id,
+                committed_version,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Insert a new evolution event. Returns id; channel_msg_id and posted_at
     /// are filled in later via update_evolution_posted once the channel
     /// post + diary write succeed.
@@ -3807,6 +3943,23 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+fn row_to_prompt_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<PromptProposal> {
+    Ok(PromptProposal {
+        id: r.get(0)?,
+        proposed_at: r.get(1)?,
+        proposed_by: r.get(2)?,
+        content: r.get(3)?,
+        why: r.get(4)?,
+        base_version: r.get(5)?,
+        status: r.get(6)?,
+        decided_at: r.get(7)?,
+        decided_by: r.get(8)?,
+        rejection_reason: r.get(9)?,
+        evolution_event_id: r.get(10)?,
+        committed_version: r.get(11)?,
+    })
 }
 
 fn row_to_tune_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<TuneProposal> {
