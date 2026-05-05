@@ -19,7 +19,8 @@ COPY examples ./examples
 COPY deploy ./deploy
 COPY crates ./crates
 # Build both binaries: exciton (the engine) + claw (the agent).
-RUN cargo build --release --bin exciton --bin claw
+RUN cargo build --release --bin exciton && \
+    cargo build --release -p exciton-claw --bin claw
 
 FROM debian:bookworm-slim
 
