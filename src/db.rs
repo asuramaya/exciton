@@ -147,6 +147,7 @@ pub struct CallOutcome {
     pub entry_mcap_usd: f64,
     pub entry_liquidity_usd: f64,
     pub entry_top_holder_pct: f64,
+    pub entry_price_change_h1: Option<f64>,
     pub status: String,
     pub horizon: String,
     pub note: String,
@@ -656,6 +657,15 @@ impl Db {
         // milestone crossing (1.5x at +50, 2x at +100, etc.).
         let _ = conn.execute(
             "ALTER TABLE calls ADD COLUMN peak_announced_pct REAL NOT NULL DEFAULT 0",
+            [],
+        );
+        // Entry-time h1 price change (DexScreener priceChange.h1, signed
+        // percent). Captured at call-fire so we can sweep the
+        // already-pumped-on-entry hypothesis from history. Pre-existing
+        // rows get NULL; list_closed_call_outcomes back-fills NULL via
+        // the latest pre-call snapshot when the row is read.
+        let _ = conn.execute(
+            "ALTER TABLE calls ADD COLUMN entry_price_change_h1 REAL",
             [],
         );
 
@@ -1916,6 +1926,7 @@ impl Db {
         note: &str,
         source: &str,
         entry_tx_rate: f64,
+        entry_price_change_h1: Option<f64>,
     ) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
@@ -1923,8 +1934,8 @@ impl Db {
              (mint, symbol, classification, confidence, called_at,
               entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
               entry_top_holder_pct, entry_pair_dex, note, source, status,
-              entry_tx_rate)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13)",
+              entry_tx_rate, entry_price_change_h1)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?14)",
             params![
                 mint,
                 symbol,
@@ -1939,6 +1950,7 @@ impl Db {
                 note,
                 source,
                 entry_tx_rate,
+                entry_price_change_h1,
             ],
         )?;
         if changed == 0 {
@@ -3987,13 +3999,27 @@ impl Db {
         let limit_idx = args.len() + 1;
         args.push(limit.into());
 
+        // For entry_price_change_h1, COALESCE with the latest pre-call
+        // snapshot's price_change_h1. Forward-recorded calls populate
+        // the column directly; legacy rows borrow from snapshots so
+        // sweep_threshold has data to filter against.
         let sql = format!(
-            "SELECT id, mint, symbol, classification, confidence, called_at,
-                    closed_at, entry_price_usd, exit_price_usd, entry_mcap_usd,
-                    entry_liquidity_usd, entry_top_holder_pct, status, note, exit_note
-               FROM calls
+            "SELECT c.id, c.mint, c.symbol, c.classification, c.confidence, c.called_at,
+                    c.closed_at, c.entry_price_usd, c.exit_price_usd, c.entry_mcap_usd,
+                    c.entry_liquidity_usd, c.entry_top_holder_pct, c.status, c.note,
+                    c.exit_note,
+                    COALESCE(c.entry_price_change_h1, (
+                        SELECT s.price_change_h1
+                          FROM token_snapshots s
+                         WHERE s.token_address = c.mint
+                           AND s.timestamp <= c.called_at
+                           AND s.price_change_h1 IS NOT NULL
+                         ORDER BY s.timestamp DESC
+                         LIMIT 1
+                    )) AS entry_pc_h1
+               FROM calls c
               WHERE {where_sql}
-              ORDER BY closed_at DESC NULLS LAST, called_at DESC
+              ORDER BY c.closed_at DESC NULLS LAST, c.called_at DESC
               LIMIT ?{limit_idx}"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -4023,6 +4049,7 @@ impl Db {
                     entry_mcap_usd: r.get(9)?,
                     entry_liquidity_usd: r.get(10)?,
                     entry_top_holder_pct: r.get(11)?,
+                    entry_price_change_h1: r.get(15)?,
                     status: r.get(12)?,
                     horizon,
                     note,

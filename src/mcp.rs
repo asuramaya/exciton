@@ -1540,6 +1540,7 @@ impl ExcitonServer {
             &note,
             "mcp",
             entry_tx_rate,
+            None, // operator-MCP manual call: no DexScreener fetch in this path
         );
         let id = match inserted {
             Ok(Some(id)) => id,
@@ -3263,6 +3264,22 @@ impl ExcitonServer {
                 "sweepable": false,
                 "description": "Minimum token age at signal time. NOT sweepable from history.",
             },
+            {
+                "field": "max_h1_price_change_pct",
+                "kind": "maximum",
+                "value_type": "f64",
+                "range": {"min": -100.0, "max": 10000.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MAX_H1_PRICE_CHANGE_PCT},
+                "active_overrides": {
+                    "global": active("max_h1_price_change_pct", "global"),
+                    "class:STAIRCASE": active("max_h1_price_change_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("max_h1_price_change_pct", "class:GRINDER"),
+                    "class:SPRING": active("max_h1_price_change_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "DexScreener priceChange.h1 ceiling at signal time. Tokens that already ran too far are bait-pump candidates — diagnostic 2026-05-05 found pre-call >+15% h1 cohort averaged -25% realized. Lower = stricter. Compile-time default disables the gate (10000 = effectively unlimited).",
+            },
         ]);
         serde_json::json!({
             "ok": true,
@@ -4359,6 +4376,10 @@ fn resolve_current_value(db: &crate::db::Db, field: &str, scope: &str) -> Curren
         ("min_token_age_secs", _) => {
             CurrentValue::Default(format!("{}", crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS))
         }
+        ("max_h1_price_change_pct", _) => CurrentValue::Default(format!(
+            "{}",
+            crate::notifier::SIGNAL_MAX_H1_PRICE_CHANGE_PCT
+        )),
         _ => CurrentValue::Unset,
     }
 }
@@ -4377,7 +4398,10 @@ fn current_effective_value(db: &crate::db::Db, field: &str, scope: &str) -> Stri
 fn field_is_sweepable(field: &str) -> bool {
     matches!(
         field,
-        "min_effective_confidence" | "max_top_holder_pct" | "min_liquidity_usd"
+        "min_effective_confidence"
+            | "max_top_holder_pct"
+            | "min_liquidity_usd"
+            | "max_h1_price_change_pct"
     )
 }
 
@@ -4393,7 +4417,7 @@ fn scope_class(scope: &str) -> Option<String> {
 /// support them; global-only otherwise.
 fn default_scopes_for_field(field: &str) -> Vec<String> {
     match field {
-        "min_effective_confidence" | "max_top_holder_pct" => vec![
+        "min_effective_confidence" | "max_top_holder_pct" | "max_h1_price_change_pct" => vec![
             "global".into(),
             "class:STAIRCASE".into(),
             "class:GRINDER".into(),
@@ -4421,6 +4445,13 @@ fn default_candidates_for_field(field: &str) -> Vec<String> {
                 .map(String::from)
                 .collect()
         }
+        // Diagnostic 2026-05-05: pre-call h1 run-up >+15% averaged
+        // -25% PnL; flat tape (-5..+5%) was the only positive cohort.
+        // Grid spans the diagnostic-suggested band.
+        "max_h1_price_change_pct" => vec!["10", "15", "25", "50", "100", "200"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         _ => vec![],
     }
 }
@@ -4462,6 +4493,18 @@ fn call_passes(call: &crate::db::CallOutcome, field: &str, candidate_str: &str) 
         "min_liquidity_usd" => candidate_str
             .parse::<f64>()
             .map_or(false, |c| call.entry_liquidity_usd >= c),
+        "max_h1_price_change_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |cap| {
+                // Calls with no recorded h1 change pass through —
+                // missing data isn't an excuse to drop the call from
+                // the universe. This matches should_signal's posture
+                // for soft-data gates.
+                match call.entry_price_change_h1 {
+                    Some(pc) => pc <= cap,
+                    None => true,
+                }
+            }),
         _ => false,
     }
 }
@@ -4577,7 +4620,7 @@ fn validate_field_scope(field: &str, scope: &str) -> Result<(), String> {
     );
     let global_only_ok = scope == "global";
     match field {
-        "min_effective_confidence" | "max_top_holder_pct" => {
+        "min_effective_confidence" | "max_top_holder_pct" | "max_h1_price_change_pct" => {
             if !per_class_ok {
                 return Err(format!(
                     "field '{}' supports scope 'global' or 'class:STAIRCASE|GRINDER|SPRING' (got '{}')",
@@ -4597,7 +4640,8 @@ fn validate_field_scope(field: &str, scope: &str) -> Result<(), String> {
             return Err(format!(
                 "field '{}' is not in the tunable allow-list. Allowed: \
                  min_effective_confidence, max_top_holder_pct, \
-                 min_liquidity_usd, min_volume_24h_usd, min_token_age_secs",
+                 max_h1_price_change_pct, min_liquidity_usd, \
+                 min_volume_24h_usd, min_token_age_secs",
                 other
             ));
         }
@@ -4647,6 +4691,20 @@ fn validate_field_value(field: &str, value: &str) -> Result<(), String> {
                     Ok(())
                 } else {
                     Err(format!("expected ≥ 0, got {}", n))
+                }
+            }),
+        "max_h1_price_change_pct" => value
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a valid number", value))
+            .and_then(|x| {
+                // Accept -100..=10000. Below -100 is impossible (you
+                // can't lose more than the asset). Above 10000% is a
+                // protocol artifact (bonding-curve fresh launches show
+                // up with absurd numbers); cap to keep the gate tight.
+                if (-100.0..=10000.0).contains(&x) {
+                    Ok(())
+                } else {
+                    Err(format!("expected -100.0..=10000.0, got {}", x))
                 }
             }),
         _ => Err(format!("no value validator for field '{}'", field)),

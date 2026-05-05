@@ -83,6 +83,15 @@ pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
 // runners (2.9% recall, 20% precision). Retuned at runner p75 caps catches
 // 49/69 runners (71% recall, 47.6% precision) — full surgery in commit msg.
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 25.0;
+// h1 price-change ceiling at signal time. 10000 = effectively no gate
+// (default-off). 2026-05-05 diagnostic on 157 closed calls found:
+//   pre-call h1 +30%+: 35 calls, mean -26.3%
+//   pre-call h1 +15-30%: 17 calls, mean -25.0%
+//   pre-call h1 +5-15%: 19 calls, mean -4.0%
+//   pre-call h1 -5..+5%: 46 calls, mean +4.4%   (only positive cohort)
+// Compile-time default leaves the gate inactive; operators dial it in
+// via committed signal_overrides once enough forward-tape accumulates.
+pub const SIGNAL_MAX_H1_PRICE_CHANGE_PCT: f64 = 10_000.0;
 pub const SIGNAL_MAX_TOP10_PCT: f64 = 50.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 
@@ -887,6 +896,18 @@ impl Notifier {
         let mcap_ok = meta
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD && v <= SIGNAL_MAX_MCAP_USD);
+        // h1 price-change ceiling. Already-pumped tokens (priceChange.h1
+        // beyond the ceiling) bait the entry — diagnostic 2026-05-05
+        // showed pre-call >+15% averaged -25% realized PnL. Per-class
+        // override → global override → compile-time default. Missing
+        // h1 data passes through (consistent with other meta-soft gates).
+        let h1_ceiling = overrides
+            .get_f64("max_h1_price_change_pct", &format!("class:{}", class))
+            .or_else(|| overrides.get_f64("max_h1_price_change_pct", "global"))
+            .unwrap_or(SIGNAL_MAX_H1_PRICE_CHANGE_PCT);
+        let h1_ok = meta
+            .and_then(|m| m.price_change_1h)
+            .map_or(true, |v| v <= h1_ceiling);
         // Velocity gate: trading-velocity is the dominant graduation predictor
         // (arxiv 2602.14860). Post-grad we use it to filter dead books.
         let tx_rate_ok = a.tx_rate >= SIGNAL_MIN_TX_RATE_PER_MIN;
@@ -954,6 +975,7 @@ impl Notifier {
             && liq_ok
             && vol_ok
             && mcap_ok
+            && h1_ok
             && tx_rate_ok
             && holder_growth_ok
             && age_ok
@@ -3145,6 +3167,7 @@ impl Notifier {
                     &auto_note,
                     "notifier",
                     a.tx_rate,
+                    meta.and_then(|m| m.price_change_1h),
                 );
                 if let Ok(Some(call_id)) = inserted {
                     // Align expires_at with the horizon-based settling window

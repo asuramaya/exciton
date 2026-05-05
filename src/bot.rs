@@ -1324,6 +1324,7 @@ impl DmBot {
         let inserted = self.db.insert_call(
             mint, &sym, "MANUAL", 0, called_at, mcap, price, liq, top_pct, &dex, &full_note, "dm",
             entry_tx_rate,
+            None, // manual DM call: no recent meta to source price_change_1h from
         )?;
 
         if inserted.is_none() {
