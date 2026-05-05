@@ -27,7 +27,7 @@ base64 = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
 sha2 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 chacha20poly1305 = "0.10"
 hex = "0.4"
 
