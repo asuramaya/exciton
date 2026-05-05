@@ -32,8 +32,11 @@ jobs:
       - name: cargo clippy (lib + bins, warnings allowed)
         run: cargo clippy --workspace --lib --bins
 
-      - name: cargo build --release
-        run: cargo build --release --bin exciton --bin claw
+      - name: cargo build --release (engine)
+        run: cargo build --release --bin exciton
+
+      - name: cargo build --release (agent)
+        run: cargo build --release -p exciton-claw --bin claw
 
       # NOTE: cargo test is not yet wired. Several test files + examples
       # have drifted from the current API surface and need rewriting.
