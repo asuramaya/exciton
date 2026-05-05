@@ -83,15 +83,23 @@ pub const SIGNAL_MIN_EFFECTIVE_CONFIDENCE: i32 = 65;
 // runners (2.9% recall, 20% precision). Retuned at runner p75 caps catches
 // 49/69 runners (71% recall, 47.6% precision) — full surgery in commit msg.
 pub const SIGNAL_MAX_TOP_HOLDER_PCT: f64 = 25.0;
-// h1 price-change ceiling at signal time. 10000 = effectively no gate
-// (default-off). 2026-05-05 diagnostic on 157 closed calls found:
-//   pre-call h1 +30%+: 35 calls, mean -26.3%
-//   pre-call h1 +15-30%: 17 calls, mean -25.0%
-//   pre-call h1 +5-15%: 19 calls, mean -4.0%
-//   pre-call h1 -5..+5%: 46 calls, mean +4.4%   (only positive cohort)
-// Compile-time default leaves the gate inactive; operators dial it in
-// via committed signal_overrides once enough forward-tape accumulates.
+// h1 price-change ceiling at signal time. Default 10000 = gate off.
+// Operators (or the claw) dial it in via committed signal_overrides
+// once forward-tape accumulates and a sweep proves the right value.
 pub const SIGNAL_MAX_H1_PRICE_CHANGE_PCT: f64 = 10_000.0;
+// h1 price-change floor at signal time. Default -100 = gate off (any
+// h1 reading passes). The 2026-05-05 sweep showed momentum-up tokens
+// (h1 >+200%) outperformed flat-tape entries on GRINDER — flipping
+// the same metric to a min-floor lets operators require trend
+// confirmation before a class-scoped fire.
+pub const SIGNAL_MIN_H1_PRICE_CHANGE_PCT: f64 = -100.0;
+// Pre-call peak vs entry ceiling. Default 10000 = gate off. Computed
+// as max(snapshot_price in last 30m) / entry_price - 1, in percent.
+// Captures the bait-spike shape that h1-trend smoothes over: tokens
+// where a recent intra-window peak was well above where we're now
+// entering. The 2026-05-05 diagnostic found pre-call peak >+15%
+// averaged -25% realized PnL.
+pub const SIGNAL_MAX_PRE_CALL_PEAK_PCT: f64 = 10_000.0;
 pub const SIGNAL_MAX_TOP10_PCT: f64 = 50.0;
 pub const SIGNAL_REQUIRED_CLASSES: &[&str] = &["STAIRCASE", "GRINDER", "SPRING"];
 
@@ -897,17 +905,37 @@ impl Notifier {
             .and_then(|m| m.market_cap_usd.or(m.fdv_usd))
             .map_or(false, |v| v >= SIGNAL_MIN_MCAP_USD && v <= SIGNAL_MAX_MCAP_USD);
         // h1 price-change ceiling. Already-pumped tokens (priceChange.h1
-        // beyond the ceiling) bait the entry — diagnostic 2026-05-05
-        // showed pre-call >+15% averaged -25% realized PnL. Per-class
-        // override → global override → compile-time default. Missing
-        // h1 data passes through (consistent with other meta-soft gates).
+        // beyond the ceiling) bait the entry. Per-class override →
+        // global override → compile-time default. Missing h1 data
+        // passes through (consistent with other meta-soft gates).
         let h1_ceiling = overrides
             .get_f64("max_h1_price_change_pct", &format!("class:{}", class))
             .or_else(|| overrides.get_f64("max_h1_price_change_pct", "global"))
             .unwrap_or(SIGNAL_MAX_H1_PRICE_CHANGE_PCT);
+        let h1_floor = overrides
+            .get_f64("min_h1_price_change_pct", &format!("class:{}", class))
+            .or_else(|| overrides.get_f64("min_h1_price_change_pct", "global"))
+            .unwrap_or(SIGNAL_MIN_H1_PRICE_CHANGE_PCT);
         let h1_ok = meta
             .and_then(|m| m.price_change_1h)
-            .map_or(true, |v| v <= h1_ceiling);
+            .map_or(true, |v| v <= h1_ceiling && v >= h1_floor);
+        // Pre-call peak vs entry ceiling. Catches the bait shape:
+        // tokens where the recent 30m peak was well above the entry
+        // price (we're entering on a fade from a local high). Lookup
+        // is one indexed query on token_snapshots; cheap enough on the
+        // signal-fire path. Missing data passes through.
+        let peak_ceiling = overrides
+            .get_f64("max_pre_call_peak_vs_entry_pct", &format!("class:{}", class))
+            .or_else(|| overrides.get_f64("max_pre_call_peak_vs_entry_pct", "global"))
+            .unwrap_or(SIGNAL_MAX_PRE_CALL_PEAK_PCT);
+        let entry_price = meta.and_then(|m| m.price_usd).unwrap_or(0.0);
+        let peak_ok = if entry_price > 0.0 && peak_ceiling < 9_999.0 {
+            self.db
+                .pre_call_peak_pct(&a.address, entry_price, 1800)
+                .map_or(true, |p| p <= peak_ceiling)
+        } else {
+            true
+        };
         // Velocity gate: trading-velocity is the dominant graduation predictor
         // (arxiv 2602.14860). Post-grad we use it to filter dead books.
         let tx_rate_ok = a.tx_rate >= SIGNAL_MIN_TX_RATE_PER_MIN;
@@ -976,6 +1004,7 @@ impl Notifier {
             && vol_ok
             && mcap_ok
             && h1_ok
+            && peak_ok
             && tx_rate_ok
             && holder_growth_ok
             && age_ok
@@ -3168,6 +3197,13 @@ impl Notifier {
                     "notifier",
                     a.tx_rate,
                     meta.and_then(|m| m.price_change_1h),
+                    price.and_then(|p| {
+                        if p > 0.0 {
+                            self.db.pre_call_peak_pct(&a.address, p, 1800)
+                        } else {
+                            None
+                        }
+                    }),
                 );
                 if let Ok(Some(call_id)) = inserted {
                     // Align expires_at with the horizon-based settling window

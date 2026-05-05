@@ -148,6 +148,7 @@ pub struct CallOutcome {
     pub entry_liquidity_usd: f64,
     pub entry_top_holder_pct: f64,
     pub entry_price_change_h1: Option<f64>,
+    pub entry_pre_call_peak_pct: Option<f64>,
     pub status: String,
     pub horizon: String,
     pub note: String,
@@ -666,6 +667,14 @@ impl Db {
         // the latest pre-call snapshot when the row is read.
         let _ = conn.execute(
             "ALTER TABLE calls ADD COLUMN entry_price_change_h1 REAL",
+            [],
+        );
+        // Pre-call peak vs entry — captures the bait-spike shape the
+        // h1-trend metric misses. Computed at insert as max(snapshot
+        // price in [called_at - 30m, called_at]) / entry_price * 100 - 100.
+        // High positive = entered on a fade from a recent local high.
+        let _ = conn.execute(
+            "ALTER TABLE calls ADD COLUMN entry_pre_call_peak_pct REAL",
             [],
         );
 
@@ -1927,6 +1936,7 @@ impl Db {
         source: &str,
         entry_tx_rate: f64,
         entry_price_change_h1: Option<f64>,
+        entry_pre_call_peak_pct: Option<f64>,
     ) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
@@ -1934,8 +1944,8 @@ impl Db {
              (mint, symbol, classification, confidence, called_at,
               entry_mcap_usd, entry_price_usd, entry_liquidity_usd,
               entry_top_holder_pct, entry_pair_dex, note, source, status,
-              entry_tx_rate, entry_price_change_h1)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?14)",
+              entry_tx_rate, entry_price_change_h1, entry_pre_call_peak_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?14, ?15)",
             params![
                 mint,
                 symbol,
@@ -1951,6 +1961,7 @@ impl Db {
                 source,
                 entry_tx_rate,
                 entry_price_change_h1,
+                entry_pre_call_peak_pct,
             ],
         )?;
         if changed == 0 {
@@ -3909,6 +3920,30 @@ impl Db {
         Ok(rows)
     }
 
+    /// Compute pre-call peak relative to a candidate entry price.
+    /// Returns max(snapshot_price in [now - window_secs, now]) /
+    /// entry_price * 100 - 100. None when no snapshot data exists.
+    /// Indexed lookup on token_snapshots (token_address, timestamp).
+    pub fn pre_call_peak_pct(&self, mint: &str, entry_price: f64, window_secs: i64) -> Option<f64> {
+        if entry_price <= 0.0 {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT MAX(price_usd) FROM token_snapshots
+              WHERE token_address = ?1
+                AND timestamp >= ?2
+                AND timestamp <= ?3
+                AND price_usd > 0",
+            rusqlite::params![mint, now - window_secs, now],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|peak| (peak - entry_price) / entry_price * 100.0)
+    }
+
     pub fn insert_review_cycle(
         &self,
         started_at: i64,
@@ -4003,6 +4038,11 @@ impl Db {
         // snapshot's price_change_h1. Forward-recorded calls populate
         // the column directly; legacy rows borrow from snapshots so
         // sweep_threshold has data to filter against.
+        // Pre-call peak window: 30 minutes back from called_at. Matches
+        // the diagnostic that surfaced the bait pattern; the right
+        // window for the live gate is whatever the agent picks via
+        // sweep, but the historical signal is computed on this fixed
+        // window so the comparison stays apples-to-apples across rows.
         let sql = format!(
             "SELECT c.id, c.mint, c.symbol, c.classification, c.confidence, c.called_at,
                     c.closed_at, c.entry_price_usd, c.exit_price_usd, c.entry_mcap_usd,
@@ -4016,7 +4056,17 @@ impl Db {
                            AND s.price_change_h1 IS NOT NULL
                          ORDER BY s.timestamp DESC
                          LIMIT 1
-                    )) AS entry_pc_h1
+                    )) AS entry_pc_h1,
+                    COALESCE(c.entry_pre_call_peak_pct,
+                        CASE WHEN c.entry_price_usd > 0 THEN (
+                            SELECT (MAX(s.price_usd) - c.entry_price_usd) / c.entry_price_usd * 100.0
+                              FROM token_snapshots s
+                             WHERE s.token_address = c.mint
+                               AND s.timestamp >= c.called_at - 1800
+                               AND s.timestamp <= c.called_at
+                               AND s.price_usd > 0
+                        ) ELSE NULL END
+                    ) AS entry_peak_pct
                FROM calls c
               WHERE {where_sql}
               ORDER BY c.closed_at DESC NULLS LAST, c.called_at DESC
@@ -4050,6 +4100,7 @@ impl Db {
                     entry_liquidity_usd: r.get(10)?,
                     entry_top_holder_pct: r.get(11)?,
                     entry_price_change_h1: r.get(15)?,
+                    entry_pre_call_peak_pct: r.get(16)?,
                     status: r.get(12)?,
                     horizon,
                     note,
