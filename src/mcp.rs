@@ -2633,7 +2633,12 @@ impl ExcitonServer {
         Parameters(params): Parameters<ListTunesParams>,
     ) -> String {
         let limit = params.limit.unwrap_or(50).clamp(1, 500);
-        let rows = match self.db.list_tune_proposals(params.status.as_deref(), limit) {
+        // Treat empty status as no filter — same coercion as analyze_outcomes.
+        let status_filter = params
+            .status
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let rows = match self.db.list_tune_proposals(status_filter, limit) {
             Ok(v) => v,
             Err(e) => {
                 return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
@@ -3248,9 +3253,18 @@ impl ExcitonServer {
             Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
         });
 
-        let fields = params
+        // Treat empty arrays as "use defaults" — matches the coercion
+        // pattern elsewhere (empty string → no filter). The agent often
+        // passes `fields:[]` when it means "all of them."
+        let fields_param = params
             .fields
             .clone()
+            .filter(|v| !v.is_empty());
+        let scopes_param = params
+            .scopes
+            .clone()
+            .filter(|v| !v.is_empty());
+        let fields = fields_param
             .unwrap_or_else(|| {
                 vec![
                     "min_effective_confidence".to_string(),
@@ -3265,11 +3279,9 @@ impl ExcitonServer {
         let mut all_candidates: Vec<serde_json::Value> = Vec::new();
 
         for field in &fields {
-            let scopes_to_try: Vec<String> = if let Some(s) = &params.scopes {
-                s.clone()
-            } else {
-                default_scopes_for_field(field)
-            };
+            let scopes_to_try: Vec<String> = scopes_param
+                .clone()
+                .unwrap_or_else(|| default_scopes_for_field(field));
             for scope in &scopes_to_try {
                 if validate_field_scope(field, scope).is_err() {
                     continue;
