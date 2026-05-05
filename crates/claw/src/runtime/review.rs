@@ -26,10 +26,11 @@ use clap::Args;
 use serde_json::json;
 
 /// Hard cap on agent turns per review. Each turn = one provider.complete.
-/// In practice the agent should land in 3–6 turns: list_tunes →
-/// analyze_outcomes → (optional second analyze with include_raw) →
-/// propose_tune → commit_tune → final message.
-const MAX_TURNS: usize = 12;
+/// With the D1 deterministic-tools surface (rank_tune_candidates does the
+/// search) a normal cycle lands in 3-4 turns: list_tunes →
+/// rank_tune_candidates → propose_tune → (commit_tune if mode=commit).
+/// 6 leaves headroom for one diagnostic detour without runaway loops.
+const MAX_TURNS: usize = 6;
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 
@@ -57,19 +58,37 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         anyhow::bail!("--mode must be 'propose' or 'commit'");
     }
 
+    // Refresh the access token if it's within 5 minutes of expiry. No-op
+    // when there's no profile (api-key fallback) or when the token is
+    // still fresh. Avoids mid-cycle 401s from a token that ages out.
+    match crate::auth::refresh_if_needed(std::time::Duration::from_secs(300)).await {
+        Ok(_) => {}
+        Err(e) => tracing::warn!("auth refresh skipped: {}", e),
+    }
+
     let mcp = McpClient::from_env()?;
     let provider = CascadingProvider::from_env()?;
 
     let now = chrono::Utc::now().timestamp();
     let since = now - args.window_secs;
     let user_kickoff = format!(
-        "Review cycle starting now ({}). Window: last {} seconds (since={}). \
-         Operating mode: {}. \
-         Begin by calling `list_tunes` to see prior proposals, then `analyze_outcomes(since={})`. \
-         If you find a bucket with strong evidence, call `propose_tune` and (if mode=commit) \
-         follow up with `commit_tune`. If nothing meets the publishable bar, \
-         stop with a brief explanation of what you looked at.",
-        now, args.window_secs, since, args.mode, since,
+        "Review cycle starting now (epoch={}). Window: last {}s (since={}). Mode: {}.\n\n\
+         Suggested flow:\n\
+         1. `list_tunes(limit=20)` — check prior moves.\n\
+         2. `rank_tune_candidates(top_k=5, since={})` — get the pre-validated menu. The server already enforces n≥10, effect≥5%, holdout≥0.\n\
+         3. If a row clears your robustness judgment, call `propose_tune` with that row's `evidence_json` verbatim. {}.\n\
+         4. Otherwise stop with a brief explanation of what you saw.\n\n\
+         You should NOT call `analyze_outcomes` or `sweep_threshold` unless `rank_tune_candidates` returned an empty/weak menu and you want to investigate a specific bucket. The ranker already covers the deterministic search.",
+        now,
+        args.window_secs,
+        since,
+        args.mode,
+        since,
+        if args.mode == "commit" {
+            "Then call `commit_tune(proposal_id, body_md=...)` with your authored diary entry"
+        } else {
+            "Stop after propose; no commit this cycle"
+        },
     );
 
     let mut messages = vec![
@@ -184,12 +203,70 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// The four autonomy tools advertised to the model. Schemas mirror the
-/// param structs in `mcp.rs` (ProposeTuneParams etc.) — keep these in
-/// sync with the server. Future iteration: have claw introspect the
-/// server's `tools/list` instead of carrying schemas here.
+/// Autonomy tools advertised to the model. Schemas mirror the param
+/// structs in `mcp.rs` — keep them in sync. Future iteration: have
+/// claw introspect via MCP `tools/list` instead of carrying schemas
+/// here.
 fn autonomy_tools() -> Vec<ToolSpec> {
     vec![
+        ToolSpec {
+            name: "rank_tune_candidates".into(),
+            description: "PRIMARY DECISION TOOL. Server runs the candidate grid \
+                          across every (scope × field × value), pre-validates \
+                          each against the floors (n>=10, effect>=5%, holdout \
+                          n>=1 and mean>=0), ranks by `effect × √n`, and \
+                          returns top-K rows with validator-ready evidence_json \
+                          attached. The agent picks one row and feeds the \
+                          embedded evidence_json straight into propose_tune. \
+                          No math required from the agent."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "top_k": { "type": "integer", "description": "Default 5, max 20." },
+                    "scopes": { "type": "array", "items": {"type":"string"}, "description": "Optional. e.g. [\"class:GRINDER\", \"global\"]. Default: all valid scopes per field." },
+                    "fields": { "type": "array", "items": {"type":"string"}, "description": "Optional. Default: all sweepable fields." },
+                    "since": { "type": "integer", "description": "Earliest called_at to include. Default: now-30d." },
+                    "holdout_pct": { "type": "integer", "description": "Holdout split percent. Default 25." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "sweep_threshold".into(),
+            description: "Per-knob threshold curve when you want to interrogate \
+                          a specific (field, scope) yourself. Same shape as one \
+                          row of rank_tune_candidates. Use only when the ranker \
+                          missed something obvious."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["field", "scope", "candidates"],
+                "properties": {
+                    "field": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "candidates": { "type": "array", "items": {"type":"string"} },
+                    "since": { "type": "integer" },
+                    "holdout_pct": { "type": "integer" }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "describe_signal_filters".into(),
+            description: "Tunable knob inventory: name, current effective value, \
+                          compile-time default, valid range, supported scopes, \
+                          whether it can be swept. Read this when you need to \
+                          confirm what's tunable, but typically you can rely on \
+                          rank_tune_candidates to know the surface."
+                .into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "list_overrides".into(),
+            description: "Active runtime overrides (committed tunes, current \
+                          values). Read counterpart to commit_tune writes."
+                .into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
         ToolSpec {
             name: "analyze_outcomes".into(),
             description: "Read closed-call outcomes bucketed by classification × horizon. \

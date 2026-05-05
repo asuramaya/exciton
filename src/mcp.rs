@@ -359,6 +359,61 @@ pub struct AnalyzeOutcomesParams {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SweepThresholdParams {
+    /// Tunable field to sweep. Currently supported by sweep:
+    /// "min_effective_confidence", "max_top_holder_pct",
+    /// "min_liquidity_usd". The other tunables
+    /// (min_volume_24h_usd, min_token_age_secs) are gated pre-call so
+    /// historical sweep is meaningless — propose those manually with
+    /// dedicated evidence.
+    pub field: String,
+    /// Scope: "global" or "class:STAIRCASE" / "class:GRINDER" /
+    /// "class:SPRING" / "class:DEVELOPING". The sweep filters the
+    /// closed-call universe by this scope before applying candidates.
+    pub scope: String,
+    /// Candidate values (stringified) to test. Each becomes one row in
+    /// the response. Skipped silently if it doesn't parse for the
+    /// field's type.
+    pub candidates: Vec<String>,
+    /// Earliest called_at to include (epoch seconds). None = unlimited
+    /// history. Default: trailing 30 days.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Holdout split as percent of universe (newest by called_at).
+    /// Default 25. Range: 10..=50.
+    #[serde(default)]
+    pub holdout_pct: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RankTuneCandidatesParams {
+    /// Restrict to specific scopes (e.g. ["class:GRINDER", "global"]).
+    /// Default: all scopes the field supports.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    /// Restrict to specific fields. Default: every field that
+    /// sweep_threshold supports today.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Number of top candidates to return, ranked by effect × √n.
+    /// Default 5, max 20.
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    /// Earliest called_at to include. Default: trailing 30 days.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Holdout split percent. Default 25.
+    #[serde(default)]
+    pub holdout_pct: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DescribeSignalFiltersParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListOverridesParams {}
+
 // -- Response types --
 
 #[derive(Debug, Serialize)]
@@ -2287,8 +2342,27 @@ impl ExcitonServer {
             "aggregates": aggregates,
         });
         if params.include_raw {
-            let raw: Vec<&crate::db::CallOutcome> = outcomes.iter().take(limit as usize).collect();
-            payload["outcomes"] = serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null);
+            // Hard byte budget so the agent can't accidentally pull
+            // 90KB of raw rows (which it did in the D1 smoke test).
+            // Trim until under budget; the limit param is a soft cap
+            // on top of this.
+            const RAW_BYTE_BUDGET: usize = 12_000;
+            let mut take = (limit as usize).min(outcomes.len());
+            loop {
+                let raw: Vec<&crate::db::CallOutcome> = outcomes.iter().take(take).collect();
+                let serialized = serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null);
+                let size = serialized.to_string().len();
+                if size <= RAW_BYTE_BUDGET || take <= 5 {
+                    payload["outcomes"] = serialized;
+                    payload["raw_truncated_to"] = serde_json::json!(take);
+                    payload["raw_byte_budget"] = serde_json::json!(RAW_BYTE_BUDGET);
+                    break;
+                }
+                take = (take as f64 * 0.7) as usize;
+                if take == 0 {
+                    take = 1;
+                }
+            }
         }
         payload.to_string()
     }
@@ -2923,6 +2997,355 @@ impl ExcitonServer {
         .to_string()
     }
 
+    /// Read the tunable knob inventory: name, current effective value,
+    /// compile-time default, valid range, supported scopes. The agent
+    /// uses this so its prompt doesn't have to hardcode the field list
+    /// — and the operator can extend the surface without re-prompting
+    /// the agent.
+    #[tool]
+    async fn describe_signal_filters(
+        &self,
+        Parameters(_): Parameters<DescribeSignalFiltersParams>,
+    ) -> String {
+        let overrides = match self.db.list_signal_overrides() {
+            Ok(rows) => rows,
+            Err(e) => {
+                return serde_json::json!({"error": format!("query failed: {e}")}).to_string()
+            }
+        };
+        let active = |field: &str, scope: &str| -> Option<String> {
+            overrides
+                .iter()
+                .find(|(f, s, _, _)| f == field && s == scope)
+                .map(|(_, _, v, _)| v.clone())
+        };
+        let entries = serde_json::json!([
+            {
+                "field": "min_effective_confidence",
+                "kind": "minimum",
+                "value_type": "i32",
+                "range": {"min": 0, "max": 100},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {
+                    "STAIRCASE": 70,
+                    "GRINDER": 65,
+                    "DEVELOPING": 60,
+                },
+                "active_overrides": {
+                    "global": active("min_effective_confidence", "global"),
+                    "class:STAIRCASE": active("min_effective_confidence", "class:STAIRCASE"),
+                    "class:GRINDER": active("min_effective_confidence", "class:GRINDER"),
+                    "class:SPRING": active("min_effective_confidence", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "Per-class confidence floor. Calls below the floor are blocked. Higher = stricter.",
+            },
+            {
+                "field": "max_top_holder_pct",
+                "kind": "maximum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": 100.0},
+                "scopes": ["global", "class:STAIRCASE", "class:GRINDER", "class:SPRING"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MAX_TOP_HOLDER_PCT},
+                "active_overrides": {
+                    "global": active("max_top_holder_pct", "global"),
+                    "class:STAIRCASE": active("max_top_holder_pct", "class:STAIRCASE"),
+                    "class:GRINDER": active("max_top_holder_pct", "class:GRINDER"),
+                    "class:SPRING": active("max_top_holder_pct", "class:SPRING"),
+                },
+                "sweepable": true,
+                "description": "Top-1 holder concentration ceiling. Higher top-holder = more rug-prone. Lower = stricter.",
+            },
+            {
+                "field": "min_liquidity_usd",
+                "kind": "minimum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_LIQUIDITY_USD},
+                "active_overrides": {
+                    "global": active("min_liquidity_usd", "global"),
+                },
+                "sweepable": true,
+                "description": "Pool-liquidity floor. Calls below the floor have unhealthy depth. Higher = stricter.",
+            },
+            {
+                "field": "min_volume_24h_usd",
+                "kind": "minimum",
+                "value_type": "f64",
+                "range": {"min": 0.0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_VOLUME_24H_USD},
+                "active_overrides": {
+                    "global": active("min_volume_24h_usd", "global"),
+                },
+                "sweepable": false,
+                "description": "24h volume floor. NOT sweepable from history (rejected calls aren't stored). Tune manually with snapshot evidence.",
+            },
+            {
+                "field": "min_token_age_secs",
+                "kind": "minimum",
+                "value_type": "i64",
+                "range": {"min": 0, "max": null},
+                "scopes": ["global"],
+                "compile_time_defaults": {"global": crate::notifier::SIGNAL_MIN_TOKEN_AGE_SECS},
+                "active_overrides": {
+                    "global": active("min_token_age_secs", "global"),
+                },
+                "sweepable": false,
+                "description": "Minimum token age at signal time. NOT sweepable from history.",
+            },
+        ]);
+        serde_json::json!({
+            "ok": true,
+            "fields": entries,
+            "evidence_floor": EVIDENCE_FLOOR,
+            "effect_floor_pct": EFFECT_FLOOR_PCT,
+        })
+        .to_string()
+    }
+
+    /// List active runtime overrides (committed tunes). Read counterpart
+    /// to commit_tune writes — lets the agent see its own current state
+    /// without grepping the DB. Each row is one (field, scope, value)
+    /// triple with set_at timestamp.
+    #[tool]
+    async fn list_overrides(
+        &self,
+        Parameters(_): Parameters<ListOverridesParams>,
+    ) -> String {
+        match self.db.list_signal_overrides() {
+            Ok(rows) => {
+                let entries: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(field, scope, value, set_at)| {
+                        serde_json::json!({
+                            "field": field,
+                            "scope": scope,
+                            "value": value,
+                            "set_at": set_at,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "count": entries.len(),
+                    "overrides": entries,
+                })
+                .to_string()
+            }
+            Err(e) => serde_json::json!({"error": format!("query failed: {e}")}).to_string(),
+        }
+    }
+
+    /// Threshold sweep — for one (field, scope), test a list of
+    /// candidate values against the closed-call universe. Returns per
+    /// candidate the validator-ready evidence_json (current/proposed/
+    /// holdout) plus summary stats. The agent picks one row and feeds
+    /// the embedded evidence_json straight into propose_tune — no math
+    /// in token-space.
+    #[tool]
+    async fn sweep_threshold(
+        &self,
+        Parameters(params): Parameters<SweepThresholdParams>,
+    ) -> String {
+        if let Err(e) = validate_field_scope(&params.field, &params.scope) {
+            return serde_json::json!({"ok": false, "error": "invalid_field_or_scope", "message": e}).to_string();
+        }
+        if !field_is_sweepable(&params.field) {
+            return serde_json::json!({
+                "ok": false,
+                "error": "field_not_sweepable",
+                "message": format!("field '{}' is gated pre-call so historical calls don't carry the value needed to sweep — propose manually with operator evidence", params.field),
+            })
+            .to_string();
+        }
+        let holdout_pct = params.holdout_pct.unwrap_or(25).clamp(10, 50) as f64 / 100.0;
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+        let class = scope_class(&params.scope);
+        let outcomes = match self
+            .db
+            .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({"ok": false, "error": "db_error", "message": e.to_string()}).to_string();
+            }
+        };
+
+        if outcomes.is_empty() {
+            return serde_json::json!({
+                "ok": true,
+                "field": params.field,
+                "scope": params.scope,
+                "since": since,
+                "baseline": null,
+                "candidates": [],
+                "note": "no closed calls in window",
+            })
+            .to_string();
+        }
+
+        // Time split: holdout = newest holdout_pct of universe by called_at.
+        let mut sorted = outcomes.clone();
+        sorted.sort_by_key(|o| o.called_at);
+        let holdout_size = ((sorted.len() as f64) * holdout_pct).round() as usize;
+        let holdout_size = holdout_size.max(1).min(sorted.len() - 1);
+        let cutoff_idx = sorted.len() - holdout_size;
+        let holdout_cutoff = sorted[cutoff_idx].called_at;
+
+        let baseline = bucket_stats(&sorted);
+
+        let candidates: Vec<serde_json::Value> = params
+            .candidates
+            .iter()
+            .filter_map(|cand_str| {
+                if validate_field_value(&params.field, cand_str).is_err() {
+                    return Some(serde_json::json!({
+                        "value": cand_str,
+                        "ok": false,
+                        "error": "value_invalid",
+                    }));
+                }
+                Some(evaluate_candidate(
+                    &sorted,
+                    &params.field,
+                    cand_str,
+                    holdout_cutoff,
+                ))
+            })
+            .collect();
+
+        serde_json::json!({
+            "ok": true,
+            "field": params.field,
+            "scope": params.scope,
+            "since": since,
+            "holdout_cutoff": holdout_cutoff,
+            "universe_n": sorted.len(),
+            "baseline": baseline,
+            "candidates": candidates,
+        })
+        .to_string()
+    }
+
+    /// Rank tunable candidates across (scope × field × candidate-grid)
+    /// using a built-in candidate set per field. Returns the top-K
+    /// ranked by `effect_pct × √n_passing`, each with a fully-formed
+    /// evidence_json the agent can pass to propose_tune verbatim.
+    /// This is the "what should I tune?" endpoint — it surveys the
+    /// space deterministically so the LLM doesn't have to enumerate.
+    #[tool]
+    async fn rank_tune_candidates(
+        &self,
+        Parameters(params): Parameters<RankTuneCandidatesParams>,
+    ) -> String {
+        let top_k = params.top_k.unwrap_or(5).clamp(1, 20) as usize;
+        let holdout_pct = params.holdout_pct.unwrap_or(25).clamp(10, 50) as f64 / 100.0;
+        let since = params.since.or_else(|| {
+            Some(chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60)
+        });
+
+        let fields = params
+            .fields
+            .clone()
+            .unwrap_or_else(|| {
+                vec![
+                    "min_effective_confidence".to_string(),
+                    "max_top_holder_pct".to_string(),
+                    "min_liquidity_usd".to_string(),
+                ]
+            })
+            .into_iter()
+            .filter(|f| field_is_sweepable(f))
+            .collect::<Vec<_>>();
+
+        let mut all_candidates: Vec<serde_json::Value> = Vec::new();
+
+        for field in &fields {
+            let scopes_to_try: Vec<String> = if let Some(s) = &params.scopes {
+                s.clone()
+            } else {
+                default_scopes_for_field(field)
+            };
+            for scope in &scopes_to_try {
+                if validate_field_scope(field, scope).is_err() {
+                    continue;
+                }
+                let class = scope_class(scope);
+                let outcomes = match self
+                    .db
+                    .list_closed_call_outcomes(class.as_deref(), None, since, 5000)
+                {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if outcomes.len() < EVIDENCE_FLOOR as usize {
+                    continue;
+                }
+                let mut sorted = outcomes;
+                sorted.sort_by_key(|o| o.called_at);
+                let holdout_size = ((sorted.len() as f64) * holdout_pct).round() as usize;
+                let holdout_size = holdout_size.max(1).min(sorted.len() - 1);
+                let cutoff_idx = sorted.len() - holdout_size;
+                let holdout_cutoff = sorted[cutoff_idx].called_at;
+
+                for cand in default_candidates_for_field(field) {
+                    let row = evaluate_candidate(&sorted, field, &cand, holdout_cutoff);
+                    if row.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        continue;
+                    }
+                    let n = row.get("n_passing").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let effect = row
+                        .get("effect_vs_baseline_pct")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let holdout_n = row
+                        .get("holdout")
+                        .and_then(|v| v.get("n"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let holdout_pnl = row
+                        .get("holdout")
+                        .and_then(|v| v.get("mean_pnl_pct"))
+                        .and_then(|v| v.as_f64());
+                    if n < EVIDENCE_FLOOR
+                        || effect < EFFECT_FLOOR_PCT
+                        || holdout_n < 1
+                        || holdout_pnl.map_or(true, |h| h < 0.0)
+                    {
+                        continue;
+                    }
+                    let leverage = effect * (n as f64).sqrt();
+                    let mut enriched = row.clone();
+                    enriched["field"] = serde_json::json!(field);
+                    enriched["scope"] = serde_json::json!(scope);
+                    enriched["leverage"] = serde_json::json!(round2(leverage));
+                    all_candidates.push(enriched);
+                }
+            }
+        }
+
+        all_candidates.sort_by(|a, b| {
+            let la = a.get("leverage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let lb = b.get("leverage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_candidates.truncate(top_k);
+
+        serde_json::json!({
+            "ok": true,
+            "since": since,
+            "fields_searched": fields,
+            "candidate_count": all_candidates.len(),
+            "candidates": all_candidates,
+            "note": "All candidates pre-validated against the same floors propose_tune enforces (n>=10, effect>=5%, holdout n>=1 and mean>=0). evidence_json on each row can be passed to propose_tune verbatim.",
+        })
+        .to_string()
+    }
+
     /// Internal helper — publishes a freshly-inserted evolution event to
     /// the operator's surfaces (Telegram channel + publisher diary). All
     /// failures are non-fatal; the evolution row already lives in DB and
@@ -3119,6 +3542,202 @@ const PROMPT_MAX: usize = 20_000;
 /// new tunable requires editing this map AND wiring it into should_signal
 /// (Phase A5). Until both are done, the agent gets `invalid_field_or_scope`
 /// — preventing the agent from inventing fields the runtime won't honor.
+/// Whether a tunable field can be swept against historical closed calls.
+/// Fields gated *pre-call* (volume, age) don't store the value on the
+/// CallOutcome row so we have nothing to filter against — the agent
+/// must propose those manually with operator-supplied evidence.
+fn field_is_sweepable(field: &str) -> bool {
+    matches!(
+        field,
+        "min_effective_confidence" | "max_top_holder_pct" | "min_liquidity_usd"
+    )
+}
+
+/// Map a scope string to a classification filter for
+/// `list_closed_call_outcomes`. "global" / unknown → None (no filter);
+/// "class:STAIRCASE" → Some("STAIRCASE").
+fn scope_class(scope: &str) -> Option<String> {
+    scope.strip_prefix("class:").map(|s| s.to_string())
+}
+
+/// Default scope set per field for `rank_tune_candidates` when the
+/// caller doesn't specify. Per-class scopes only for fields that
+/// support them; global-only otherwise.
+fn default_scopes_for_field(field: &str) -> Vec<String> {
+    match field {
+        "min_effective_confidence" | "max_top_holder_pct" => vec![
+            "global".into(),
+            "class:STAIRCASE".into(),
+            "class:GRINDER".into(),
+            "class:SPRING".into(),
+        ],
+        _ => vec!["global".into()],
+    }
+}
+
+/// Default candidate grid per field. Picked to span "stricter than today"
+/// without overshooting the realistic operating range.
+fn default_candidates_for_field(field: &str) -> Vec<String> {
+    match field {
+        "min_effective_confidence" => vec!["62", "66", "70", "74", "78", "82"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "max_top_holder_pct" => vec!["10", "15", "20", "25", "30"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "min_liquidity_usd" => {
+            vec!["20000", "30000", "50000", "75000", "100000", "150000"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        _ => vec![],
+    }
+}
+
+/// Pull the bucket-level baseline stats — n, mean PnL, win rate.
+fn bucket_stats(rows: &[crate::db::CallOutcome]) -> serde_json::Value {
+    let n = rows.len() as i64;
+    let pnls: Vec<f64> = rows.iter().filter_map(|r| r.pnl_pct).collect();
+    let mean_pnl = if pnls.is_empty() {
+        None
+    } else {
+        Some(pnls.iter().sum::<f64>() / pnls.len() as f64)
+    };
+    let wins = rows.iter().filter(|r| r.status == "withdrew").count() as i64;
+    let win_rate = if n > 0 {
+        100.0 * wins as f64 / n as f64
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "n": n,
+        "mean_pnl_pct": mean_pnl.map(round2),
+        "win_rate_pct": round2(win_rate),
+    })
+}
+
+/// Decide if a closed call would still pass under a candidate value
+/// for `field`. Direction depends on the field semantic:
+///   - min_X: pass when call's value ≥ candidate
+///   - max_X: pass when call's value ≤ candidate
+fn call_passes(call: &crate::db::CallOutcome, field: &str, candidate_str: &str) -> bool {
+    match field {
+        "min_effective_confidence" => candidate_str
+            .parse::<i32>()
+            .map_or(false, |c| call.confidence >= c),
+        "max_top_holder_pct" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |c| call.entry_top_holder_pct <= c),
+        "min_liquidity_usd" => candidate_str
+            .parse::<f64>()
+            .map_or(false, |c| call.entry_liquidity_usd >= c),
+        _ => false,
+    }
+}
+
+/// Run one candidate through the (sorted-by-called_at) universe; emit
+/// the validator-shaped evidence_json plus summary stats. Returns
+/// `{ok:false, error: "insufficient_passing_n"}` when the proposed
+/// gate would leave fewer than EVIDENCE_FLOOR / 2 calls — sweep can
+/// still surface this to the agent as "we tried but it's too tight".
+fn evaluate_candidate(
+    sorted: &[crate::db::CallOutcome],
+    field: &str,
+    candidate_str: &str,
+    holdout_cutoff: i64,
+) -> serde_json::Value {
+    let baseline = bucket_stats(sorted);
+    let cur_pnl = baseline
+        .get("mean_pnl_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cur_n = baseline.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let passing: Vec<&crate::db::CallOutcome> = sorted
+        .iter()
+        .filter(|c| call_passes(c, field, candidate_str))
+        .collect();
+    let rejected: Vec<&crate::db::CallOutcome> = sorted
+        .iter()
+        .filter(|c| !call_passes(c, field, candidate_str))
+        .collect();
+
+    let prop_pnls: Vec<f64> = passing.iter().filter_map(|r| r.pnl_pct).collect();
+    let prop_mean = if prop_pnls.is_empty() {
+        None
+    } else {
+        Some(prop_pnls.iter().sum::<f64>() / prop_pnls.len() as f64)
+    };
+    let rej_pnls: Vec<f64> = rejected.iter().filter_map(|r| r.pnl_pct).collect();
+    let rej_mean = if rej_pnls.is_empty() {
+        None
+    } else {
+        Some(rej_pnls.iter().sum::<f64>() / rej_pnls.len() as f64)
+    };
+    let prop_wins = passing.iter().filter(|r| r.status == "withdrew").count() as i64;
+    let prop_win_rate = if !passing.is_empty() {
+        100.0 * prop_wins as f64 / passing.len() as f64
+    } else {
+        0.0
+    };
+
+    // Holdout = passing calls with called_at >= cutoff.
+    let holdout: Vec<&crate::db::CallOutcome> = passing
+        .iter()
+        .copied()
+        .filter(|c| c.called_at >= holdout_cutoff)
+        .collect();
+    let holdout_pnls: Vec<f64> = holdout.iter().filter_map(|r| r.pnl_pct).collect();
+    let holdout_mean = if holdout_pnls.is_empty() {
+        None
+    } else {
+        Some(holdout_pnls.iter().sum::<f64>() / holdout_pnls.len() as f64)
+    };
+
+    let effect = match prop_mean {
+        Some(p) => p - cur_pnl,
+        None => 0.0,
+    };
+
+    let evidence = serde_json::json!({
+        "current": {
+            "n": cur_n,
+            "mean_pnl_pct": baseline.get("mean_pnl_pct").cloned().unwrap_or(serde_json::Value::Null),
+            "win_rate_pct": baseline.get("win_rate_pct").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "proposed": {
+            "n": passing.len(),
+            "mean_pnl_pct": prop_mean.map(round2),
+            "win_rate_pct": round2(prop_win_rate),
+        },
+        "holdout": {
+            "n": holdout.len(),
+            "mean_pnl_pct": holdout_mean.map(round2),
+            "cutoff": holdout_cutoff,
+        },
+        "method": format!("sweep_threshold field={} cand={}", field, candidate_str),
+    });
+
+    serde_json::json!({
+        "ok": true,
+        "value": candidate_str,
+        "n_passing": passing.len(),
+        "n_rejected": rejected.len(),
+        "mean_pnl_passing_pct": prop_mean.map(round2),
+        "mean_pnl_rejected_pct": rej_mean.map(round2),
+        "win_rate_passing_pct": round2(prop_win_rate),
+        "effect_vs_baseline_pct": round2(effect),
+        "holdout": {
+            "n": holdout.len(),
+            "mean_pnl_pct": holdout_mean.map(round2),
+        },
+        "evidence_json": evidence.to_string(),
+    })
+}
+
 fn validate_field_scope(field: &str, scope: &str) -> Result<(), String> {
     let per_class_ok = matches!(
         scope,
