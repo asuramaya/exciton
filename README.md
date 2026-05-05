@@ -1,10 +1,36 @@
 # Exciton
 
-**MCP-first Solana intelligence engine.** Deterministic on-chain scanner, signal forecaster, Telegram operator surface, and JSON publisher in a single Rust binary.
+**OSS crypto-influencer engine for Solana.** A deterministic on-chain scanner + LLM-driven autonomous-trading agent in a single Rust workspace. One codebase, many instances — every operator runs their own ape with their own wallet, persona, Telegram surface, and published site.
 
-Live demo: [madapesai.com](https://madapesai.com) — a real deployment running this codebase, publishing call state in real time.
+[madapesai.com](https://madapesai.com) is the reference deployment, not the product. The product is the engine that lets you spin up a different ape on the same code.
 
 > **Status:** Active. Used in production by the original author; APIs and config schema may shift between minor versions. Pin a commit if you depend on stability.
+
+---
+
+## Quickstart
+
+```bash
+# 1. Pull the image
+docker pull ghcr.io/asuramaya/exciton:latest
+
+# 2. Copy + edit the example config
+git clone https://github.com/asuramaya/exciton
+cp exciton/deploy/config.container.toml.example config.toml
+# edit config.toml: wallet, telegram tokens, publisher repo path, RPC endpoints
+
+# 3. Run
+docker run -d --name my-ape \
+  -v "$(pwd)/state:/data" \
+  -v "$(pwd)/config.toml:/etc/exciton/config.toml:ro" \
+  -p 127.0.0.1:8082:8082 \
+  ghcr.io/asuramaya/exciton:latest
+
+# 4. Authorize claw (the autonomy agent)
+docker exec -it my-ape claw login
+```
+
+Full walkthrough: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ---
 

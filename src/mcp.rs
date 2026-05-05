@@ -1275,7 +1275,7 @@ impl ExcitonServer {
             .unwrap_or(0);
         let wallet_sol = wallet_lamports as f64 / 1e9;
 
-        // Publisher freshness: mtime on data/health.json in the MadApes repo.
+        // Publisher freshness: mtime on data/health.json in the publisher repo.
         let (publisher_path, publisher_age_seconds): (String, i64) =
             match self.config.madapes.as_ref() {
                 Some(mp) => {

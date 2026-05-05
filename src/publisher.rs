@@ -100,9 +100,9 @@ struct ActivityFile {
 }
 
 /// Featured-token snapshot for the site's pinned section. Carries the
-/// project's own coin (mint configured via `featured_mint` in the
-/// MadApes section of config) plus the ape wallet's holding percentage
-/// and the never-selling pledge text.
+/// operator's chosen featured coin (mint configured via `featured_mint`
+/// in the publisher section of config) plus the operator wallet's
+/// holding percentage.
 #[derive(Debug, Serialize, Default, Clone)]
 struct FeaturedFile {
     mint: String,
@@ -298,7 +298,7 @@ impl Publisher {
         let interval = self.cfg.interval_seconds.max(60);
         tokio::spawn(async move {
             tracing::info!(
-                "MadApes publisher active: pushing to {} (max {}s, push-on-event)",
+                "Publisher active: pushing to {} (max {}s, push-on-event)",
                 self.cfg.repo_path,
                 interval
             );
@@ -335,11 +335,11 @@ impl Publisher {
                 // can't finish in 60s it's not worth the next tick waiting.
                 match tokio::time::timeout(Duration::from_secs(60), self.run_once()).await {
                     Ok(Ok(committed)) if committed => {
-                        tracing::info!("MadApes publish: data snapshot pushed")
+                        tracing::info!("Publisher: data snapshot pushed")
                     }
-                    Ok(Ok(_)) => tracing::info!("MadApes publish: no data change"),
-                    Ok(Err(e)) => tracing::warn!("MadApes publish failed: {}", e),
-                    Err(_) => tracing::warn!("MadApes publish: tick exceeded 60s budget — abandoning"),
+                    Ok(Ok(_)) => tracing::info!("Publisher: no data change"),
+                    Ok(Err(e)) => tracing::warn!("Publisher failed: {}", e),
+                    Err(_) => tracing::warn!("Publisher: tick exceeded 60s budget — abandoning"),
                 }
             }
         });

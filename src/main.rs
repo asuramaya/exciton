@@ -534,7 +534,7 @@ async fn main() -> Result<()> {
                 img_proc.spawn();
             }
         } else {
-            tracing::info!("MadApes publisher configured but disabled");
+            tracing::info!("publisher configured but disabled");
         }
     }
 
