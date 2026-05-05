@@ -7,6 +7,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
+COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -16,7 +17,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY deploy ./deploy
-RUN cargo build --release --bin exciton
+COPY crates ./crates
+# Build both binaries: exciton (the engine) + claw (the agent).
+RUN cargo build --release --bin exciton --bin claw
 
 FROM debian:bookworm-slim
 
@@ -25,6 +28,7 @@ RUN apt-get update     && apt-get install -y --no-install-recommends         ca-
 WORKDIR /data
 
 COPY --from=builder /app/target/release/exciton /usr/local/bin/exciton
+COPY --from=builder /app/target/release/claw /usr/local/bin/claw
 COPY deploy/config.container.toml.example /etc/exciton/config.toml
 
 ENV EXCITON_DB_PATH=/data/exciton.db
