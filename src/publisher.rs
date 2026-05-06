@@ -1,31 +1,23 @@
 //! Publisher — periodically snapshots the operating wallet to JSON files
-//! inside a configured target git repo, then commits and pushes.
+//! in a local staging dir, then ships the consolidated state via an
+//! HMAC-signed POST to a Cloudflare Worker (`/api/admin/publish`). The
+//! Worker writes each present key into KV; public read endpoints
+//! (`/api/diary`, `/api/calls`, `/api/strategy`) serve the snapshots
+//! with edge cache.
 //!
-//! Zero LLM, zero API keys. All numbers come from on-chain reads + DexScreener;
-//! all summaries are templated from raw balance deltas. The site is the bag +
-//! the tracks + the thoughts — this module owns the first two. Thoughts are
-//! append-only markdown and never touched by the publisher.
-//!
-//! Pacing:
-//!   - runs on a fixed tokio interval (default 5 min)
-//!   - commits only touch data/ — thoughts/ is append-only and manual
-//!   - commit prefix `data:` so the git log stays legible next to `note:`
-//!     commits from hand-written reads
+//! Zero LLM, zero LLM-shaped API keys. All numbers come from on-chain
+//! reads + DexScreener; all summaries are templated from raw balance
+//! deltas.
 
 use crate::config::MadapesConfig;
 use crate::db::Db;
 use crate::ingester::RpcRouter;
 use crate::market;
 use anyhow::{Context, Result};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
-// Async git ops with hard timeouts. The previous sync std::process::Command
-// path could hang indefinitely on a stalled `git push` (slow network /
-// GitHub blip), blocking a tokio worker thread for the duration. The
-// publisher would freeze with no log lines until the underlying socket
-// timed out (often >2 minutes). Using tokio::process + timeout caps each
-// git op at 60s.
-use tokio::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -308,9 +300,9 @@ impl Publisher {
             // warm and there's nothing new to publish yet.
             tick.tick().await;
             // Cooldown between successive runs: even if 5 events kick
-            // back-to-back, give the prior git push room to land. 30s
-            // is comfortably below interesting human-perception
-            // staleness while bounding git/RPC load on bursts.
+            // back-to-back, give the prior CF publish room to land.
+            // 30s is comfortably below interesting human-perception
+            // staleness while bounding RPC load on bursts.
             const MIN_INTERVAL: Duration = Duration::from_secs(30);
             let mut last_run = tokio::time::Instant::now() - MIN_INTERVAL;
             loop {
@@ -328,11 +320,12 @@ impl Publisher {
                 last_run = tokio::time::Instant::now();
                 tracing::debug!("publisher tick start");
                 // Hard 60s budget on the entire tick. The inner per-RPC
-                // timeouts (5s/8s) cap individual hot calls, but downstream
-                // work (build_calls_file's per-mint market fetches, scout/
-                // whale/details per active call, the git push) can still
-                // accumulate beyond a useful staleness budget. If the tick
-                // can't finish in 60s it's not worth the next tick waiting.
+                // timeouts (5s/8s) cap individual hot calls, but
+                // downstream work (build_calls_file's per-mint market
+                // fetches, scout/whale/details per active call, the
+                // CF publish) can still accumulate beyond a useful
+                // staleness budget. If the tick can't finish in 60s
+                // it's not worth the next tick waiting.
                 match tokio::time::timeout(Duration::from_secs(60), self.run_once()).await {
                     Ok(Ok(committed)) if committed => {
                         tracing::info!("Publisher: data snapshot pushed")
@@ -347,9 +340,9 @@ impl Publisher {
 
     pub async fn run_once(&self) -> Result<bool> {
         let repo = PathBuf::from(&self.cfg.repo_path);
-        if !repo.join(".git").exists() {
-            anyhow::bail!("repo_path {:?} is not a git checkout", repo);
-        }
+        // `repo_path` is the local staging dir for the JSON files that
+        // get bundled into the HMAC-signed POST. No git involvement —
+        // the engine ships exclusively to a Cloudflare Worker.
         let data_dir = repo.join("data");
         std::fs::create_dir_all(&data_dir).context("create data/ dir")?;
         let now = chrono::Utc::now().timestamp();
@@ -689,7 +682,7 @@ impl Publisher {
             write_json(&data_dir.join("featured.json"), &f)?;
         }
 
-        self.commit_and_push(&repo, now).await
+        self.post_publish(&data_dir, now).await
     }
 
     /// Snapshot the featured token (the project's own coin) for the site
@@ -1500,92 +1493,131 @@ impl Publisher {
         }
     }
 
-    async fn commit_and_push(&self, repo: &Path, ts: i64) -> Result<bool> {
-        let repo_arg = repo.to_str().unwrap_or(".");
-        let status = run_git(&["-C", repo_arg, "status", "--porcelain", "--", "data/"])
-            .await
-            .context("git status")?;
-        if status.stdout.is_empty() {
-            return Ok(false);
+    /// Push the consolidated public state to the Cloudflare Worker as a
+    /// single HMAC-signed POST. Reads the JSON files just written into
+    /// `data_dir` (so the file-write helpers stay untouched), pulls
+    /// the diary feed + override snapshot from DB, signs `<ts>.<body>`
+    /// with HMAC-SHA256, and ships the bundle.
+    ///
+    /// Returns `Ok(true)` on a successful push. The Worker validates
+    /// the signature + timestamp skew before writing each present key
+    /// into KV; the read endpoints pick up the new state on their next
+    /// cache miss.
+    async fn post_publish(&self, data_dir: &Path, ts: i64) -> Result<bool> {
+        let url = self.cfg.cf_publish_url.as_str();
+        if url.is_empty() {
+            anyhow::bail!("cf_publish_url is empty — required when madapes.enabled");
+        }
+        // Secret was env-expanded at startup in main.rs.
+        let secret = self.cfg.cf_publish_secret.as_str();
+        if secret.is_empty() {
+            anyhow::bail!("cf_publish_secret is empty — required when madapes.enabled");
         }
 
-        run_git(&["-C", repo_arg, "add", "data/"])
-            .await
-            .context("git add")?;
+        // calls.json was just written by run_once. Read it back so the
+        // POST carries the same shape the legacy GH Pages site
+        // consumed; the Worker stores it under KV key `calls`.
+        let calls_path = data_dir.join("calls.json");
+        let calls = if calls_path.exists() {
+            match std::fs::read_to_string(&calls_path) {
+                Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => {
+                    tracing::warn!("publisher: read calls.json: {}", e);
+                    serde_json::Value::Null
+                }
+            }
+        } else {
+            serde_json::Value::Null
+        };
 
-        let msg = format!("data: snapshot {}", ts);
-        let commit = run_git(&["-C", repo_arg, "commit", "-m", &msg])
-            .await
-            .context("git commit")?;
-        if !commit.status.success() {
-            anyhow::bail!(
-                "git commit failed: {}",
-                String::from_utf8_lossy(&commit.stderr)
-            );
-        }
+        // Diary feed — last 20 evolution events ordered newest-first.
+        // Same shape the static site renders client-side.
+        let diary = self
+            .db
+            .list_evolution_events(None, 20)
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            "kind": e.kind,
+                            "title": e.summary,
+                            "summary": e.summary,
+                            "body_md": e.body_md,
+                            "created_at": e.committed_at,
+                            "diary_path": e.diary_path,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        // Try push first (the optimistic path — most ticks have no other
-        // committer racing us). On non-fast-forward (operator pushed source
-        // changes from local), pull --rebase to grab their work, then push
-        // again. Without this, every operator local push leaves the
-        // publisher stuck rejected until someone pulls in-container.
-        let push = run_git(&["-C", repo_arg, "push", "--quiet"])
-            .await
-            .context("git push")?;
-        if push.status.success() {
-            return Ok(true);
-        }
+        // Strategy snapshot — the runtime-mutable signal_overrides in
+        // effect right now. Empty when the engine is running on
+        // defaults (the Worker renders that as "no overrides currently
+        // in effect — engine running on defaults").
+        let strategy = self
+            .db
+            .list_signal_overrides()
+            .map(|rows| {
+                let map: serde_json::Map<String, serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(field, scope, value, set_at)| {
+                        let key = if scope.is_empty() {
+                            field
+                        } else {
+                            format!("{}:{}", field, scope)
+                        };
+                        (
+                            key,
+                            serde_json::json!({ "value": value, "set_at": set_at }),
+                        )
+                    })
+                    .collect();
+                serde_json::Value::Object(map)
+            })
+            .unwrap_or(serde_json::json!({}));
 
-        // Recoverable rejections: stderr contains "non-fast-forward" or
-        // "fetch first". Anything else (auth failure, network out) we
-        // surface as before.
-        let stderr = String::from_utf8_lossy(&push.stderr).to_string();
-        let recoverable = stderr.contains("non-fast-forward")
-            || stderr.contains("fetch first")
-            || stderr.contains("rejected");
-        if !recoverable {
-            anyhow::bail!("git push failed: {}", stderr);
-        }
+        let body = serde_json::json!({
+            "calls": calls,
+            "diary": diary,
+            "strategy": strategy,
+            "captured_at": ts,
+        });
+        let body_str = serde_json::to_string(&body)?;
 
-        tracing::info!("publisher: push rejected, pulling --rebase and retrying");
-        let pull = run_git(&["-C", repo_arg, "pull", "--rebase", "--quiet"])
+        // Signature: HMAC-SHA256 over `<ts>.<body>`. The same scheme
+        // the Worker (cloudflare/worker/src/index.js) validates with.
+        // Replay protection lives on the Worker side via timestamp
+        // skew check.
+        let signed = format!("{}.{}", ts, body_str);
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).context("hmac key init")?;
+        mac.update(signed.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("build reqwest client")?;
+        let resp = client
+            .post(url)
+            .header("X-Exciton-Timestamp", ts.to_string())
+            .header("X-Exciton-Signature", sig)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
             .await
-            .context("git pull --rebase")?;
-        if !pull.status.success() {
-            // Conflict during rebase. Abort so we leave the tree clean
-            // for the next tick instead of stuck mid-rebase.
-            let _ = run_git(&["-C", repo_arg, "rebase", "--abort"]).await;
-            anyhow::bail!(
-                "git pull --rebase failed: {}",
-                String::from_utf8_lossy(&pull.stderr)
-            );
+            .context("cf publish send")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!("cf publish {} -> {}", status, detail);
         }
-        let push2 = run_git(&["-C", repo_arg, "push", "--quiet"])
-            .await
-            .context("git push (retry)")?;
-        if !push2.status.success() {
-            anyhow::bail!(
-                "git push (retry) failed: {}",
-                String::from_utf8_lossy(&push2.stderr)
-            );
-        }
+        tracing::info!("publisher: cf publish ok ts={}", ts);
         Ok(true)
-    }
-}
-
-/// Run a git subcommand with a hard 60s timeout. Returns the same Output
-/// shape as Command::output() but kills the child if the call doesn't
-/// return within the window — preventing hung git push from freezing
-/// the publisher loop.
-async fn run_git(args: &[&str]) -> Result<std::process::Output> {
-    use std::time::Duration;
-    let mut cmd = Command::new("git");
-    cmd.args(args);
-    let fut = cmd.output();
-    match tokio::time::timeout(Duration::from_secs(60), fut).await {
-        Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) => Err(anyhow::anyhow!("git spawn: {}", e)),
-        Err(_) => anyhow::bail!("git {} timed out after 60s", args.join(" ")),
     }
 }
 

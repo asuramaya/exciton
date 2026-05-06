@@ -13,3 +13,4 @@ config.vm.toml
 .DS_Store
 .claude/
 .playwright-mcp/
+.wrangler/

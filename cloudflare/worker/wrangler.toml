@@ -1,0 +1,44 @@
+# Worker config for the exciton public face.
+#
+# Deploys a single Worker at madapesai.com that serves:
+#   - GET /api/diary       — last N evolution events (KV-backed, edge-cached)
+#   - GET /api/calls       — active + recent closed calls (KV-backed, edge-cached)
+#   - GET /api/strategy    — current effective tunables (KV-backed, edge-cached)
+#   - POST /api/admin/publish — HMAC-signed write from the engine's publisher
+#   - GET /health          — readiness probe
+#
+# Operators forking this for their own ape:
+#   1. `wrangler kv namespace create <your-ape>-state` and replace the id below
+#   2. `wrangler secret put PUBLISH_SECRET` (matches CF_PUBLISH_SECRET on the engine)
+#   3. `wrangler deploy`
+#   4. (Optional) attach a custom domain via the CF dashboard or `wrangler triggers`.
+
+name = "exciton-edge"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Production routes. The Worker intercepts /api/* on the apex domain;
+# everything else on madapesai.com falls through to the Pages project.
+# Fork operators: replace with your own zone or remove this block to
+# run on *.workers.dev only.
+routes = [
+  { pattern = "madapesai.com/api/*", zone_name = "madapesai.com" }
+]
+
+# KV namespace holding the published state blobs. The id below points at
+# the namespace `wrangler kv namespace create exciton-state` provisioned
+# on the asuramaya.hq account; fork operators replace this with their own.
+kv_namespaces = [
+  { binding = "STATE", id = "f23e0d40b28a4455ab65350bf0fffa61" }
+]
+
+# Tunables surfaced as Worker vars (non-secret). PUBLISH_SECRET is set
+# separately via `wrangler secret put PUBLISH_SECRET` so it never lands
+# in the repo.
+[vars]
+PUBLIC_CACHE_SECONDS_DIARY = "30"
+PUBLIC_CACHE_SECONDS_CALLS = "30"
+PUBLIC_CACHE_SECONDS_STRATEGY = "300"
+HMAC_MAX_SKEW_SECONDS = "300"

@@ -115,17 +115,6 @@ pub struct MadapesConfig {
     /// fetch a live price. Set conservatively.
     #[serde(default = "default_sol_price_fallback")]
     pub sol_price_fallback_usd: f64,
-    /// Recraft API key for generating thought-note images. Optional — when
-    /// absent, the image processor is disabled and placeholders remain as
-    /// meta-captions only. Keep this server-side; never commit to the
-    /// public repo.
-    #[serde(default)]
-    pub recraft_api_key: String,
-    /// How often the image processor scans thoughts/ for new placeholders.
-    /// Independent from the data publisher's cadence — images are a rare
-    /// event (one per note addition) so a slower tick keeps API calls low.
-    #[serde(default = "default_image_interval")]
-    pub image_interval_seconds: u64,
     /// Featured-token mint — the project's own token, surfaced in a
     /// pinned section at the top of the site with live market data and
     /// the ape wallet's holding percentage. Empty disables the section.
@@ -135,6 +124,16 @@ pub struct MadapesConfig {
     /// Optional; when empty, the button is hidden.
     #[serde(default)]
     pub featured_buy_url: String,
+    /// Cloudflare Worker URL the publisher POSTs consolidated state
+    /// snapshots to (e.g. `https://madapesai.com/api/admin/publish`).
+    /// Required when `enabled = true` — the engine no longer carries a
+    /// git-push fallback. `repo_path` is the local staging dir for the
+    /// JSON files that get bundled into the POST body.
+    pub cf_publish_url: String,
+    /// Shared HMAC-SHA256 secret matching the Worker's `PUBLISH_SECRET`.
+    /// Supports `${ENV_VAR}` expansion so the secret stays out of the
+    /// committed config. Required when `enabled = true`.
+    pub cf_publish_secret: String,
 }
 
 fn default_publish_interval() -> u64 {
@@ -142,9 +141,6 @@ fn default_publish_interval() -> u64 {
 }
 fn default_sol_price_fallback() -> f64 {
     150.0
-}
-fn default_image_interval() -> u64 {
-    900
 }
 fn default_jito_tip() -> u64 {
     100_000

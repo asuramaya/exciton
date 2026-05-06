@@ -37,5 +37,5 @@ enabled = true
 repo_path = "${MADAPES_REPO_PATH}"
 interval_seconds = 300
 sol_price_fallback_usd = 150.0
-recraft_api_key = "${RECRAFT_API_KEY}"
-image_interval_seconds = 900
+cf_publish_url = "${CF_PUBLISH_URL}"
+cf_publish_secret = "${CF_PUBLISH_SECRET}"

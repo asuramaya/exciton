@@ -14,7 +14,6 @@ services:
     volumes:
       - ${EXCITON_STATE_DIR:-./state}:/data
       - ${PUBLISHER_REPO_DIR:-./publisher-target}:/srv/publisher-target
-      - ${EXCITON_SSH_DIR:-./ssh}:/root/.ssh
       - ${EXCITON_CONFIG_PATH:-./deploy/config.container.toml.example}:/etc/exciton/config.toml:ro
     stdin_open: true
     tty: true

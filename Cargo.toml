@@ -58,6 +58,13 @@ chrono = { version = "0.4", features = ["serde"] }
 bs58 = "0.5"
 base64 = "0.22"
 bincode = "1"
+# HMAC-SHA256 + hex encoding for the publisher's signed POST to the
+# Cloudflare Worker (`/api/admin/publish`). The Worker validates the
+# signature with the same scheme; without these we'd be re-implementing
+# SHA-256 by hand.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 # plotters dropped 2026-05-02 PM — replaced by chromium-headless DexScreener
 # screenshot via chart_screenshot.rs. The plotters sparkline rendered from
 # our internal token_snapshots series only had 2 data points at call time,

@@ -77,9 +77,12 @@ evolution_chat_id = -100...  # where claw publishes diary entries
 public_bot_username = "your_public_bot"
 private_bot_username = "your_private_bot"
 
-[publisher]
-repo_path = "/srv/publisher-target"   # mounted volume
-featured_mint = "..."        # optional pinned token
+[madapes]
+enabled = true
+repo_path = "/srv/publisher-target"           # local staging dir
+cf_publish_url = "https://your-domain.com/api/admin/publish"
+cf_publish_secret = "${CF_PUBLISH_SECRET}"   # matches Worker's PUBLISH_SECRET
+featured_mint = ""                            # optional pinned token
 
 [rpc]
 endpoints = [
@@ -87,21 +90,35 @@ endpoints = [
 ]
 ```
 
-## 4. SSH key for the publisher
+## 4. Stand up the public face on Cloudflare
 
-The publisher pushes via git. Inside the container the user is `exciton`; mount your deploy key into `/home/exciton/.ssh`:
+The publisher ships JSON state to a Cloudflare Worker (HMAC-signed POST), which writes it to KV. The static shell on Cloudflare Pages reads from the Worker. Everything fits inside the free tier — see [`deploy/CLOUDFLARE.md`](../deploy/CLOUDFLARE.md) for the full walkthrough.
+
+Quick version:
 
 ```bash
-mkdir -p ssh
-ssh-keygen -t ed25519 -N "" -f ssh/publisher_deploy
-# Add ssh/publisher_deploy.pub as a deploy key on your site's git repo (write access).
-cat > ssh/config <<EOF
-Host github-publisher
-  HostName github.com
-  User git
-  IdentityFile /home/exciton/.ssh/publisher_deploy
-  StrictHostKeyChecking no
-EOF
+# from the repo root
+npm install -g wrangler        # one-time
+wrangler login
+
+# provision KV + Worker
+cd cloudflare/worker
+wrangler kv namespace create <your-ape>-state
+# paste the returned id into wrangler.toml's kv_namespaces
+
+openssl rand -hex 32 > /tmp/pub_secret
+wrangler secret put PUBLISH_SECRET    # paste the same value
+wrangler deploy
+
+# static shell
+cd ../..
+wrangler pages deploy cloudflare/pages --project-name=<your-ape>
+```
+
+Wire `<your-domain>` to the Pages project and add a Worker route for `<your-domain>/api/*` in the Cloudflare dashboard. Then add the secret to your engine's `.env`:
+
+```bash
+echo "CF_PUBLISH_SECRET=$(cat /tmp/pub_secret)" >> .env
 ```
 
 ## 5. Authorize claw
@@ -173,7 +190,7 @@ The public channel auto-posts new calls + milestone updates.
 - `./state/exciton.db` — calls, snapshots, autonomy state. Back this up.
 - `./claw-auth/auth.json` — claw's OAuth profile. Treat as a secret.
 - `./config.toml` — your operator config. Treat as a secret.
-- `./ssh/` — your publisher deploy key.
+- The KV namespace on Cloudflare — published state. Recoverable from a fresh publisher tick if lost.
 
 ## Rotation / migration
 

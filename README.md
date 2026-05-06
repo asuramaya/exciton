@@ -77,10 +77,10 @@ The output is a stream of:
                 └─────┬───────────┬──────────────┬────────┘
                       │           │              │
                 Channel posts  JSON +        LLM operator
-                              git push       (Claude, etc.)
+                              CF Worker     (Claude, etc.)
                                   │
                                   ▼
-                          public site repo
+                          edge KV + Pages
                        (your demo / dashboard)
 ```
 
@@ -93,7 +93,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the signal pipeline, clas
 - Rust 1.88+ (edition 2021)
 - A Solana RPC endpoint — free tiers from [Helius](https://helius.dev), [Alchemy](https://alchemy.com), or [QuickNode](https://quicknode.com) all work
 - Optional: a Telegram bot token if you want notifications
-- Optional: a target git repo for the JSON publisher
+- Optional: a Cloudflare account (free tier) for the public face — see [`deploy/CLOUDFLARE.md`](deploy/CLOUDFLARE.md)
 
 ### Build + run
 
@@ -129,7 +129,9 @@ endpoints = ["https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"]
 enabled = false   # flip to true once you have a bot
 
 [madapes]
-enabled = false   # flip to true and set repo_path to publish JSON snapshots
+enabled = false   # flip to true to publish snapshots to your CF Worker
+# cf_publish_url = "https://your-domain.com/api/admin/publish"
+# cf_publish_secret = "${CF_PUBLISH_SECRET}"
 ```
 
 See [`config.example.toml`](config.example.toml) for the full annotated reference.
@@ -142,7 +144,7 @@ Key sections:
 
 - `[rpc]` — list of Solana RPC endpoints (round-robin + auto-failover)
 - `[telegram]` — bot tokens, chat IDs, public/private bot usernames, public site URL
-- `[madapes]` — JSON publisher target (a local git checkout that gets pushed every 300s)
+- `[madapes]` — JSON publisher: stages snapshots to a local dir, ships them via HMAC-signed POST to a Cloudflare Worker every 300s
 - `[risk]` — position sizing (only consulted by the optional execution module)
 - `[alerts]` — confidence thresholds for auto-call gates
 - `[mcp]` — MCP server toggle (default on)
@@ -182,20 +184,21 @@ Disable with `EXCITON_DISABLE_MCP=1` if you want a headless deploy.
 
 ## Publisher
 
-The publisher snapshot loop runs every 300s and writes JSON files into a target git repo, then commits + pushes:
+The publisher snapshot loop runs every 300s. Each tick it writes the JSON files into a local staging dir, then ships the consolidated state to a Cloudflare Worker via an HMAC-signed POST:
 
 ```
-<repo_path>/
-├── data/
-│   ├── calls.json          # active + historical calls with PnL
-│   ├── scouts/<mint>.json  # per-token scout reports
-│   ├── whales/<mint>.json  # per-token whale activity
-│   └── …
+<repo_path>/data/
+├── calls.json          # active + historical calls with PnL
+├── scout/<mint>.json   # per-token scout reports
+├── whales/<mint>.json  # per-token whale activity
+└── …
 ```
 
-Set `[madapes] enabled = true` and `repo_path = "/path/to/your/public/site/checkout"`. The container runs `git add -A && git commit && git push` using whatever git credentials are present in the working directory (deploy key, gh CLI, etc.).
+The Worker writes each present key (`diary`, `calls`, `strategy`) to KV; the public read endpoints (`/api/diary`, `/api/calls`, `/api/strategy`) serve them with edge cache. The MCP surface stays bound to `localhost` — exposing it publicly would let anyone burn your RPC budget.
 
-[madapesai.com](https://madapesai.com) is a live example of the published JSON rendered as a static site.
+To wire it up: follow [`deploy/CLOUDFLARE.md`](deploy/CLOUDFLARE.md) (fits inside Cloudflare's free tier), set `[madapes] enabled = true` with `cf_publish_url` + `cf_publish_secret` in your `config.toml`, restart the engine.
+
+[madapesai.com](https://madapesai.com) is the live reference deployment.
 
 ## Project layout
 
@@ -211,7 +214,7 @@ src/
   notifier.rs          Telegram channel layer
   bot.rs               Telegram DM bot (long-poll, two surfaces)
   intel.rs             deep-evidence bundles for individual tokens
-  publisher.rs         JSON snapshot loop + git push
+  publisher.rs         JSON snapshot loop + Cloudflare Worker push
   mcp.rs               MCP server (tools, schema, transport)
   market.rs            DexScreener-backed market data cache
   forecaster.rs        confidence aggregation

@@ -94,24 +94,30 @@ claw_api_secret = ""
 claw_api_port = 8081
 
 # ─────────────────────────────────────────────────────────────
-# Publisher — writes JSON snapshots into a target git repo.
-# Omit the section to disable. The target repo must already be
-# a git checkout with push credentials available in the env.
+# Publisher — snapshots the operating wallet to JSON, then ships
+# the bundle via an HMAC-signed POST to a Cloudflare Worker.
+# The Worker writes each present key to KV; the public read API
+# (/api/diary, /api/calls, /api/strategy) serves them with edge
+# cache. Omit the [madapes] section to disable publishing.
 # ─────────────────────────────────────────────────────────────
 [madapes]
 enabled = false
-# Absolute path to the target repo checkout (e.g. your public site).
+# Local staging dir for the JSON files the publisher bundles into
+# the POST body. Any writable path works — does not need to be a
+# git checkout.
 repo_path = "${MADAPES_REPO_PATH}"
 # Publish cadence in seconds.
 interval_seconds = 300
 # Fallback SOL/USD when live price fetch fails.
 sol_price_fallback_usd = 150.0
-# Optional Recraft API key for thought-note image generation.
-recraft_api_key = "${RECRAFT_API_KEY}"
-image_interval_seconds = 900
 # Featured token (project's own coin) — pinned section on the site.
 featured_mint = ""
 featured_buy_url = ""
+# Cloudflare Worker URL the publisher POSTs to. Required when
+# `enabled = true`. Pair with `cf_publish_secret` (HMAC-SHA256
+# shared with the Worker's PUBLISH_SECRET).
+cf_publish_url = "https://your-domain.com/api/admin/publish"
+cf_publish_secret = "${CF_PUBLISH_SECRET}"
 
 # ─────────────────────────────────────────────────────────────
 # Execution — trade execution. EXPERIMENTAL.

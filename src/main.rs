@@ -28,7 +28,6 @@ mod discovery_pollers;
 mod execution;
 mod forecaster;
 mod horizon;
-mod image_gen;
 mod ingester;
 mod intel;
 mod launch_forensics;
@@ -43,7 +42,6 @@ mod wallet_observer;
 mod scout;
 mod signals;
 mod templates;
-mod thought_images;
 
 use config::Config;
 use db::Db;
@@ -105,7 +103,7 @@ async fn main() -> Result<()> {
     }
     if let Some(mp) = config.madapes.as_mut() {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
-        mp.recraft_api_key = ingester::resolve_env_vars(&mp.recraft_api_key);
+        mp.cf_publish_secret = ingester::resolve_env_vars(&mp.cf_publish_secret);
     }
     tracing::info!("Exciton starting");
 
@@ -534,18 +532,6 @@ async fn main() -> Result<()> {
                 db.clone(),
             ));
             pub_instance.spawn(publish_kick.clone());
-
-            // Thought-image processor runs beside the publisher. Only starts
-            // when a Recraft key is present — no accidental API burn on
-            // local dev without credentials.
-            if !mp.recraft_api_key.is_empty() {
-                let img_proc = Arc::new(thought_images::ThoughtImageProcessor::new(
-                    PathBuf::from(&mp.repo_path),
-                    mp.image_interval_seconds,
-                    mp.recraft_api_key.clone(),
-                ));
-                img_proc.spawn();
-            }
         } else {
             tracing::info!("publisher configured but disabled");
         }

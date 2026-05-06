@@ -112,20 +112,6 @@ pub struct WalletXrayParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PostNoteParams {
-    /// Human-readable title — becomes the thought_title on the site.
-    pub title: String,
-    /// Full markdown body. Image placeholders in the form
-    /// `<div class="img-placeholder">[IMAGE: caption]</div>` get picked up
-    /// by the image processor on its next tick.
-    pub body: String,
-    /// Optional filename slug — kebab-case. Auto-derived from the title
-    /// when omitted.
-    #[serde(default)]
-    pub slug: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FireCallParams {
     /// Mint address of the token being called.
     pub mint: String,
@@ -708,32 +694,6 @@ struct Position {
     pnl_pct: f64,
 }
 
-/// Turn a human title into a kebab-case slug — lowercase ASCII, dashes
-/// between word boundaries, nothing fancy. Used by `post_note` when the
-/// caller doesn't provide a slug explicitly.
-fn slugify(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
-    let mut prev_dash = true;
-    for c in title.chars() {
-        if c.is_alphanumeric() {
-            for lo in c.to_lowercase() {
-                out.push(lo);
-            }
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        out.push_str("note");
-    }
-    out
-}
-
 fn to_json<T: Serialize>(data: &T) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("Error: {e}"))
 }
@@ -1290,23 +1250,6 @@ impl ExcitonServer {
                 }
                 None => ("(madapes disabled)".to_string(), -1),
             };
-        // -1 = disabled (no recraft key). Front-end pipeline_health
-        // reports "stale" for any positive number above the threshold;
-        // -1 means we shouldn't flag it stale at all (the processor
-        // intentionally isn't running).
-        let assets_age_seconds: i64 = match self.config.madapes.as_ref() {
-            Some(mp) if !mp.recraft_api_key.is_empty() => {
-                let p = format!("{}/thoughts/assets.json", mp.repo_path);
-                std::fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(-1)
-            }
-            _ => -1,
-        };
-
         // Scanner / alert activity — newest alert ts.
         let last_alert_ts: i64 = {
             let alerts = self.db.get_pending_alerts(1).unwrap_or_default();
@@ -1342,9 +1285,6 @@ impl ExcitonServer {
                 } else {
                     "fresh"
                 },
-            },
-            "image_processor": {
-                "manifest_age_seconds": assets_age_seconds,
             },
             "scanner": {
                 "newest_alert_age_seconds": last_alert_age,
@@ -1399,78 +1339,6 @@ impl ExcitonServer {
             })
             .to_string(),
         }
-    }
-
-    /// Append a new note to the publisher repo's `thoughts/` folder, update the index, commit
-    /// with the `note:` prefix and push. Respects append-only — fails with
-    /// an error if the target filename already exists. The image processor
-    /// picks up any `<div class="img-placeholder">[IMAGE: ...]</div>` blocks
-    /// on its next 15-minute tick (no action needed here).
-    #[tool]
-    async fn post_note(&self, Parameters(params): Parameters<PostNoteParams>) -> String {
-        let _ = self.db.audit_log("claude", "post_note", &params.title);
-        let Some(mp) = self.config.madapes.clone() else {
-            return "{\"error\":\"madapes config missing\"}".to_string();
-        };
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let slug = params.slug.unwrap_or_else(|| slugify(&params.title));
-        let file = format!("{}_{}.md", date, slug);
-        let thoughts_dir = std::path::PathBuf::from(&mp.repo_path).join("thoughts");
-        let path = thoughts_dir.join(&file);
-
-        if path.exists() {
-            return serde_json::json!({
-                "error": "filename collision — note already exists",
-                "path": path.to_string_lossy(),
-            })
-            .to_string();
-        }
-        if let Err(e) = std::fs::write(&path, &params.body) {
-            return serde_json::json!({ "error": format!("write failed: {}", e) }).to_string();
-        }
-
-        // Update the index.json — preserve existing order, prepend newest.
-        let index_path = thoughts_dir.join("index.json");
-        let mut index_val: serde_json::Value = std::fs::read_to_string(&index_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({"thoughts": []}));
-        let arr = index_val.get_mut("thoughts").and_then(|v| v.as_array_mut());
-        if let Some(arr) = arr {
-            arr.insert(
-                0,
-                serde_json::json!({
-                    "date": date,
-                    "file": file,
-                    "title": params.title,
-                }),
-            );
-        }
-        let _ = std::fs::write(
-            &index_path,
-            serde_json::to_string_pretty(&index_val).unwrap_or_default(),
-        );
-
-        // git add + commit + push with the `note:` prefix. Each git op
-        // capped at 60s via tokio::process + timeout — same pattern as
-        // publisher::run_git, prevents hung pushes from blocking the
-        // MCP tool indefinitely (and stealing a tokio worker thread).
-        let repo = &mp.repo_path;
-        let msg = format!("note: {}", params.title);
-        let _ = run_git_with_timeout(&["-C", repo, "add", "thoughts/"]).await;
-        let commit = run_git_with_timeout(&["-C", repo, "commit", "-m", &msg]).await;
-        let committed = commit.as_ref().map(|o| o.status.success()).unwrap_or(false);
-        if committed {
-            let _ = run_git_with_timeout(&["-C", repo, "push", "--quiet"]).await;
-        }
-
-        serde_json::json!({
-            "file": file,
-            "path": path.to_string_lossy(),
-            "committed": committed,
-            "next_tick": "image processor will pick up placeholders within 15 min",
-        })
-        .to_string()
     }
 
     /// Fire a public call — freezes the entry state (mcap, price, liquidity,
@@ -2769,11 +2637,11 @@ impl ExcitonServer {
             ),
         );
 
-        // Broadcast: post to evolution channel + write markdown to the
-        // publisher's thoughts dir + git push. Failures here are NON-fatal
-        // — the evolution row is already in DB, so the website diary will
-        // pick it up on the next sync, and a channel re-post can be done
-        // manually by reading the row.
+        // Broadcast: post to evolution channel. The evolution_events
+        // row is the source of truth — the publisher's next tick reads
+        // it and ships the diary feed to the Cloudflare Worker.
+        // Failures here are NON-fatal: the row is already in DB so a
+        // missed channel post can be re-sent manually.
         let publish = self
             .publish_evolution(evo_id, "STRATEGY", &summary, body)
             .await;
@@ -4116,7 +3984,7 @@ impl ExcitonServer {
         body_md: &str,
     ) -> serde_json::Value {
         let mut channel_msg_id: Option<i64> = None;
-        let mut diary_path: Option<String> = None;
+        let diary_path: Option<String> = None;
         let mut errors: Vec<String> = Vec::new();
         let now = chrono::Utc::now().timestamp();
 
@@ -4181,73 +4049,10 @@ impl ExcitonServer {
             }
         }
 
-        // Diary file write + git push to the publisher repo.
-        if let Some(mp) = self.config.madapes.clone() {
-            if mp.enabled && !mp.repo_path.is_empty() {
-                let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                let slug = slugify(summary);
-                let file = format!("{}_evo-{}-{}.md", date, kind_label.to_lowercase(), slug);
-                let thoughts_dir = std::path::PathBuf::from(&mp.repo_path).join("thoughts");
-                if let Err(e) = std::fs::create_dir_all(&thoughts_dir) {
-                    errors.push(format!("diary mkdir: {}", e));
-                } else {
-                    let path = thoughts_dir.join(&file);
-                    let title = format!("EVOLVED — {kind_label} · {summary}");
-                    let frontmatter = format!(
-                        "---\nkind: evolution\ncategory: {}\ndate: {}\nevolution_event_id: {}\ntitle: {}\n---\n\n",
-                        kind_label.to_lowercase(),
-                        date,
-                        evo_id,
-                        title
-                    );
-                    let contents = format!("{}{}\n", frontmatter, body_md);
-                    if let Err(e) = std::fs::write(&path, &contents) {
-                        errors.push(format!("diary write: {}", e));
-                    } else {
-                        diary_path = Some(format!("thoughts/{}", file));
-                        // Update index.json so the front end picks it up.
-                        let index_path = thoughts_dir.join("index.json");
-                        let mut index_val: serde_json::Value = std::fs::read_to_string(&index_path)
-                            .ok()
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_else(|| serde_json::json!({"thoughts": []}));
-                        if let Some(arr) =
-                            index_val.get_mut("thoughts").and_then(|v| v.as_array_mut())
-                        {
-                            arr.insert(
-                                0,
-                                serde_json::json!({
-                                    "date": date,
-                                    "file": file,
-                                    "title": title,
-                                    "kind": "evolution",
-                                    "category": kind_label.to_lowercase(),
-                                }),
-                            );
-                        }
-                        let _ = std::fs::write(
-                            &index_path,
-                            serde_json::to_string_pretty(&index_val).unwrap_or_default(),
-                        );
-                        let repo = &mp.repo_path;
-                        let msg = format!("evo: {kind_label} · {summary}");
-                        let _ = run_git_with_timeout(&["-C", repo, "add", "thoughts/"]).await;
-                        let commit =
-                            run_git_with_timeout(&["-C", repo, "commit", "-m", &msg]).await;
-                        let committed =
-                            commit.as_ref().map(|o| o.status.success()).unwrap_or(false);
-                        if committed {
-                            let _ = run_git_with_timeout(&["-C", repo, "push", "--quiet"]).await;
-                        } else if let Ok(out) = commit {
-                            errors.push(format!(
-                                "diary commit non-zero: {}",
-                                String::from_utf8_lossy(&out.stderr).trim()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        // The evolution_events row is the source of truth; the
+        // publisher's next tick reads it via list_evolution_events
+        // and POSTs the diary feed to the Cloudflare Worker. No
+        // file-system write here — the legacy git-pages rail is gone.
 
         if let Err(e) = self.db.update_evolution_posted(
             evo_id,
@@ -4842,17 +4647,3 @@ impl ServerHandler for ExcitonServer {
     }
 }
 
-/// Async git invocation with a hard 60s timeout. Mirrors the helper in
-/// publisher.rs / thought_images.rs — keeps a stalled `git push` from
-/// blocking an MCP tool call (and the underlying tokio worker thread).
-async fn run_git_with_timeout(args: &[&str]) -> Result<std::process::Output, anyhow::Error> {
-    use std::time::Duration;
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args);
-    let fut = cmd.output();
-    match tokio::time::timeout(Duration::from_secs(60), fut).await {
-        Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) => Err(anyhow::anyhow!("git spawn: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("git {} timed out after 60s", args.join(" "))),
-    }
-}
