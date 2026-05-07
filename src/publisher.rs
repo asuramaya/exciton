@@ -331,7 +331,7 @@ impl Publisher {
                         tracing::info!("Publisher: data snapshot pushed")
                     }
                     Ok(Ok(_)) => tracing::info!("Publisher: no data change"),
-                    Ok(Err(e)) => tracing::warn!("Publisher failed: {}", e),
+                    Ok(Err(e)) => tracing::warn!("Publisher failed: {:#}", e),
                     Err(_) => tracing::warn!("Publisher: tick exceeded 60s budget — abandoning"),
                 }
             }
@@ -1600,6 +1600,7 @@ impl Publisher {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .user_agent(concat!("exciton-publisher/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build reqwest client")?;
         let resp = client
