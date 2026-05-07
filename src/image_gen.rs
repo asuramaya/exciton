@@ -1,11 +1,11 @@
 //! Image generation for diary entries.
 //!
 //! Architectural rule: bytes never touch the Cloudflare Worker.
-//! - Engine on the docker box owns the OpenAI key + R2 credentials.
-//! - Engine renders via OpenAI gpt-image-1, PUTs the PNG to R2 via
-//!   S3-sigv4, then writes only the public URL into `thoughts/assets.json`.
-//! - Publisher's normal data tick ships `assets.json` to the Worker; the
-//!   page reads it from `/api/data/thoughts_assets`.
+//! - Engine on the docker box owns the Recraft key + R2 credentials.
+//! - Engine renders via Recraft v3, PUTs the PNG to R2 via S3-sigv4,
+//!   then writes only the public URL into `thoughts/assets.json`.
+//! - Publisher's normal data tick ships `assets.json` to the Worker;
+//!   the page reads it from `/api/data/thoughts_assets`.
 //!
 //! Decoupled from the publisher tick: this loop runs on its own
 //! cadence so a slow image render can't stall a 60s publisher budget.
@@ -33,7 +33,7 @@ pub fn spawn(cfg: Arc<MadapesConfig>) {
         || cfg.r2_access_key_id.is_empty()
         || cfg.r2_secret_access_key.is_empty()
         || cfg.cdn_base_url.is_empty()
-        || cfg.image_gen_api_key.is_empty()
+        || cfg.recraft_api_key.is_empty()
     {
         tracing::info!("image_gen: disabled (one or more credentials/URLs missing)");
         return;
@@ -104,7 +104,14 @@ async fn run_once(client: &reqwest::Client, cfg: &MadapesConfig) -> Result<u32> 
         let prompt = prompts
             .get(next_idx as usize)
             .ok_or_else(|| anyhow!("not enough prompts for idx {}", next_idx))?;
-        let png = render_image(client, &cfg.image_gen_api_key, &cfg.image_gen_model, prompt).await?;
+        let png = render_image(
+            client,
+            &cfg.recraft_api_key,
+            &cfg.recraft_model,
+            &cfg.recraft_style,
+            prompt,
+        )
+        .await?;
         let key = format!("thoughts/{}_{:02}.png", slug, next_idx);
         put_r2(client, cfg, &key, &png, "image/png").await?;
         let url = format!("{}/{}", cfg.cdn_base_url.trim_end_matches('/'), key);
@@ -188,36 +195,38 @@ fn build_prompts(md: &str, n: usize) -> Option<(String, Vec<String>)> {
     Some((slug, prompts))
 }
 
-/// Call OpenAI gpt-image-1 (response is base64 PNG).
+/// Call Recraft v3. Returns PNG bytes.
 async fn render_image(
     client: &reqwest::Client,
     api_key: &str,
     model: &str,
+    style: &str,
     prompt: &str,
 ) -> Result<Vec<u8>> {
     let body = json!({
         "model": model,
+        "style": style,
         "prompt": prompt,
         "n": 1,
         "size": "1024x1024",
-        "quality": "medium",
+        "response_format": "b64_json",
     });
     let resp = client
-        .post("https://api.openai.com/v1/images/generations")
+        .post("https://external.api.recraft.ai/v1/images/generations")
         .bearer_auth(api_key)
         .json(&body)
         .send()
         .await
-        .context("openai images.generations")?;
+        .context("recraft images.generations")?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("openai image gen {}: {}", status, text);
+        anyhow::bail!("recraft image gen {}: {}", status, text);
     }
-    let v: Value = serde_json::from_str(&text).context("parse images.generations response")?;
+    let v: Value = serde_json::from_str(&text).context("parse recraft response")?;
     let b64 = v["data"][0]["b64_json"]
         .as_str()
-        .ok_or_else(|| anyhow!("openai response missing data[0].b64_json"))?;
+        .ok_or_else(|| anyhow!("recraft response missing data[0].b64_json"))?;
     Ok(B64.decode(b64).context("decode b64 image")?)
 }
 

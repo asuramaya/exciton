@@ -154,13 +154,18 @@ pub struct MadapesConfig {
     /// `<cdn_base_url>/<key>`.
     #[serde(default)]
     pub cdn_base_url: String,
-    /// OpenAI API key for image generation (Chat for captions +
-    /// gpt-image-1 for renders). Supports `${ENV_VAR}` expansion.
+    /// Recraft API key for image generation. Supports `${ENV_VAR}`
+    /// expansion. Empty disables image gen.
     #[serde(default)]
-    pub image_gen_api_key: String,
-    /// Image model id. Defaults to `gpt-image-1`.
-    #[serde(default = "default_image_gen_model")]
-    pub image_gen_model: String,
+    pub recraft_api_key: String,
+    /// Recraft model id. Defaults to `recraftv3`.
+    #[serde(default = "default_recraft_model")]
+    pub recraft_model: String,
+    /// Recraft style — `digital_illustration`, `realistic_image`,
+    /// `vector_illustration`, `icon`. Defaults to digital_illustration
+    /// to match the legacy ape-diary visual language.
+    #[serde(default = "default_recraft_style")]
+    pub recraft_style: String,
     /// How many images to generate per diary entry.
     #[serde(default = "default_images_per_entry")]
     pub images_per_entry: u32,
@@ -177,8 +182,11 @@ fn default_publish_interval() -> u64 {
 fn default_sol_price_fallback() -> f64 {
     150.0
 }
-fn default_image_gen_model() -> String {
-    "gpt-image-1".to_string()
+fn default_recraft_model() -> String {
+    "recraftv3".to_string()
+}
+fn default_recraft_style() -> String {
+    "digital_illustration".to_string()
 }
 fn default_images_per_entry() -> u32 {
     3

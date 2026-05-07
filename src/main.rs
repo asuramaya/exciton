@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         mp.cf_publish_secret = ingester::resolve_env_vars(&mp.cf_publish_secret);
         mp.r2_access_key_id = ingester::resolve_env_vars(&mp.r2_access_key_id);
         mp.r2_secret_access_key = ingester::resolve_env_vars(&mp.r2_secret_access_key);
-        mp.image_gen_api_key = ingester::resolve_env_vars(&mp.image_gen_api_key);
+        mp.recraft_api_key = ingester::resolve_env_vars(&mp.recraft_api_key);
     }
     tracing::info!("Exciton starting");
 
