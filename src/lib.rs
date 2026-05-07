@@ -40,6 +40,7 @@ pub mod notifier;
 pub mod publisher;
 pub mod pumpportal;
 pub mod scanner;
+pub mod wallet_cache;
 pub mod wallet_observer;
 pub mod scout;
 pub mod signals;
