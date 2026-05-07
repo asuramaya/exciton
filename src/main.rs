@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
     }
     if let Some(mp) = config.madapes.as_mut() {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
+        mp.cf_publish_url = ingester::resolve_env_vars(&mp.cf_publish_url);
         mp.cf_publish_secret = ingester::resolve_env_vars(&mp.cf_publish_secret);
     }
     tracing::info!("Exciton starting");
