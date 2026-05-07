@@ -2,7 +2,7 @@
 
 **OSS crypto-influencer engine for Solana.** A deterministic on-chain scanner + LLM-driven autonomous-trading agent in a single Rust workspace. One codebase, many instances — every operator runs their own ape with their own wallet, persona, Telegram surface, and published site.
 
-[madapesai.com](https://madapesai.com) is the reference deployment, not the product. The product is the engine that lets you spin up a different ape on the same code.
+[madapesai.com](https://madapesai.com) is the reference deployment, not the product. The product is the engine that lets you spin up a different ape on the same code. The public shell for that reference deployment now lives in this repo under [`cloudflare/pages`](cloudflare/pages).
 
 > **Status:** Active. Used in production by the original author; APIs and config schema may shift between minor versions. Pin a commit if you depend on stability.
 
@@ -51,7 +51,7 @@ Every read is on-chain (or DexScreener for cached market data). **No LLM is in t
 The output is a stream of:
 
 1. **Telegram cards** — call cards, signal cards, hourly digests posted to configured channels
-2. **JSON snapshots** — `data/calls.json`, scout reports, whale snapshots — committed to a target git repo (your public-facing site)
+2. **JSON snapshots** — `data/calls.json`, scout reports, whale snapshots — written to a local publish dir and shipped to the public site surface
 3. **MCP tools** — exposes the entire scanner to any MCP-speaking LLM client (Claude, Cursor, etc.) so an operator can drive the system in natural language: query state, trigger scans, inspect tokens, manage calls
 
 ## Architecture
@@ -198,7 +198,7 @@ The Worker writes each present key (`diary`, `calls`, `strategy`) to KV; the pub
 
 To wire it up: follow [`deploy/CLOUDFLARE.md`](deploy/CLOUDFLARE.md) (fits inside Cloudflare's free tier), set `[madapes] enabled = true` with `cf_publish_url` + `cf_publish_secret` in your `config.toml`, restart the engine.
 
-[madapesai.com](https://madapesai.com) is the live reference deployment.
+[madapesai.com](https://madapesai.com) is the live reference deployment, sourced from this repo's `cloudflare/pages` tree.
 
 ## Project layout
 

@@ -8,7 +8,7 @@ A single Rust binary (`exciton`) that runs as a long-lived service:
 
 - **Scanner + ingester**: walks pump.fun + PumpSwap, computes signal scores, writes to SQLite
 - **Notifier**: posts public calls to a Telegram channel; takes operator commands in a private DM bot
-- **Publisher**: pushes call snapshots + diary entries to a static-site repo (your `your-site.com` source repo)
+- **Publisher**: writes call snapshots + diary entries to a local publish dir, then ships them to the Cloudflare-backed public site
 - **MCP server**: exposes the autonomy surface on a private port for `claw` to drive
 - **claw** (separate binary in the same image): the autonomous agent — runs on a cron, reviews the closed-call tape, proposes strategy tunes, optionally publishes diary evolutions
 
@@ -19,7 +19,7 @@ A single Rust binary (`exciton`) that runs as a long-lived service:
 - A DexScreener-friendly internet connection (no special API key required).
 - Two Telegram bots (one public channel-poster, one private DM bot for operator commands). Get tokens via @BotFather.
 - A wallet keypair for the ape (paper-only mode works without one — execution is opt-in).
-- A target Git repo for the publisher to push to (your "site source" repo).
+- A local publish directory for the publisher staging files.
 - An OpenAI ChatGPT account (Plus/Pro) OR an OpenAI API key for `claw`.
 
 ## 1. Pull the image
@@ -51,7 +51,7 @@ services:
       EXCITON_DB_PATH: /data/exciton.db
     volumes:
       - ./state:/data
-      - ./your-site:/srv/publisher-target
+      - ./publisher-target:/srv/publisher-target
       - ./ssh:/home/exciton/.ssh:ro
       - ./claw-auth:/home/exciton/.exciton
       - ./config.toml:/etc/exciton/config.toml:ro
@@ -79,7 +79,7 @@ private_bot_username = "your_private_bot"
 
 [madapes]
 enabled = true
-repo_path = "/srv/publisher-target"           # local staging dir
+repo_path = "/srv/publisher-target"           # local staging dir for publisher output
 cf_publish_url = "https://your-domain.com/api/admin/publish"
 cf_publish_secret = "${CF_PUBLISH_SECRET}"   # matches Worker's PUBLISH_SECRET
 featured_mint = ""                            # optional pinned token
