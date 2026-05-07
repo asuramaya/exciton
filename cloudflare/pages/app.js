@@ -154,7 +154,7 @@ function renderHealth(h) {
   const banner = document.getElementById("stale-banner");
   if (banner && h.last_update) {
     const ageSec = Date.now() / 1000 - h.last_update;
-    const stale = ageSec > 12 * 60;
+    const stale = ageSec > 25 * 60;
     banner.hidden = !stale;
     if (stale) {
       banner.textContent = "publisher quiet — last pulse " + fmtTimeAgo(h.last_update);
