@@ -1,241 +1,144 @@
 # Exciton
 
-**OSS crypto-influencer engine for Solana.** A deterministic on-chain scanner + LLM-driven autonomous-trading agent in a single Rust workspace. One codebase, many instances — every operator runs their own ape with their own wallet, persona, Telegram surface, and published site.
+<p align="center">
+  <img src="docs/exciton.png" alt="Exciton mascot" width="520">
+</p>
 
-[madapesai.com](https://madapesai.com) is the reference deployment, not the product. The product is the engine that lets you spin up a different ape on the same code. The public shell for that reference deployment now lives in this repo under [`cloudflare/pages`](cloudflare/pages).
+<p align="center">
+  <a href="https://github.com/asuramaya/exciton/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/asuramaya/exciton/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/asuramaya/exciton/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/rust-1.88%2B-orange">
+  <img alt="Status" src="https://img.shields.io/badge/status-alpha-orange">
+  <img alt="MCP" src="https://img.shields.io/badge/mcp-first-7c3aed">
+</p>
 
-> **Status:** Active. Used in production by the original author; APIs and config schema may shift between minor versions. Pin a commit if you depend on stability.
+<p align="center">
+  <a href="https://madapesai.com"><b>Reference deployment</b></a> ·
+  <a href="https://github.com/asuramaya/exciton/blob/main/docs/DEPLOY.md">Deploy guide</a> ·
+  <a href="https://github.com/asuramaya/exciton/blob/main/docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="https://github.com/asuramaya/exciton/blob/main/deploy/CLOUDFLARE.md">Cloudflare</a>
+</p>
 
----
+> MCP-first Solana intelligence engine. Deterministic on-chain scanning,
+> signal scoring, Telegram surfaces, and a public publishing loop in one Rust
+> workspace.
 
-## Quickstart
+`exciton` is the engine. [`madapesai.com`](https://madapesai.com) is the live
+reference deployment built from it, and the public shell for that deployment
+now lives in this repo under [`cloudflare/pages`](cloudflare/pages).
+
+## What It Does
+
+- **Scans Solana continuously** across pump.fun and PumpSwap, picking up fresh mints, holder concentration, velocity, market depth, graduation state, and smart-wallet movement
+- **Keeps the signal path deterministic**: classification and scoring stay in Rust, on-chain and market-data driven, with no LLM in the signal pipeline
+- **Exposes multiple operator surfaces**: Telegram cards, a private MCP server, JSON snapshots, diary/state publishing, and a Cloudflare-backed public site
+- **Supports many instances from one codebase**: each operator can run their own wallet, persona, Telegram surface, publish target, and control loop
+
+## Quick Start
 
 ```bash
-# 1. Pull the image
+# Pull the image
 docker pull ghcr.io/asuramaya/exciton:latest
 
-# 2. Copy + edit the example config
+# Clone and copy the container config
 git clone https://github.com/asuramaya/exciton
 cp exciton/deploy/config.container.toml.example config.toml
-# edit config.toml: wallet, telegram tokens, publisher repo path, RPC endpoints
 
-# 3. Run
+# Run the engine
 docker run -d --name my-ape \
   -v "$(pwd)/state:/data" \
   -v "$(pwd)/config.toml:/etc/exciton/config.toml:ro" \
   -p 127.0.0.1:8082:8082 \
   ghcr.io/asuramaya/exciton:latest
 
-# 4. Authorize claw (the autonomy agent)
+# Authorize claw if you want the autonomous review surface
 docker exec -it my-ape claw login
 ```
 
 Full walkthrough: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
----
+## Surfaces
 
-## What it does
-
-Exciton scans Solana continuously for tradeable patterns:
-
-- **Discovery** — walks pump.fun + PumpSwap program signatures, picks up fresh mints as they're created
-- **Holder distribution** — computes top-N concentration, distribution scores, holder counts
-- **Velocity** — tx/min, multiples of baseline, momentum deltas
-- **Market depth** — DexScreener integration for price, liquidity, mcap, h1 volume
-- **Graduation** — detects bonding-curve → AMM transitions
-- **Smart-wallet tracking** — diffs curated wallets' SPL holdings, flags fresh buys
-- **Forensics** — deployer track record, sniper retention, cohort overlap
-
-Every read is on-chain (or DexScreener for cached market data). **No LLM is in the signal pipeline** — all classification is deterministic Rust.
-
-The output is a stream of:
-
-1. **Telegram cards** — call cards, signal cards, hourly digests posted to configured channels
-2. **JSON snapshots** — `data/calls.json`, scout reports, whale snapshots — written to a local publish dir and shipped to the public site surface
-3. **MCP tools** — exposes the entire scanner to any MCP-speaking LLM client (Claude, Cursor, etc.) so an operator can drive the system in natural language: query state, trigger scans, inspect tokens, manage calls
+| Surface | What it is for |
+| --- | --- |
+| **Scanner** | Discovery, scoring, re-analysis, digests, and token evidence collection |
+| **Telegram** | Public call cards plus private operator commands |
+| **Publisher** | Snapshot loop writing local state and shipping it to the public site |
+| **MCP** | Private tool surface for agents and operators to inspect state and drive the system |
+| **Cloudflare shell** | The public `madapesai.com` face under [`cloudflare/pages`](cloudflare/pages) |
 
 ## Architecture
 
-```
-            ┌─────────────────────────────────────────────────┐
-            │  Solana RPC (Helius / Alchemy / QuickNode / …)  │
-            └────────────────────────┬────────────────────────┘
-                                     │
-                ┌────────────────────▼────────────────────┐
-                │              EXCITON  (Rust)            │
-                │                                         │
-                │   discovery → signals → scanner loop    │
-                │                  │                      │
-                │     ┌────────────┼─────────────┐        │
-                │     ▼            ▼             ▼        │
-                │  Telegram     SQLite        MCP server  │
-                │  surfaces    (state)       (tool API)   │
-                │     │                          │        │
-                │     │       publisher          │        │
-                │     │           │              │        │
-                │     ▼           ▼              ▼        │
-                └─────┬───────────┬──────────────┬────────┘
-                      │           │              │
-                Channel posts  JSON +        LLM operator
-                              CF Worker     (Claude, etc.)
-                                  │
-                                  ▼
-                          edge KV + Pages
-                       (your demo / dashboard)
+```text
+Solana RPC / DexScreener
+          ↓
+       exciton
+  scanner · state · signals
+      ↙      ↓       ↘
+Telegram   JSON      MCP
+surface   publish   surface
+              ↓
+      Cloudflare Worker + Pages
+          madapesai.com
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the signal pipeline, classification taxonomy, and call lifecycle.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the signal pipeline,
+call lifecycle, and internal module split.
 
-## Quick start
+## Deployment Model
 
-### Requirements
+The intended deployment shape is:
 
-- Rust 1.88+ (edition 2021)
-- A Solana RPC endpoint — free tiers from [Helius](https://helius.dev), [Alchemy](https://alchemy.com), or [QuickNode](https://quicknode.com) all work
-- Optional: a Telegram bot token if you want notifications
-- Optional: a Cloudflare account (free tier) for the public face — see [`deploy/CLOUDFLARE.md`](deploy/CLOUDFLARE.md)
+1. `exciton` runs as the long-lived scanner/runtime
+2. the publisher stages local JSON output and ships it to the Cloudflare Worker
+3. the public shell in [`cloudflare/pages`](cloudflare/pages) reads from the Worker-backed endpoints
+4. the MCP surface stays private unless you intentionally expose and secure it
 
-### Build + run
-
-```bash
-git clone https://github.com/asuramaya/exciton.git
-cd exciton
-
-# Copy the templates and fill them in
-cp config.example.toml config.toml
-cp .env.example .env
-
-# Edit config.toml + .env with your RPC endpoint(s), bot token, etc.
-$EDITOR config.toml .env
-
-# Build (release)
-cargo build --release
-
-# Run
-./target/release/exciton
-```
-
-State (SQLite + WAL) is written to `exciton.db` in the working directory. Set `EXCITON_DB_PATH` to override.
-
-### Minimal config
-
-The smallest useful `config.toml` looks like:
-
-```toml
-[rpc]
-endpoints = ["https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"]
-
-[telegram]
-enabled = false   # flip to true once you have a bot
-
-[madapes]
-enabled = false   # flip to true to publish snapshots to your CF Worker
-# cf_publish_url = "https://your-domain.com/api/admin/publish"
-# cf_publish_secret = "${CF_PUBLISH_SECRET}"
-```
-
-See [`config.example.toml`](config.example.toml) for the full annotated reference.
+[`madapesai.com`](https://madapesai.com) is the reference deployment, not the
+product boundary.
 
 ## Configuration
 
-Everything goes in `config.toml`. Secrets (API keys, bot tokens) reference env vars via `${VAR_NAME}` substitution — Exciton resolves them at startup.
+Everything lives in `config.toml`, with secrets referenced through
+`${VAR_NAME}` substitution.
 
 Key sections:
 
-- `[rpc]` — list of Solana RPC endpoints (round-robin + auto-failover)
-- `[telegram]` — bot tokens, chat IDs, public/private bot usernames, public site URL
-- `[madapes]` — JSON publisher: stages snapshots to a local dir, ships them via HMAC-signed POST to a Cloudflare Worker every 300s
-- `[risk]` — position sizing (only consulted by the optional execution module)
-- `[alerts]` — confidence thresholds for auto-call gates
-- `[mcp]` — MCP server toggle (default on)
-- `[execution]` — trade execution (off by default; experimental)
+- `[rpc]` — Solana RPC endpoints with round-robin and failover
+- `[telegram]` — channel poster, DM bot, public URLs, chat IDs
+- `[madapes]` — publisher staging path and Cloudflare publish settings
+- `[mcp]` — MCP server transport and exposure
+- `[execution]` — optional execution module
 
-Full field-by-field comments live in `config.example.toml`. Read it once before deploying.
+Start with [`config.example.toml`](config.example.toml) and
+[`deploy/config.container.toml.example`](deploy/config.container.toml.example).
 
-## Telegram model (optional)
+## Project Layout
 
-If you enable the Telegram surface, Exciton expects two bots:
-
-| Surface | Token field | Used for |
-|---|---|---|
-| **Channel poster** | `bot_token` | sendMessage / editMessageText to public channels |
-| **Operator DM** | `dm_bot_token` | Long-poll for `/commands` (admin-only) |
-
-Why two: Telegram only allows one long-poller per token. If you `getUpdates` on the same token from two clients you get `409 Conflict`. Splitting keeps the channel poster free for `sendMessage` while the DM bot owns `getUpdates`.
-
-You can run with one bot if you don't need the operator DM surface — set `dm_enabled = false`.
-
-## MCP integration
-
-Exciton ships an MCP server (HTTP streamable transport, default port 8080). Any MCP client can connect and drive the scanner:
-
-```bash
-# In your MCP client config:
-{
-  "mcpServers": {
-    "exciton": { "url": "http://localhost:8080" }
-  }
-}
+```text
+src/              engine, scanner loop, notifier, publisher, MCP server
+crates/claw/      autonomous review / tuning agent
+cloudflare/       public shell + Worker deployment
+deploy/           container and deployment guides
+docs/             architecture and operational docs
+examples/         runnable examples
+tests/            integration and regression tests
 ```
 
-Tools exposed include `inspect_token`, `scan_token`, `list_calls`, `list_signals`, `add_call`, `close_call`, etc. See [`docs/MCP.md`](docs/MCP.md) (TODO).
+## Naming Note
 
-Disable with `EXCITON_DISABLE_MCP=1` if you want a headless deploy.
-
-## Publisher
-
-The publisher snapshot loop runs every 300s. Each tick it writes the JSON files into a local staging dir, then ships the consolidated state to a Cloudflare Worker via an HMAC-signed POST:
-
-```
-<repo_path>/data/
-├── calls.json          # active + historical calls with PnL
-├── scout/<mint>.json   # per-token scout reports
-├── whales/<mint>.json  # per-token whale activity
-└── …
-```
-
-The Worker writes each present key (`diary`, `calls`, `strategy`) to KV; the public read endpoints (`/api/diary`, `/api/calls`, `/api/strategy`) serve them with edge cache. The MCP surface stays bound to `localhost` — exposing it publicly would let anyone burn your RPC budget.
-
-To wire it up: follow [`deploy/CLOUDFLARE.md`](deploy/CLOUDFLARE.md) (fits inside Cloudflare's free tier), set `[madapes] enabled = true` with `cf_publish_url` + `cf_publish_secret` in your `config.toml`, restart the engine.
-
-[madapesai.com](https://madapesai.com) is the live reference deployment, sourced from this repo's `cloudflare/pages` tree.
-
-## Project layout
-
-```
-src/
-  main.rs              entry — config load, env resolution, task spawn
-  config.rs            Config structs + TOML loader
-  db.rs                SQLite schema + every query
-  ingester.rs          RPC router (multi-endpoint, health-tracked failover)
-  discovery.rs         pump.fun + PumpSwap signature walking
-  signals/             token analysis — classification, distribution, momentum
-  scanner.rs           main loop — discovery / re-analysis / settling / digest
-  notifier.rs          Telegram channel layer
-  bot.rs               Telegram DM bot (long-poll, two surfaces)
-  intel.rs             deep-evidence bundles for individual tokens
-  publisher.rs         JSON snapshot loop + Cloudflare Worker push
-  mcp.rs               MCP server (tools, schema, transport)
-  market.rs            DexScreener-backed market data cache
-  forecaster.rs        confidence aggregation
-  scout.rs             pre-call scout reports
-  templates.rs         HTML rendering for Telegram cards
-  …
-examples/              runnable examples (require env vars to post anywhere)
-tests/                 unit + integration tests
-docs/                  architecture + style docs
-```
-
-## Naming note
-
-The project was originally called `photon`. It has been renamed to `exciton` end-to-end (crate, binary, Docker image, env vars, on-disk paths). Old `github.com/asuramaya/photon` URLs still redirect. If you have an existing checkout with state, the default SQLite path is now `exciton.db` — point `EXCITON_DB_PATH` at your existing `photon.db` to keep using it.
+The project was originally called `photon`. It has been renamed to `exciton`
+across the crate, binary, image, env vars, and deployment docs. Old
+`github.com/asuramaya/photon` URLs still redirect.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Bug reports and PRs welcome. For security issues see [`SECURITY.md`](SECURITY.md).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). For security issues, see
+[`SECURITY.md`](SECURITY.md).
 
 ## License
 
 [MIT](LICENSE).
 
-This is research / educational software. Solana memecoins are highly speculative and most lose money. Nothing here is financial advice. Use at your own risk.
+This is research / educational software. Solana memecoins are highly
+speculative and most lose money. Nothing here is financial advice.
