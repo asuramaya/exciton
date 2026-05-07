@@ -134,6 +134,46 @@ pub struct MadapesConfig {
     /// Supports `${ENV_VAR}` expansion so the secret stays out of the
     /// committed config. Required when `enabled = true`.
     pub cf_publish_secret: String,
+    /// Cloudflare R2 account id. Empty disables image generation.
+    /// Image bytes never touch the Worker — engine pushes directly to
+    /// R2 via S3-compatible PUT, then writes only the public URL into
+    /// the publisher data payload.
+    #[serde(default)]
+    pub r2_account_id: String,
+    /// R2 bucket name (e.g. `madapesai-images`).
+    #[serde(default)]
+    pub r2_bucket: String,
+    /// R2 access key id. Supports `${ENV_VAR}` expansion.
+    #[serde(default)]
+    pub r2_access_key_id: String,
+    /// R2 secret access key. Supports `${ENV_VAR}` expansion.
+    #[serde(default)]
+    pub r2_secret_access_key: String,
+    /// Public CDN base URL bound to the R2 bucket — e.g.
+    /// `https://cdn.madapesai.com`. The engine emits asset URLs as
+    /// `<cdn_base_url>/<key>`.
+    #[serde(default)]
+    pub cdn_base_url: String,
+    /// Recraft API key for image generation. Supports `${ENV_VAR}`
+    /// expansion. Empty disables image gen.
+    #[serde(default)]
+    pub recraft_api_key: String,
+    /// Recraft model id. Defaults to `recraftv3`.
+    #[serde(default = "default_recraft_model")]
+    pub recraft_model: String,
+    /// Recraft style — `digital_illustration`, `realistic_image`,
+    /// `vector_illustration`, `icon`. Defaults to digital_illustration
+    /// to match the legacy ape-diary visual language.
+    #[serde(default = "default_recraft_style")]
+    pub recraft_style: String,
+    /// How many images to generate per diary entry.
+    #[serde(default = "default_images_per_entry")]
+    pub images_per_entry: u32,
+    /// Image gen scan cadence in seconds. The loop scans for entries
+    /// missing assets at this interval and generates one image per
+    /// scan; multi-image backlogs drain across consecutive ticks.
+    #[serde(default = "default_image_gen_interval")]
+    pub image_gen_interval_seconds: u64,
 }
 
 fn default_publish_interval() -> u64 {
@@ -141,6 +181,18 @@ fn default_publish_interval() -> u64 {
 }
 fn default_sol_price_fallback() -> f64 {
     150.0
+}
+fn default_recraft_model() -> String {
+    "recraftv3".to_string()
+}
+fn default_recraft_style() -> String {
+    "digital_illustration".to_string()
+}
+fn default_images_per_entry() -> u32 {
+    3
+}
+fn default_image_gen_interval() -> u64 {
+    60
 }
 fn default_jito_tip() -> u64 {
     100_000

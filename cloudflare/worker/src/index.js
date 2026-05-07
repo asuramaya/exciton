@@ -38,7 +38,7 @@ const HMAC_HEADER_SIG = "x-exciton-signature";
 const PUBLISHED_KEYS = ["diary", "calls", "strategy"];
 
 // Raw top-level data keys served at /api/data/<name>; KV key is `data:<name>`.
-const DATA_KEYS = ["health", "pnl", "positions", "activity", "calls", "stream", "featured"];
+const DATA_KEYS = ["health", "pnl", "positions", "activity", "calls", "stream", "featured", "thoughts_index", "thoughts_assets"];
 
 // Per-mint detail maps. Each KV value is `{ "<mint>": {...} }`.
 // URL: /api/data/{key}/<mint>; KV key: `data:<storeKey>`.

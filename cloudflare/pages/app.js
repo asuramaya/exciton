@@ -154,7 +154,7 @@ function renderHealth(h) {
   const banner = document.getElementById("stale-banner");
   if (banner && h.last_update) {
     const ageSec = Date.now() / 1000 - h.last_update;
-    const stale = ageSec > 12 * 60;
+    const stale = ageSec > 25 * 60;
     banner.hidden = !stale;
     if (stale) {
       banner.textContent = "publisher quiet — last pulse " + fmtTimeAgo(h.last_update);
@@ -1635,7 +1635,15 @@ async function renderThoughts(index) {
     return;
   }
 
-  const assets = (await loadJson("thoughts/assets.json")) || {};
+  // Merge static (bundled with Pages, covers legacy entries with
+  // pre-rendered assets) with KV (engine writes new entries into
+  // /api/data/thoughts_assets). KV wins on key collision so re-renders
+  // by the engine override stale static.
+  const [kvAssets, staticAssets] = await Promise.all([
+    loadJson("/api/data/thoughts_assets"),
+    loadJson("thoughts/assets.json"),
+  ]);
+  const assets = { ...(staticAssets || {}), ...(kvAssets || {}) };
   // Sort by date desc, ties broken by index.json position (preserves
   // operator-controlled order for same-day entries — alphabetical
   // filename was previously dropping later-published entries below

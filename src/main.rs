@@ -22,6 +22,7 @@ mod bot;
 mod chart_screenshot;
 mod config;
 mod holders;
+mod image_gen;
 mod db;
 mod discovery;
 mod discovery_pollers;
@@ -105,6 +106,9 @@ async fn main() -> Result<()> {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
         mp.cf_publish_url = ingester::resolve_env_vars(&mp.cf_publish_url);
         mp.cf_publish_secret = ingester::resolve_env_vars(&mp.cf_publish_secret);
+        mp.r2_access_key_id = ingester::resolve_env_vars(&mp.r2_access_key_id);
+        mp.r2_secret_access_key = ingester::resolve_env_vars(&mp.r2_secret_access_key);
+        mp.recraft_api_key = ingester::resolve_env_vars(&mp.recraft_api_key);
     }
     tracing::info!("Exciton starting");
 
@@ -533,6 +537,10 @@ async fn main() -> Result<()> {
                 db.clone(),
             ));
             pub_instance.spawn(publish_kick.clone());
+            // Image-gen loop runs decoupled from the publisher tick so a
+            // 30s OpenAI render never threatens the 60s publisher budget.
+            // Self-disables if any R2/OpenAI credential is empty.
+            image_gen::spawn(Arc::new(mp.clone()));
         } else {
             tracing::info!("publisher configured but disabled");
         }

@@ -1589,17 +1589,24 @@ impl Publisher {
         // collapsed into single objects keyed by mint so that one KV
         // write per detail class covers all calls. The Worker slices on
         // read at /api/data/{calls,scouts,whales}/<mint>.
+        // Thoughts assets + index live one level up under thoughts/.
+        // image_gen writes assets.json on its own cadence; the publisher
+        // ships whatever's there so the page can swap from the static
+        // bundled assets.json to the live KV-backed one.
+        let thoughts_dir = PathBuf::from(&self.cfg.repo_path).join("thoughts");
         let data = serde_json::json!({
-            "health":         read_json_file(&data_dir.join("health.json")),
-            "pnl":            read_json_file(&data_dir.join("pnl.json")),
-            "positions":      read_json_file(&data_dir.join("positions.json")),
-            "activity":       read_json_file(&data_dir.join("activity.json")),
-            "calls":          calls.clone(),
-            "stream":         read_json_file(&data_dir.join("stream.json")),
-            "featured":       read_json_file(&data_dir.join("featured.json")),
-            "calls_details":  read_json_dir_as_map(&data_dir.join("calls")),
-            "scouts":         read_json_dir_as_map(&data_dir.join("scouts")),
-            "whales":         read_json_dir_as_map(&data_dir.join("whales")),
+            "health":           read_json_file(&data_dir.join("health.json")),
+            "pnl":              read_json_file(&data_dir.join("pnl.json")),
+            "positions":        read_json_file(&data_dir.join("positions.json")),
+            "activity":         read_json_file(&data_dir.join("activity.json")),
+            "calls":            calls.clone(),
+            "stream":           read_json_file(&data_dir.join("stream.json")),
+            "featured":         read_json_file(&data_dir.join("featured.json")),
+            "calls_details":    read_json_dir_as_map(&data_dir.join("calls")),
+            "scouts":           read_json_dir_as_map(&data_dir.join("scouts")),
+            "whales":           read_json_dir_as_map(&data_dir.join("whales")),
+            "thoughts_index":   read_json_file(&thoughts_dir.join("index.json")),
+            "thoughts_assets":  read_json_file(&thoughts_dir.join("assets.json")),
         });
 
         let body = serde_json::json!({
