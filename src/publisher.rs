@@ -1580,10 +1580,33 @@ impl Publisher {
             })
             .unwrap_or(serde_json::json!({}));
 
+        // Rich data feed — every JSON file the live site reads, bundled
+        // into one `data: {...}` field so the Worker can fan it out into
+        // KV under the `data:<name>` namespace.
+        //
+        // Top-level snapshots are read from the staging dir verbatim;
+        // the per-mint detail dirs (calls/, scouts/, whales/) are
+        // collapsed into single objects keyed by mint so that one KV
+        // write per detail class covers all calls. The Worker slices on
+        // read at /api/data/{calls,scouts,whales}/<mint>.
+        let data = serde_json::json!({
+            "health":         read_json_file(&data_dir.join("health.json")),
+            "pnl":            read_json_file(&data_dir.join("pnl.json")),
+            "positions":      read_json_file(&data_dir.join("positions.json")),
+            "activity":       read_json_file(&data_dir.join("activity.json")),
+            "calls":          calls.clone(),
+            "stream":         read_json_file(&data_dir.join("stream.json")),
+            "featured":       read_json_file(&data_dir.join("featured.json")),
+            "calls_details":  read_json_dir_as_map(&data_dir.join("calls")),
+            "scouts":         read_json_dir_as_map(&data_dir.join("scouts")),
+            "whales":         read_json_dir_as_map(&data_dir.join("whales")),
+        });
+
         let body = serde_json::json!({
             "calls": calls,
             "diary": diary,
             "strategy": strategy,
+            "data": data,
             "captured_at": ts,
         });
         let body_str = serde_json::to_string(&body)?;
@@ -1817,4 +1840,47 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let s = serde_json::to_string_pretty(value).context("serialize json")?;
     std::fs::write(path, s).with_context(|| format!("write {:?}", path))?;
     Ok(())
+}
+
+/// Read a JSON file off the staging dir into a `serde_json::Value`
+/// without forcing a schema. Missing/unreadable/unparseable files
+/// resolve to `null` so the publisher POST body always has the same
+/// shape regardless of which side-effect files made it to disk.
+fn read_json_file(path: &Path) -> serde_json::Value {
+    if !path.exists() {
+        return serde_json::Value::Null;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+/// Read every `*.json` file in a directory into an object keyed by the
+/// file stem. Used for the per-mint detail dirs (data/calls,
+/// data/scouts, data/whales) which the engine writes one file per call
+/// but the Worker stores as a single map for cheap KV writes. Missing
+/// directory yields an empty object.
+fn read_json_dir_as_map(dir: &Path) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return serde_json::Value::Object(map),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                map.insert(stem, v);
+            }
+        }
+    }
+    serde_json::Value::Object(map)
 }

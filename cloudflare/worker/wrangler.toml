@@ -41,4 +41,7 @@ kv_namespaces = [
 PUBLIC_CACHE_SECONDS_DIARY = "30"
 PUBLIC_CACHE_SECONDS_CALLS = "30"
 PUBLIC_CACHE_SECONDS_STRATEGY = "300"
+# /api/data/<file> + /api/data/{calls,scouts,whales}/<mint> share this TTL.
+# Match it to the publisher cadence on the engine (default 900s).
+PUBLIC_CACHE_SECONDS_DATA = "30"
 HMAC_MAX_SKEW_SECONDS = "300"
