@@ -37,6 +37,7 @@ mod mcp;
 mod metadata;
 mod notifier;
 mod publisher;
+mod wallet_cache;
 mod pumpportal;
 mod scanner;
 mod wallet_observer;
@@ -530,16 +531,34 @@ async fn main() -> Result<()> {
     // interrupt the main scanner.
     if let Some(mp) = config.madapes.clone() {
         if mp.enabled {
+            // Wallet snapshot cache — refreshed ambient by a slow loop.
+            // Reserves Solana RPC budget for the scanner/scout decision
+            // path; the publisher reads from this cache and never blocks
+            // on RPC for our own wallet state.
+            let wallet_cache = wallet_cache::new_cache();
+            wallet_cache::spawn_refresh(
+                wallet_cache.clone(),
+                rpc.clone(),
+                config.wallet.public_key.clone(),
+                300, // 5 min default — staleness here just delays the
+                     // page's bag/featured holding values, never drops a
+                     // publisher tick
+            );
             let pub_instance = Arc::new(publisher::Publisher::new(
                 mp.clone(),
                 config.wallet.public_key.clone(),
                 rpc.clone(),
                 db.clone(),
+                wallet_cache,
             ));
-            pub_instance.spawn(publish_kick.clone());
+            pub_instance.clone().spawn(publish_kick.clone());
+            // Scout loop — per-call evidence bundles, whale traces, and
+            // call detail JSON. Off the publisher critical path so RPC
+            // degradation only causes scout staleness, never publish drops.
+            pub_instance.clone().spawn_scout_loop();
             // Image-gen loop runs decoupled from the publisher tick so a
-            // 30s OpenAI render never threatens the 60s publisher budget.
-            // Self-disables if any R2/OpenAI credential is empty.
+            // 30s Recraft render never threatens the 60s publisher budget.
+            // Self-disables if any R2/Recraft credential is empty.
             image_gen::spawn(Arc::new(mp.clone()));
         } else {
             tracing::info!("publisher configured but disabled");

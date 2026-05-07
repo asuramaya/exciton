@@ -12,6 +12,7 @@
 use crate::config::MadapesConfig;
 use crate::db::Db;
 use crate::ingester::RpcRouter;
+use crate::wallet_cache::SharedWalletCache;
 use crate::market;
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -274,15 +275,25 @@ pub struct Publisher {
     wallet: String,
     rpc: Arc<RpcRouter>,
     db: Arc<Db>,
+    /// Shared wallet snapshot. Refreshed by `wallet_cache::spawn_refresh`
+    /// on its own cadence. Publisher reads from here — never blocks on RPC.
+    wallet_cache: SharedWalletCache,
 }
 
 impl Publisher {
-    pub fn new(cfg: MadapesConfig, wallet: String, rpc: Arc<RpcRouter>, db: Arc<Db>) -> Self {
+    pub fn new(
+        cfg: MadapesConfig,
+        wallet: String,
+        rpc: Arc<RpcRouter>,
+        db: Arc<Db>,
+        wallet_cache: SharedWalletCache,
+    ) -> Self {
         Self {
             cfg,
             wallet,
             rpc,
             db,
+            wallet_cache,
         }
     }
 
@@ -338,6 +349,42 @@ impl Publisher {
         });
     }
 
+    /// Background scout loop. Generates per-call scout receipts, whale
+    /// snapshots, and detail JSON on a slow cadence, off the publisher
+    /// critical path. Each per-call RPC chain runs without an outer
+    /// timeout so degraded RPC fleets only delay the data, never drop
+    /// it. The publisher's own tick reads whatever scout files exist
+    /// on disk.
+    pub fn spawn_scout_loop(self: Arc<Self>) {
+        // 5min cadence — long enough that the per-call RPC walks have
+        // headroom to complete even when 2/3 endpoints are 429'd.
+        let interval = Duration::from_secs(300);
+        tokio::spawn(async move {
+            tracing::info!(
+                "Scout loop active (every {}s, no per-tick timeout)",
+                interval.as_secs()
+            );
+            let repo = std::path::PathBuf::from(&self.cfg.repo_path);
+            let data_dir = repo.join("data");
+            if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                tracing::warn!("scout_loop: create data dir failed: {} — exiting loop", e);
+                return;
+            }
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately by default; that's fine here —
+            // scout work is idempotent + dedupes by call_id.
+            loop {
+                tick.tick().await;
+                let calls_file = self.build_calls_file().await;
+                self.publish_call_scout_snapshots(&calls_file, &data_dir).await;
+                self.publish_whale_snapshots(&calls_file, &data_dir).await;
+                self.publish_call_details(&calls_file, &data_dir).await;
+                tracing::debug!("scout_loop: pass complete");
+            }
+        });
+    }
+
     pub async fn run_once(&self) -> Result<bool> {
         let repo = PathBuf::from(&self.cfg.repo_path);
         // `repo_path` is the local staging dir for the JSON files that
@@ -347,29 +394,31 @@ impl Publisher {
         std::fs::create_dir_all(&data_dir).context("create data/ dir")?;
         let now = chrono::Utc::now().timestamp();
 
-        // 1. Wallet state + live SOL price. RPC failure here used to abort
-        // the entire tick, which froze the public ledger whenever both RPCs
-        // were 429'd — calls.json, scout receipts, and whale snapshots all
-        // stopped publishing for unrelated reasons. Now: log + degrade to 0
-        // so the rest of the pipeline still ships fresh data. Hard 5s
-        // timeout so a degraded RPC fleet (every endpoint walking sequentially
-        // before sidelining) can't eat the whole tick — under all-5-down,
-        // get_balance was taking minutes and the loop never published.
-        const RPC_BUDGET: Duration = Duration::from_secs(5);
-        let sol_balance = match tokio::time::timeout(RPC_BUDGET, self.rpc.get_balance(&self.wallet)).await {
-            Ok(Ok(lamports)) => lamports as f64 / 1e9,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "publisher: get_balance failed ({}) — degrading wallet snapshot, continuing",
-                    e
-                );
-                0.0
-            }
-            Err(_) => {
-                tracing::warn!("publisher: get_balance timed out (>5s) — degrading wallet snapshot");
-                0.0
-            }
+        // 1+2. Wallet state — read from `wallet_cache`. RPCs are reserved
+        // for the scanner/scout decision loop; this critical path never
+        // blocks on a Solana RPC. The cache is refreshed ambient by
+        // `wallet_cache::spawn_refresh` on its own cadence; staleness here
+        // is bounded by that cadence (default 5min) and is preferable to
+        // a publisher tick timing out under RPC degradation.
+        let (sol_balance, holdings, wallet_snap_age) = {
+            let snap = self.wallet_cache.read().await;
+            let age = if snap.last_updated > 0 {
+                now - snap.last_updated
+            } else {
+                -1
+            };
+            (snap.sol_balance, snap.holdings.clone(), age)
         };
+        if wallet_snap_age < 0 {
+            tracing::warn!(
+                "publisher: wallet_cache not yet populated — first refresh pending"
+            );
+        } else if wallet_snap_age > 600 {
+            tracing::warn!(
+                "publisher: wallet_cache is {}s stale — RPC fleet may be saturated",
+                wallet_snap_age
+            );
+        }
         // SOL-price fetch via CoinGecko — wrap in a short timeout so a
         // single slow CG response can't eat the whole tick. fetch_sol_price
         // returns Option<f64> (None on err), so timeout gives
@@ -382,20 +431,6 @@ impl Publisher {
         .ok()
         .flatten()
         .unwrap_or(self.cfg.sol_price_fallback_usd);
-
-        // 2. Current holdings — used for positions + mark-to-market PnL.
-        let holdings = match tokio::time::timeout(
-            RPC_BUDGET,
-            self.rpc.get_wallet_token_holdings(&self.wallet),
-        )
-        .await
-        {
-            Ok(Ok(h)) => h,
-            Ok(Err(_)) | Err(_) => {
-                tracing::warn!("publisher: get_wallet_token_holdings degraded (timeout or err)");
-                Default::default()
-            }
-        };
 
         // 3. Scan recent wallet signatures, record any detected trades into
         //    the wallet_ledger. Idempotent by signature, so re-scanning the
@@ -607,39 +642,12 @@ impl Publisher {
             }
         };
 
-        // 9b. One-shot scout receipts per active call — captures the
-        //     evidence bundle close to call-time and keeps it public.
-        if tokio::time::timeout(
-            PHASE_BUDGET,
-            self.publish_call_scout_snapshots(&calls_file, &data_dir),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("publisher: publish_call_scout_snapshots timed out — skipping this tick");
-        }
-
-        // 9c. Per-call whale snapshots.
-        if tokio::time::timeout(
-            PHASE_BUDGET,
-            self.publish_whale_snapshots(&calls_file, &data_dir),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("publisher: publish_whale_snapshots timed out — skipping this tick");
-        }
-
-        // 9d. Per-call detail JSON for the front-end's #call=<mint> drill-in.
-        if tokio::time::timeout(
-            PHASE_BUDGET,
-            self.publish_call_details(&calls_file, &data_dir),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("publisher: publish_call_details timed out — skipping this tick");
-        }
+        // 9b/c/d. Scout receipts, whale snapshots, and per-call details
+        // were inline RPC blocks here. They've moved to `spawn_scout_loop`
+        // so the publisher tick stays pure read-from-state. The publisher
+        // will pick up whatever scout files exist on disk and ship them;
+        // the scout loop fills them in on its own slow cadence with
+        // generous timeouts so RPC degradation doesn't drop ticks.
 
         let health = Health {
             wallet: self.wallet.clone(),
@@ -697,13 +705,15 @@ impl Publisher {
         };
         // Live market — symbol/name/price/mcap/24h. Cached via market::get_market.
         let market = market::get_market(&mint).await.ok().flatten();
-        // Ape wallet's MAAI balance via SPL token-accounts lookup.
-        let mut ape_balance: f64 = 0.0;
-        if let Ok(holdings) = self.rpc.get_wallet_token_holdings(&self.wallet).await {
-            if let Some((_, bal)) = holdings.iter().find(|(m, _)| m == &mint) {
-                ape_balance = *bal;
-            }
-        }
+        // Ape wallet's MAAI balance — read from cache, never RPC.
+        let ape_balance: f64 = {
+            let snap = self.wallet_cache.read().await;
+            snap.holdings
+                .iter()
+                .find(|(m, _)| m == &mint)
+                .map(|(_, bal)| *bal)
+                .unwrap_or(0.0)
+        };
         // Supply: derive from mcap/price (pump.fun = ~1B fixed supply but
         // we don't hardcode that — derive from observable market data).
         let (price_usd, mcap_usd) = market

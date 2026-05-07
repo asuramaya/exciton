@@ -725,11 +725,16 @@ impl ExcitonServer {
     fn spawn_publisher_flush(&self) {
         let Some(mp) = self.config.madapes.clone() else { return; };
         if !mp.enabled { return; }
+        // Ad-hoc one-shot publisher: empty wallet cache. The long-running
+        // engine refreshes the cache ambient; this MCP-triggered flush
+        // ships whatever's currently in state without re-fetching wallet
+        // RPC (RPCs are reserved for the scanner/scout decision loop).
         let pub_instance = crate::publisher::Publisher::new(
             mp,
             self.config.wallet.public_key.clone(),
             self.rpc.clone(),
             self.db.clone(),
+            crate::wallet_cache::new_cache(),
         );
         tokio::spawn(async move {
             if let Err(e) = pub_instance.run_once().await {
@@ -1323,6 +1328,7 @@ impl ExcitonServer {
             self.config.wallet.public_key.clone(),
             self.rpc.clone(),
             self.db.clone(),
+            crate::wallet_cache::new_cache(),
         );
 
         match publisher.run_once().await {
