@@ -125,16 +125,16 @@ For each active call: parse horizon from note (default SHORT), fetch current pri
 | LONG | age ≥ 30d | `expired` (30d hold complete) |
 | LONG | (price OK) | operator settles via `/close_call` |
 
-## Publisher — `publisher::run_once` (every 300s)
+## Publisher — `publisher::run_once` (push-on-event, default 300s tick)
 
-1. Fetch SOL balance + price → write wallet snapshot
+1. Read the wallet snapshot (SOL balance + holdings) from the shared `wallet_cache`. **The publish path never calls Solana RPC** — the RPC budget is reserved for the scanner. A separate background task (`wallet_cache::spawn_refresh`) refreshes that snapshot on its own slow cadence; if RPC is degraded the publisher serves the last-known-good values instead of blocking.
 2. Build positions from `wallet_ledger` cost basis
 3. Compute realized + unrealized PnL
 4. Build activity stream from `wallet_ledger`
 5. `build_calls_file` (filtered by `voided` exclusion) → `data/calls.json`
-6. Per-token scout snapshots → `data/scouts/<mint>.json`
-7. Per-token whale snapshots → `data/whales/<mint>.json`
-8. `git add -A && git commit && git push` to the configured target repo
+6. Bundle every JSON file just written and ship it to the Cloudflare Worker via a single **HMAC-SHA256-signed POST** to `/api/admin/publish` (`X-Exciton-Timestamp` + `X-Exciton-Signature`). No git is involved — the Worker writes each present key to KV.
+
+Per-token scout and whale snapshots (`data/scouts/<mint>.json`, `data/whales/<mint>.json`) are produced by a separate `spawn_scout_loop` (300s) so a slow per-token walk can never stall the main publish tick.
 
 ## Database
 
@@ -153,7 +153,7 @@ For each active call: parse horizon from note (default SHORT), fetch current pri
 
 ## MCP server
 
-`mcp.rs` exposes the scanner's analysis tools over MCP (Model Context Protocol). Default transport is HTTP-streamable on port 8080. Tools include:
+`mcp.rs` exposes the scanner's analysis tools over MCP (Model Context Protocol). Default transport is HTTP-streamable on port 8082 (override with `EXCITON_MCP_PORT`), at the `/mcp` path. Tools include:
 
 - `inspect_token(address)` — full evidence bundle for a mint
 - `scan_token(address)` — force a fresh `analyze_token` run

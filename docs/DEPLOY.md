@@ -204,7 +204,7 @@ To rotate the wallet: edit `[wallet] public_key`, restart. Active calls stay in 
 
 - **`MCP bearer auth DISABLED`** — fine for loopback. To accept external MCP traffic, set `EXCITON_MCP_TOKEN=…` in `.env` and require the same `Authorization: Bearer …` on requests.
 - **`pumpportal: disconnected`** — pumpportal websocket is best-effort; the discovery pollers cover the gap on a 60s cadence.
-- **`forensics_required` blocking calls** — RPC pressure timing out the launch-forensics task. Add a second RPC endpoint or use a paid plan.
+- **`forensics_required` blocking calls** — RPC pressure timing out the launch-forensics task. Add another RPC endpoint to widen the round-robin pool (the router fails over automatically).
 - **`claw review` loops** — check that the model env var is set (`CLAW_CODEX_MODEL=gpt-5.4` is a safe default for ChatGPT-account-billed paths).
 
 ## Architecture

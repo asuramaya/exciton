@@ -3,9 +3,6 @@ target
 exciton.db
 exciton.db-shm
 exciton.db-wal
-photon.db
-photon.db-shm
-photon.db-wal
 .DS_Store
 .claude
 .playwright-mcp

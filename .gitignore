@@ -2,9 +2,6 @@
 exciton.db
 exciton.db-wal
 exciton.db-shm
-photon.db
-photon.db-wal
-photon.db-shm
 config.toml
 config.vm.toml
 .mcp.json
