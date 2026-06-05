@@ -15,7 +15,7 @@ later ripped out, both the "we shipped" note and the "we ripped it
 out" note live in here. The git log is the timeline; this folder is
 its human-readable form.
 
-This is load-bearing. The public face of MadApes is trust, and trust
+This is load-bearing. The public face of the project is trust, and trust
 is earned by never rewriting history. If a call goes to zero, the
 ape documents the autopsy — it doesn't delete the obituary and
 pretend the body was never there.

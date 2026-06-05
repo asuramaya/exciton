@@ -1,4 +1,4 @@
-// MadApes.ai — renders live PnL + positions + activity + thoughts.
+// exciton — renders live PnL + positions + activity + thoughts.
 // Data comes from /data/*.json snapshots committed to the repo (~every 5 min).
 // Thoughts are dated markdown files under /thoughts/, indexed by /thoughts/index.json.
 //
@@ -10,7 +10,7 @@
 const SOLSCAN = "https://solscan.io";
 const DEXSCREENER = "https://dexscreener.com/solana";
 const CHART_WINDOWS = ["1h", "6h", "24h", "all"];
-const CHART_WINDOW_STORAGE_KEY = "madapes.chartWindow";
+const CHART_WINDOW_STORAGE_KEY = "exciton.chartWindow";
 const MAX_SEEN_STREAM = 500;
 
 function fmtUsd(n) {

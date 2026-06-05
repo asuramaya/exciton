@@ -77,7 +77,7 @@ evolution_chat_id = -100...  # where claw publishes diary entries
 public_bot_username = "your_public_bot"
 private_bot_username = "your_private_bot"
 
-[madapes]
+[publisher]
 enabled = true
 repo_path = "/srv/publisher-target"           # local staging dir for publisher output
 cf_publish_url = "https://your-domain.com/api/admin/publish"

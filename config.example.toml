@@ -98,14 +98,14 @@ claw_api_port = 8081
 # the bundle via an HMAC-signed POST to a Cloudflare Worker.
 # The Worker writes each present key to KV; the public read API
 # (/api/diary, /api/calls, /api/strategy) serves them with edge
-# cache. Omit the [madapes] section to disable publishing.
+# cache. Omit the [publisher] section to disable publishing.
 # ─────────────────────────────────────────────────────────────
-[madapes]
+[publisher]
 enabled = false
 # Local staging dir for the JSON files the publisher bundles into
 # the POST body. Any writable path works — does not need to be a
 # git checkout.
-repo_path = "${MADAPES_REPO_PATH}"
+repo_path = "${PUBLISHER_REPO_PATH}"
 # Publish cadence in seconds.
 interval_seconds = 300
 # Fallback SOL/USD when live price fetch fails.

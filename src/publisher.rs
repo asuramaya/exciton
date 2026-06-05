@@ -9,7 +9,7 @@
 //! reads + DexScreener; all summaries are templated from raw balance
 //! deltas.
 
-use crate::config::MadapesConfig;
+use crate::config::PublisherConfig;
 use crate::db::Db;
 use crate::ingester::RpcRouter;
 use crate::wallet_cache::SharedWalletCache;
@@ -271,7 +271,7 @@ struct CallsFile {
 pub type PublishKick = Arc<tokio::sync::Notify>;
 
 pub struct Publisher {
-    cfg: MadapesConfig,
+    cfg: PublisherConfig,
     wallet: String,
     rpc: Arc<RpcRouter>,
     db: Arc<Db>,
@@ -282,7 +282,7 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new(
-        cfg: MadapesConfig,
+        cfg: PublisherConfig,
         wallet: String,
         rpc: Arc<RpcRouter>,
         db: Arc<Db>,
@@ -1516,12 +1516,12 @@ impl Publisher {
     async fn post_publish(&self, data_dir: &Path, ts: i64) -> Result<bool> {
         let url = self.cfg.cf_publish_url.as_str();
         if url.is_empty() {
-            anyhow::bail!("cf_publish_url is empty — required when madapes.enabled");
+            anyhow::bail!("cf_publish_url is empty — required when publisher.enabled");
         }
         // Secret was env-expanded at startup in main.rs.
         let secret = self.cfg.cf_publish_secret.as_str();
         if secret.is_empty() {
-            anyhow::bail!("cf_publish_secret is empty — required when madapes.enabled");
+            anyhow::bail!("cf_publish_secret is empty — required when publisher.enabled");
         }
 
         // calls.json was just written by run_once. Read it back so the

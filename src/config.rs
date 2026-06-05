@@ -20,7 +20,7 @@ pub struct Config {
     pub telegram: Option<TelegramConfig>,
     /// Optional — when absent, no data is published to a target repo.
     #[serde(default)]
-    pub madapes: Option<MadapesConfig>,
+    pub publisher: Option<PublisherConfig>,
     /// Optional — when absent OR `enabled=false`, exciton stays paper-only.
     /// Auto-calls insert rows + post TG cards but never sign trades.
     #[serde(default)]
@@ -100,7 +100,7 @@ impl ExecutionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct MadapesConfig {
+pub struct PublisherConfig {
     /// Master switch. Defaults to `false` so local runs don't accidentally
     /// push to the public repo.
     #[serde(default)]
@@ -125,7 +125,7 @@ pub struct MadapesConfig {
     #[serde(default)]
     pub featured_buy_url: String,
     /// Cloudflare Worker URL the publisher POSTs consolidated state
-    /// snapshots to (e.g. `https://madapesai.com/api/admin/publish`).
+    /// snapshots to (e.g. `https://your-domain.com/api/admin/publish`).
     /// Required when `enabled = true` — the engine no longer carries a
     /// git-push fallback. `repo_path` is the local staging dir for the
     /// JSON files that get bundled into the POST body.
@@ -140,7 +140,7 @@ pub struct MadapesConfig {
     /// the publisher data payload.
     #[serde(default)]
     pub r2_account_id: String,
-    /// R2 bucket name (e.g. `madapesai-images`).
+    /// R2 bucket name (e.g. `your-images-bucket`).
     #[serde(default)]
     pub r2_bucket: String,
     /// R2 access key id. Supports `${ENV_VAR}` expansion.
@@ -150,7 +150,7 @@ pub struct MadapesConfig {
     #[serde(default)]
     pub r2_secret_access_key: String,
     /// Public CDN base URL bound to the R2 bucket — e.g.
-    /// `https://cdn.madapesai.com`. The engine emits asset URLs as
+    /// `https://cdn.your-domain.com`. The engine emits asset URLs as
     /// `<cdn_base_url>/<key>`.
     #[serde(default)]
     pub cdn_base_url: String,
@@ -422,7 +422,7 @@ impl Default for Config {
                 stale_feed_seconds: 30,
             },
             telegram: None,
-            madapes: None,
+            publisher: None,
             execution: None,
         }
     }

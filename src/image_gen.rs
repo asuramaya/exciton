@@ -20,14 +20,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::MadapesConfig;
+use crate::config::PublisherConfig;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Spawn the image-gen background loop. Returns immediately. Does
 /// nothing (logs once) when any required credential is empty so OSS
-/// forks can run without R2 + OpenAI.
-pub fn spawn(cfg: Arc<MadapesConfig>) {
+/// forks can run without R2 + Recraft.
+pub fn spawn(cfg: Arc<PublisherConfig>) {
     if cfg.r2_account_id.is_empty()
         || cfg.r2_bucket.is_empty()
         || cfg.r2_access_key_id.is_empty()
@@ -62,7 +62,7 @@ pub fn spawn(cfg: Arc<MadapesConfig>) {
 }
 
 /// One scan: find entries missing assets, generate up to one image, return count.
-async fn run_once(client: &reqwest::Client, cfg: &MadapesConfig) -> Result<u32> {
+async fn run_once(client: &reqwest::Client, cfg: &PublisherConfig) -> Result<u32> {
     let thoughts = PathBuf::from(&cfg.repo_path).join("thoughts");
     if !thoughts.is_dir() {
         return Ok(0);
@@ -233,7 +233,7 @@ async fn render_image(
 /// Sign + PUT to R2 via S3-compatible sigv4. Region is `auto`.
 async fn put_r2(
     client: &reqwest::Client,
-    cfg: &MadapesConfig,
+    cfg: &PublisherConfig,
     key: &str,
     body: &[u8],
     content_type: &str,

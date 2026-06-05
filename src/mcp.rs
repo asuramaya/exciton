@@ -723,7 +723,7 @@ impl ExcitonServer {
     }
 
     fn spawn_publisher_flush(&self) {
-        let Some(mp) = self.config.madapes.clone() else { return; };
+        let Some(mp) = self.config.publisher.clone() else { return; };
         if !mp.enabled { return; }
         // Ad-hoc one-shot publisher: empty wallet cache. The long-running
         // engine refreshes the cache ambient; this MCP-triggered flush
@@ -1242,7 +1242,7 @@ impl ExcitonServer {
 
         // Publisher freshness: mtime on data/health.json in the publisher repo.
         let (publisher_path, publisher_age_seconds): (String, i64) =
-            match self.config.madapes.as_ref() {
+            match self.config.publisher.as_ref() {
                 Some(mp) => {
                     let p = format!("{}/data/health.json", mp.repo_path);
                     let age = std::fs::metadata(&p)
@@ -1253,7 +1253,7 @@ impl ExcitonServer {
                         .unwrap_or(-1);
                     (p, age)
                 }
-                None => ("(madapes disabled)".to_string(), -1),
+                None => ("(publisher disabled)".to_string(), -1),
             };
         // Scanner / alert activity — newest alert ts.
         let last_alert_ts: i64 = {
@@ -1316,11 +1316,11 @@ impl ExcitonServer {
         let _ = self
             .db
             .audit_log("claude", "pulse", "manual publisher pulse");
-        let Some(mp) = self.config.madapes.clone() else {
-            return "{\"error\":\"madapes config missing\"}".to_string();
+        let Some(mp) = self.config.publisher.clone() else {
+            return "{\"error\":\"publisher config missing\"}".to_string();
         };
         if !mp.enabled {
-            return "{\"error\":\"madapes publisher disabled\"}".to_string();
+            return "{\"error\":\"publisher disabled\"}".to_string();
         }
 
         let publisher = crate::publisher::Publisher::new(
@@ -2110,11 +2110,11 @@ impl ExcitonServer {
             0.0
         };
 
-        // SOL price in USD: use the madapes fallback if configured, else 150 as
+        // SOL price in USD: use the publisher fallback if configured, else 150 as
         // a conservative floor. This converts token USD price → SOL value.
         let sol_price_usd = self
             .config
-            .madapes
+            .publisher
             .as_ref()
             .map(|m| m.sol_price_fallback_usd)
             .unwrap_or(150.0);

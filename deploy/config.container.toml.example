@@ -32,9 +32,9 @@ dm_enabled = true
 admin_user_ids = []  # Telegram user IDs allowed to issue operator commands
 dm_rate_limit_per_minute = 30
 
-[madapes]
+[publisher]
 enabled = true
-repo_path = "${MADAPES_REPO_PATH}"
+repo_path = "${PUBLISHER_REPO_PATH}"
 interval_seconds = 300
 sol_price_fallback_usd = 150.0
 cf_publish_url = "${CF_PUBLISH_URL}"

@@ -13,7 +13,6 @@
 </p>
 
 <p align="center">
-  <a href="https://madapesai.com"><b>Reference deployment</b></a> ·
   <a href="https://github.com/asuramaya/exciton/blob/main/docs/DEPLOY.md">Deploy guide</a> ·
   <a href="https://github.com/asuramaya/exciton/blob/main/docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="https://github.com/asuramaya/exciton/blob/main/deploy/CLOUDFLARE.md">Cloudflare</a>
@@ -23,9 +22,9 @@
 > signal scoring, Telegram surfaces, and a public publishing loop in one Rust
 > workspace.
 
-`exciton` is the engine. [`madapesai.com`](https://madapesai.com) is the live
-reference deployment built from it, and the public shell for that deployment
-now lives in this repo under [`cloudflare/pages`](cloudflare/pages).
+`exciton` is the engine. The public shell a deployment serves — live PnL
+dashboard, diary, and call history — ships in this repo under
+[`cloudflare/pages`](cloudflare/pages) as a forkable reference front end.
 
 ## What It Does
 
@@ -65,7 +64,7 @@ Full walkthrough: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 | **Telegram** | Public call cards plus private operator commands |
 | **Publisher** | Snapshot loop writing local state and shipping it to the public site |
 | **MCP** | Private tool surface for agents and operators to inspect state and drive the system |
-| **Cloudflare shell** | The public `madapesai.com` face under [`cloudflare/pages`](cloudflare/pages) |
+| **Cloudflare shell** | The public web face under [`cloudflare/pages`](cloudflare/pages) |
 
 ## Architecture
 
@@ -79,7 +78,7 @@ Telegram   JSON      MCP
 surface   publish   surface
               ↓
       Cloudflare Worker + Pages
-          madapesai.com
+          public site
 ```
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the signal pipeline,
@@ -94,8 +93,7 @@ The intended deployment shape is:
 3. the public shell in [`cloudflare/pages`](cloudflare/pages) reads from the Worker-backed endpoints
 4. the MCP surface stays private unless you intentionally expose and secure it
 
-[`madapesai.com`](https://madapesai.com) is the reference deployment, not the
-product boundary.
+The reference deployment is one ape on one wallet — not the product boundary.
 
 ## Configuration
 
@@ -106,7 +104,7 @@ Key sections:
 
 - `[rpc]` — Solana RPC endpoints with round-robin and failover
 - `[telegram]` — channel poster, DM bot, public URLs, chat IDs
-- `[madapes]` — publisher staging path and Cloudflare publish settings
+- `[publisher]` — publisher staging path and Cloudflare publish settings
 - `[mcp]` — MCP server transport and exposure
 - `[execution]` — optional execution module
 
