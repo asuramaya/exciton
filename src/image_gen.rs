@@ -227,7 +227,7 @@ async fn render_image(
     let b64 = v["data"][0]["b64_json"]
         .as_str()
         .ok_or_else(|| anyhow!("recraft response missing data[0].b64_json"))?;
-    Ok(B64.decode(b64).context("decode b64 image")?)
+    B64.decode(b64).context("decode b64 image")
 }
 
 /// Sign + PUT to R2 via S3-compatible sigv4. Region is `auto`.
