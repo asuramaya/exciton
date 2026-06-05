@@ -1,6 +1,6 @@
 # Worker config for the exciton public face.
 #
-# Deploys a single Worker at madapesai.com that serves:
+# Deploys a single Worker at your apex domain that serves:
 #   - GET /api/diary       — last N evolution events (KV-backed, edge-cached)
 #   - GET /api/calls       — active + recent closed calls (KV-backed, edge-cached)
 #   - GET /api/strategy    — current effective tunables (KV-backed, edge-cached)
@@ -20,11 +20,11 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 # Production routes. The Worker intercepts /api/* on the apex domain;
-# everything else on madapesai.com falls through to the Pages project.
+# everything else on the apex domain falls through to the Pages project.
 # Fork operators: replace with your own zone or remove this block to
 # run on *.workers.dev only.
 routes = [
-  { pattern = "madapesai.com/api/*", zone_name = "madapesai.com" }
+  { pattern = "your-domain.com/api/*", zone_name = "your-domain.com" }
 ]
 
 # KV namespace holding the published state blobs. The id below points at

@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
             tg_cfg.evolution_chat_id = tg_cfg.ops_chat_id.clone();
         }
     }
-    if let Some(mp) = config.madapes.as_mut() {
+    if let Some(mp) = config.publisher.as_mut() {
         mp.repo_path = ingester::resolve_env_vars(&mp.repo_path);
         mp.cf_publish_url = ingester::resolve_env_vars(&mp.cf_publish_url);
         mp.cf_publish_secret = ingester::resolve_env_vars(&mp.cf_publish_secret);
@@ -529,7 +529,7 @@ async fn main() -> Result<()> {
     // on a fixed interval. Notes under thoughts/ are left alone (append-only,
     // manual). Non-fatal on failures: a transient git/RPC error doesn't
     // interrupt the main scanner.
-    if let Some(mp) = config.madapes.clone() {
+    if let Some(mp) = config.publisher.clone() {
         if mp.enabled {
             // Wallet snapshot cache — refreshed ambient by a slow loop.
             // Reserves Solana RPC budget for the scanner/scout decision

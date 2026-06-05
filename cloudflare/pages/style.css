@@ -1,4 +1,4 @@
-/* MadApes.ai — dark, info-dense, no gimmicks */
+/* exciton — dark, info-dense, no gimmicks */
 
 :root {
   --bg: #0a0a0a;
@@ -489,7 +489,7 @@ h1 .dot { color: var(--accent); }
   border-bottom-color: var(--green) !important;
 }
 
-/* Subtle accent pulse on the MADAPES wordmark dot — signals that this
+/* Subtle accent pulse on the EXCITON wordmark dot — signals that this
    site is alive, not a screenshot. Slow enough to not be annoying. */
 h1 .dot {
   animation: dot-pulse 2.8s ease-in-out infinite;

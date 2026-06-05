@@ -26,7 +26,7 @@ Out of scope:
 - Third-party dependencies (report upstream — happy to coordinate)
 - The Solana RPC provider you choose
 - DexScreener / external APIs
-- Bugs in the deployed `madapesai.com` site (it's a sister project — its repo lives separately)
+- Bugs in an operator's deployed public site (the published front-end is a downstream deployment with its own repo, separate from the engine)
 
 ## Operating securely
 
