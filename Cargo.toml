@@ -13,7 +13,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
-rmcp = { version = "0.17", features = ["client", "transport-streamable-http-client", "transport-child-process"] }
+rmcp = { version = "1.7", features = ["client", "transport-streamable-http-client", "transport-child-process"] }
 base64 = "0.22"
 url = "2"
 toml = "0.8"
