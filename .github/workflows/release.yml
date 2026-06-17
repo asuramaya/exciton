@@ -56,7 +56,7 @@ jobs:
       # already published at this point — this scan documents what
       # the published image contains, not whether to publish.
       - name: Scan published image (trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           severity: HIGH,CRITICAL
